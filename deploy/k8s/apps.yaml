@@ -39,8 +39,11 @@ spec:
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: evidence, mountPath: /evidence }
+            - { name: tmp, mountPath: /tmp }
       volumes:
         - name: data
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
         - name: evidence
           persistentVolumeClaim: { claimName: evidence }

@@ -6,10 +6,10 @@ edits are detectable by re-walking the chain. Sandboxes never mount this volume.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
+import threading
 import time
 
 GENESIS = "0" * 64
@@ -25,7 +25,7 @@ class EvidenceLog:
         self.component = component
         self.path = os.path.join(directory or os.environ.get("EVIDENCE_DIR", "/evidence"), f"{component}.jsonl")
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()   # writes are short; safe from both threads and the event loop
         self.seq, self.prev_hash = self._tail()
 
     def _tail(self) -> tuple[int, str]:
@@ -38,8 +38,8 @@ class EvidenceLog:
                         seq, prev = e["seq"], e["hash"]
         return seq, prev
 
-    async def write(self, action: str, **fields) -> dict:
-        async with self._lock:
+    def write_sync(self, action: str, **fields) -> dict:
+        with self._lock:
             event = {"ts": time.time(), "seq": self.seq + 1, "component": self.component,
                      "action": action, **fields, "prev_hash": self.prev_hash}
             event["hash"] = _digest(self.prev_hash, event)
@@ -49,6 +49,9 @@ class EvidenceLog:
                 os.fsync(f.fileno())
             self.seq, self.prev_hash = event["seq"], event["hash"]
             return event
+
+    async def write(self, action: str, **fields) -> dict:
+        return self.write_sync(action, **fields)
 
 
 def verify_chain(path: str) -> tuple[bool, int, str]:

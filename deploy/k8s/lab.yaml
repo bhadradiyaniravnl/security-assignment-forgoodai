@@ -98,3 +98,49 @@ spec:
   ports:
     - { name: http, port: 80, targetPort: 8080 }
     - { name: https, port: 443, targetPort: 8443 }
+---
+# git-lab lives in sbx-system (it is internal infrastructure, not "the internet").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git-lab
+  namespace: sbx-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: git-lab }
+  template:
+    metadata:
+      labels: { app: git-lab }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: git-lab
+          image: sbx/services:dev
+          imagePullPolicy: Never
+          command: ["python", "-m", "sbx.lab.git_lab"]
+          ports: [{ containerPort: 8080 }]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: repos, mountPath: /repos }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: repos, emptyDir: {} }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-lab
+  namespace: sbx-system
+spec:
+  selector: { app: git-lab }
+  ports:
+    - { name: git, port: 8080, targetPort: 8080 }

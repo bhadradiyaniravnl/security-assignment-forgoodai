@@ -437,6 +437,13 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
 - **Compression:** gzip responses were relayed without their `Content-Encoding` header, which corrupted client responses and hid tool_use blocks from the gateway. credproxy now requests `Accept-Encoding: identity` upstream, because the gateway must inspect bodies.
 - **Claude Code model fallback:** with only `--model` set, Claude Code 2.1.1 also called `claude-sonnet-4-5-*` / `claude-haiku-4-5-*`, which the spec denied. Sandboxes now set `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` from the spec. This is a realistic D2 false-positive source.
 - **Secret-handling incident (contained):** a real API key was saved into the tracked `secrets/.example.env` and committed locally (never pushed). We rewrote history, purged the objects, rotated the key, and added a pre-commit guard (`scripts/git-hooks/pre-commit`, `make hooks`) that blocks `secrets/*`, filled-in templates and key-shaped strings.
+
+**M3 results (2026-10-29):** `make lifecycle` passes 21 of 21 checks.
+- `sbxctl run/ls/status/logs/stop/diff/destroy` drive the control plane over a NodePort bound to 127.0.0.1.
+- The repo is cloned by the control plane from git-lab (`git://`, reachable only by the control plane) and the canary is planted in `repo/.env`. The workspace is streamed in as base64 chunks via exec args (no stdin, no credentials in the pod), and `task.json` is written last and atomically.
+- Trigger-time rejections: extra policy keys, repos outside the spec, non-owners, malformed spec names, and stopping another user's session.
+- A reconciler ends a session (and so invalidates its token) when the pod disappears or fails, which includes the `activeDeadlineSeconds` TTL.
+- Spec loading is minimal: specs are baked into the image and digest-bound per session. Baseline checks at registration are M6.
 - **R6:** Cilium `toFQDNs` for credproxy needs DNS proxying through Cilium. If that's flaky in kind, fall back to `toEntities: world` for credproxy only, with the L7 allowlist kept in credproxy.
 - **Resolved:**
   - cuts accepted;

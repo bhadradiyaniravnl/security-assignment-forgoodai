@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin wrapper so `bin/sbxctl ...` works from the repo without installing anything.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHONPATH="$ROOT/src" exec python3 -m sbx.cli.sbxctl "$@"

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   policy       TEXT NOT NULL,
   canaries     TEXT NOT NULL DEFAULT '[]',
   state        TEXT NOT NULL,
+  detail       TEXT,
   created_at   REAL NOT NULL,
   ended_at     REAL
 );

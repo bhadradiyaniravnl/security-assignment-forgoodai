@@ -10,6 +10,8 @@ RUN mkdir -p /etc/lab-tls && openssl req -x509 -newkey rsa:2048 -nodes -days 365
       -subj "/CN=lab-ext" -addext "subjectAltName=DNS:paste-mock.lab-ext.svc,DNS:attacker-sink.lab-ext.svc" \
       -keyout /etc/lab-tls/tls.key -out /etc/lab-tls/tls.crt && chmod 0644 /etc/lab-tls/tls.key
 COPY src /app/src
+COPY specs /app/specs
+COPY demo-repo /app/demo-repo
 ENV PYTHONPATH=/app/src PYTHONUNBUFFERED=1
 USER 10001
 WORKDIR /app
