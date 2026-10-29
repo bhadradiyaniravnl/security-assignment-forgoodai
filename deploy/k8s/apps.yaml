@@ -165,3 +165,47 @@ spec:
   ports:
     - { name: http, port: 9000, targetPort: 9000 }
     - { name: tunnel, port: 9001, targetPort: 9001 }
+---
+# detector: reads evidence read-only and Hubble flows; acts only through the control plane.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detector
+  namespace: sbx-system
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: detector }
+  template:
+    metadata:
+      labels: { app: detector }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: detector
+          image: sbx/services:dev
+          imagePullPolicy: Never
+          command: ["python", "-m", "sbx.detector.main"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: HOME, value: /tmp }
+            - name: SBX_INTERNAL_KEY
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: key } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: evidence, mountPath: /evidence, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: evidence
+          persistentVolumeClaim: { claimName: evidence, readOnly: true }
+        - name: tmp
+          emptyDir: {}

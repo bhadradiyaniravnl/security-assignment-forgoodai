@@ -2,6 +2,7 @@
 
   sbxctl run bugfix-agent -p repo=demo/app -p task="Make the tests pass" [-f]
   sbxctl ls | status SID | logs SID [-f] [--raw] | stop SID | diff SID | destroy SID
+  sbxctl contain SID | alerts
 """
 from __future__ import annotations
 
@@ -87,7 +88,8 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("-p", "--param", action="append", default=[], metavar="KEY=VALUE")
     r.add_argument("-f", "--follow", action="store_true", help="stream progress until the agent exits")
     sub.add_parser("ls", help="list your sessions")
-    for name in ("status", "stop", "diff", "destroy"):
+    sub.add_parser("alerts", help="detections and containment verifications for your sessions")
+    for name in ("status", "stop", "diff", "destroy", "contain"):
         sub.add_parser(name).add_argument("sid")
     lg = sub.add_parser("logs", help="agent progress (from pod stdout; not security evidence)")
     lg.add_argument("sid")
@@ -113,6 +115,16 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(call("POST", f"/sessions/{a.sid}/stop")))
     elif a.cmd == "diff":
         print(call("GET", f"/sessions/{a.sid}/diff"), end="")
+    elif a.cmd == "contain":
+        r = call("POST", f"/sessions/{a.sid}/contain")
+        print(json.dumps({k: r.get(k) for k in ("session_id", "state", "probe", "probe_blocked", "elapsed_s", "snapshot")},
+                         indent=2))
+    elif a.cmd == "alerts":
+        for e in call("GET", "/alerts"):
+            c = e.get("containment") or {}
+            print(f"{e['seq']:>4} {e['rule']:<3} {e['severity']:<6} {e.get('session_id') or '-':<10} "
+                  f"user={e.get('user')} spec={e.get('spec')}\n     {e['summary']}"
+                  + (f"\n     contained in {c.get('elapsed_s')}s probe_blocked={c.get('probe_blocked')}" if c.get('quarantined_at') else ""))
     elif a.cmd == "destroy":
         print(json.dumps(call("DELETE", f"/sessions/{a.sid}")))
 

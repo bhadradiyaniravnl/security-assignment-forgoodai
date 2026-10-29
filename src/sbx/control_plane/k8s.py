@@ -122,3 +122,40 @@ def exec_(sid: str, cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
 def logs(sid: str, follow: bool, tail: int | None = None):
     return core().read_namespaced_pod_log(pod_name(sid), NS, container="agent", follow=follow,
                                           tail_lines=tail, _preload_content=False)
+
+
+def quarantine(sid: str) -> None:
+    """Per-session Cilium deny policy. Deny rules override allows; measured <=1s to take
+    effect (vs ~45s for relabelling, which forces a new security identity)."""
+    core()   # ensure in-cluster config is loaded before using other API groups
+    body = {
+        "apiVersion": "cilium.io/v2", "kind": "CiliumNetworkPolicy",
+        "metadata": {"name": f"quarantine-{sid}", "namespace": NS, "labels": {"sbx/session": sid}},
+        "spec": {"endpointSelector": {"matchLabels": {"sbx/session": sid}},
+                 "egressDeny": [{"toEntities": ["all"]}], "ingressDeny": [{"fromEntities": ["all"]}]},
+    }
+    try:
+        client.CustomObjectsApi().create_namespaced_custom_object("cilium.io", "v2", NS, "ciliumnetworkpolicies", body)
+    except ApiException as e:
+        if e.status != 409:
+            raise
+    try:
+        core().patch_namespaced_pod(pod_name(sid), NS, {"metadata": {"labels": {"sbx/state": "contained"}}})
+    except ApiException as e:
+        if e.status != 404:
+            raise
+
+
+def unquarantine(sid: str) -> None:
+    core()
+    try:
+        client.CustomObjectsApi().delete_namespaced_custom_object("cilium.io", "v2", NS, "ciliumnetworkpolicies",
+                                                                  f"quarantine-{sid}")
+    except ApiException as e:
+        if e.status != 404:
+            raise
+
+
+def pod_snapshot(sid: str) -> dict:
+    p = core().read_namespaced_pod(pod_name(sid), NS)
+    return client.ApiClient().sanitize_for_serialization(p)

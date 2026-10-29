@@ -26,7 +26,9 @@ WORK = os.environ.get("CP_WORK", "/data/work")
 RESULTS = os.environ.get("CP_RESULTS", "/data/results")
 CHUNK = 60_000
 
+EVIDENCE_DIR = os.environ.get("EVIDENCE_DIR", "/evidence")
 evidence = EvidenceLog("control-plane")
+alerts = EvidenceLog("alerts")
 
 
 class SessionError(Exception):
@@ -97,11 +99,76 @@ def stop(store: Store, sid: str, user: str) -> dict:
     return {"session_id": sid, "state": "stopped", "diff_bytes": len(diff)}
 
 
+def contain(store: Store, sid: str, actor: str, alert_id: str | None = None, reason: str = "") -> dict:
+    """Revoke -> network quarantine -> preserve evidence -> probe. The pod is kept (frozen off the
+    network) for forensics until destroy. Order matters: the token dies before anything else."""
+    s = store.get(sid)
+    if s is None:
+        raise SessionError(404, "no such session")
+    if s["state"] == "contained":
+        return {"session_id": sid, "state": "contained", "already": True}
+    if s["state"] not in ("running", "creating", "stopping"):
+        raise SessionError(409, f"session is {s['state']}")
+    t0 = time.time()
+    store.update(sid, state="contained", detail=f"contained by {actor}: {reason}"[:500])     # 1. revoke
+    revoked_at = time.time()
+    k8s.quarantine(sid)                                                                         # 2. isolate
+    quarantined_at = time.time()
+    snap = _snapshot(sid, s)                                                                    # 3. preserve
+    time.sleep(2)
+    probe = _probe(sid)                                                                         # 4. probe
+    result = {"session_id": sid, "state": "contained", "actor": actor, "alert_id": alert_id,
+              "revoked_at": revoked_at, "quarantined_at": quarantined_at, "snapshot": snap, "probe": probe,
+              "probe_blocked": all(v == "000" for v in probe.values()), "elapsed_s": round(time.time() - t0, 2)}
+    evidence.write_sync("session_contain", user=s["user"], spec=s["spec_name"], spec_digest=s["spec_digest"],
+                        **{k: v for k, v in result.items() if k != "state"})
+    return result
+
+
+def _snapshot(sid: str, s: dict) -> str:
+    """Copies what an investigator needs out of reach of the sandbox, before anything is destroyed."""
+    d = os.path.join(EVIDENCE_DIR, "sessions", sid)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "session.json"), "w") as f:
+        json.dump(s, f, indent=2, default=str)
+    try:
+        with open(os.path.join(d, "pod.json"), "w") as f:
+            json.dump(k8s.pod_snapshot(sid), f, indent=2, default=str)
+        with open(os.path.join(d, "agent-stdout.log"), "wb") as f:     # untrusted, kept for context only
+            f.write(k8s.logs(sid, follow=False).data)
+    except Exception as e:  # noqa: BLE001 - snapshot is best effort; containment must not fail on it
+        with open(os.path.join(d, "snapshot-errors.txt"), "a") as f:
+            f.write(f"{e}\n")
+    gw = os.path.join(EVIDENCE_DIR, "gateway.jsonl")
+    if os.path.exists(gw):
+        with open(gw) as src, open(os.path.join(d, "gateway-events.jsonl"), "w") as dst:
+            dst.writelines(line for line in src if f'"session_id": "{sid}"' in line)
+    return d
+
+
+def _probe(sid: str) -> dict:
+    """Generates traffic from inside the contained pod; every path must fail (000 = no connection)."""
+    cmds = {
+        "egress_via_proxy": 'curl -s -o /dev/null -m 4 -w "%{http_code}" http://paste-mock.lab-ext/probe',
+        "ai_gateway": 'curl -s -o /dev/null -m 4 -w "%{http_code}" http://gateway:8080/v1/messages',
+        "direct_gateway_bypassing_proxy": 'curl -s -o /dev/null -m 4 -w "%{http_code}" --noproxy "*" http://10.96.100.10:3128/',
+    }
+    out = {}
+    for name, cmd in cmds.items():
+        try:
+            _, stdout, _ = k8s.exec_(sid, ["sh", "-c", cmd], timeout=15)
+            out[name] = stdout.strip() or "000"
+        except Exception as e:  # noqa: BLE001
+            out[name] = f"exec-error: {e}"[:100]
+    return out
+
+
 def destroy(store: Store, sid: str, user: str) -> dict:
     s = _owned(store, sid, user)
     if s["state"] in ("running", "creating", "stopping"):
         store.update(sid, state="stopping")
     k8s.delete_pod(sid)
+    k8s.unquarantine(sid)
     shutil.rmtree(os.path.join(WORK, sid), ignore_errors=True)
     store.update(sid, state="destroyed", ended=True)
     evidence.write_sync("session_destroy", session_id=sid, user=user, spec=s["spec_name"])

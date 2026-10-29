@@ -444,6 +444,19 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
 - Trigger-time rejections: extra policy keys, repos outside the spec, non-owners, malformed spec names, and stopping another user's session.
 - A reconciler ends a session (and so invalidates its token) when the pod disappears or fails, which includes the `activeDeadlineSeconds` TTL.
 - Spec loading is minimal: specs are baked into the image and digest-bound per session. Baseline checks at registration are M6.
+
+**M4 results (2026-10-29):** `make containment` passes 16 of 16 checks, and the M1 (12/12) and M3 (21/21) regressions still pass.
+- **D1:** the canary was POSTed to the allowlisted `paste-mock`. The request was allowed by spec (the lab receipt shows it left), detected from gateway evidence, and the session was auto-contained. The alert carries user, session, spec@version + digest, pod/IP, the observed request, and a pointer to the gateway evidence (seq + hash).
+- **D2:** six bypass attempts (raw TCP to the sink, API server, DNS, credproxy ports) are visible **only** in Hubble. They were dropped by Cilium, and the 5-in-60s burst auto-contained the session.
+- **Containment order:** revoke token → per-session `egressDeny`/`ingressDeny` CNP (measured revoke→quarantine 18 ms) → evidence snapshot to `/evidence/sessions/<sid>/` (pod spec/status, compiled session record, agent stdout, the session's gateway events) → in-pod probe. The pod is kept, off the network, for forensics until `destroy`.
+- **Verification needs two independent sources to agree:** Hubble DROPPED flows from the pod after quarantine (218 in the test run) **and** no gateway `allow` for the session after revocation. The in-pod probe is recorded as a third, weaker signal (its output comes from the untrusted pod).
+- The alert is recorded at detection time. Containment and verification are separate records linked by `alert_id` in the hash-chained `alerts.jsonl`, so the timeline is preserved.
+- The detector reads evidence read-only and has no Kubernetes credentials. It can act only by asking the control plane.
+- **Known gaps (for the write-up):**
+  - D3 (tool_use inspection) is implemented but unexercised until API credits exist.
+  - On restart, the detector re-verifies the whole chain but alerts only on events from the last 60s.
+  - Single-replica detector and gateway.
+  - The control plane's public API trusts `X-User` (prototype).
 - **R6:** Cilium `toFQDNs` for credproxy needs DNS proxying through Cilium. If that's flaky in kind, fall back to `toEntities: world` for credproxy only, with the L7 allowlist kept in credproxy.
 - **Resolved:**
   - cuts accepted;

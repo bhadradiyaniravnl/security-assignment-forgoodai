@@ -23,6 +23,11 @@ def _start_reconciler() -> None:
     sessions.reconcile_forever(store)
 
 
+def require_internal(x_sbx_internal: str | None = Header(default=None)) -> None:
+    if not internal.check(x_sbx_internal):
+        raise HTTPException(401, "internal auth required")
+
+
 def require_user(x_user: str | None = Header(default=None)) -> str:
     if not x_user:
         raise HTTPException(401, "X-User required")
@@ -80,6 +85,84 @@ def destroy_session(sid: str, user: str = Depends(require_user)) -> dict:
     return _call(sessions.destroy, sid, user)
 
 
+@app.post("/sessions/{sid}/contain")
+def contain_session(sid: str, user: str = Depends(require_user)) -> dict:
+    s = store.get(sid)
+    if s is None or s["user"] != user:
+        raise HTTPException(404, "no such session")
+    return _call(sessions.contain, sid, f"user:{user}", None, "manual")
+
+
+@app.get("/alerts")
+def list_alerts(user: str = Depends(require_user)) -> list:
+    """Alerts on the caller's sessions, with containment verifications attached."""
+    rows = _read_alerts()
+    verif = {r["alert_id"]: r for r in rows if r.get("action") == "containment_verification"}
+    cont = {r["alert_id"]: r["result"] for r in rows if r.get("action") == "containment"}
+    out = []
+    for a in rows:
+        if a.get("action") == "alert" and a.get("user") == user:
+            out.append({**a, "containment": cont.get(a["alert_id"]), "verification": verif.get(a["alert_id"])})
+    return out
+
+
+class AlertIn(BaseModel):
+    alert_id: str
+    rule: str
+    severity: str
+    session_id: str | None = None
+    summary: str
+    observed: dict = {}
+    evidence: list = []
+    contain: bool = False
+
+
+@app.post("/internal/alerts", dependencies=[Depends(require_internal)])
+def raise_alert(a: AlertIn) -> dict:
+    """Alert sink for the detector. Joins user/spec from the registry so every alert links
+    initiating user -> session -> observed action. The alert is recorded at detection time,
+    then (if requested) the session is contained and a linked containment record is written."""
+    s = store.get(a.session_id) if a.session_id else None
+    who = {"user": s["user"], "spec": s["spec_name"], "spec_digest": s["spec_digest"], "pod": s["pod_name"],
+           "pod_ip": s["pod_ip"]} if s else {}
+    rec = sessions.alerts.write_sync("alert", **a.model_dump(), **who)
+    containment = None
+    if a.contain and s and s["state"] in ("running", "creating", "stopping"):
+        try:
+            containment = sessions.contain(store, a.session_id, "detector", a.alert_id, f"{a.rule}: {a.summary}")
+        except sessions.SessionError as e:
+            containment = {"error": str(e)}
+        sessions.alerts.write_sync("containment", alert_id=a.alert_id, session_id=a.session_id, result=containment)
+    return {**rec, "containment": containment}
+
+
+class VerificationIn(BaseModel):
+    alert_id: str
+    session_id: str
+    verified: bool
+    sources: dict
+
+
+@app.post("/internal/alerts/verification", dependencies=[Depends(require_internal)])
+def verify_alert(v: VerificationIn) -> dict:
+    return sessions.alerts.write_sync("containment_verification", **v.model_dump())
+
+
+@app.get("/internal/alerts", dependencies=[Depends(require_internal)])
+def internal_alerts() -> list:
+    return _read_alerts()
+
+
+def _read_alerts() -> list:
+    import json
+    import os
+    path = sessions.alerts.path
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 @app.get("/sessions/{sid}/diff", response_class=PlainTextResponse)
 def session_diff(sid: str, user: str = Depends(require_user)) -> str:
     return _call(sessions.diff, sid, user)
@@ -88,11 +171,6 @@ def session_diff(sid: str, user: str = Depends(require_user)) -> str:
 def _public(s: dict) -> dict:
     return {k: s.get(k) for k in ("session_id", "user", "spec_name", "spec_digest", "params", "pod_name",
                                   "pod_ip", "state", "detail", "created_at", "ended_at")}
-
-
-def require_internal(x_sbx_internal: str | None = Header(default=None)) -> None:
-    if not internal.check(x_sbx_internal):
-        raise HTTPException(401, "internal auth required")
 
 
 class SessionIn(BaseModel):
