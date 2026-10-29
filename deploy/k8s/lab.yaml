@@ -1,0 +1,100 @@
+# Simulated internet for the scenario. Both sinks record every receipt (ground truth).
+#   attacker-sink: in no spec's egress allowlist
+#   paste-mock:    allowlisted by the demo spec (a "legitimate" upload service)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attacker-sink
+  namespace: lab-ext
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: attacker-sink }
+  template:
+    metadata:
+      labels: { app: attacker-sink }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: sink
+          image: sbx/services:dev
+          imagePullPolicy: Never
+          command: ["python", "-m", "sbx.lab.sink"]
+          env:
+            - { name: SINK_NAME, value: attacker-sink }
+          ports:
+            - { containerPort: 8080 }
+            - { containerPort: 8443 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paste-mock
+  namespace: lab-ext
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: paste-mock }
+  template:
+    metadata:
+      labels: { app: paste-mock }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: sink
+          image: sbx/services:dev
+          imagePullPolicy: Never
+          command: ["python", "-m", "sbx.lab.sink"]
+          env:
+            - { name: SINK_NAME, value: paste-mock }
+          ports:
+            - { containerPort: 8080 }
+            - { containerPort: 8443 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: attacker-sink
+  namespace: lab-ext
+spec:
+  selector: { app: attacker-sink }
+  ports:
+    - { name: http, port: 80, targetPort: 8080 }
+    - { name: https, port: 443, targetPort: 8443 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paste-mock
+  namespace: lab-ext
+spec:
+  selector: { app: paste-mock }
+  ports:
+    - { name: http, port: 80, targetPort: 8080 }
+    - { name: https, port: 443, targetPort: 8443 }

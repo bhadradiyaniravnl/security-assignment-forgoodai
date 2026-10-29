@@ -1,0 +1,10 @@
+# Evidence store: mounted rw by gateway/control-plane, ro by detector, never by sandboxes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: evidence
+  namespace: sbx-system
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 1Gi }

@@ -1,0 +1,148 @@
+# Platform namespace: default deny, then one explicit path per component.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: system-default-deny
+  namespace: sbx-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# DNS for platform pods (sandboxes get none).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: system-dns
+  namespace: sbx-system
+spec:
+  endpointSelector: {}
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports: [{ port: "53", protocol: ANY }]
+          rules:
+            dns: [{ matchPattern: "*" }]
+---
+# gateway: ingress from running sessions; egress to credproxy and control-plane.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: gateway
+  namespace: sbx-system
+spec:
+  endpointSelector:
+    matchLabels: { app: gateway }
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sbx-sessions
+            sbx/state: running
+      toPorts:
+        - ports:
+            - { port: "8080", protocol: TCP }
+            - { port: "3128", protocol: TCP }
+  egress:
+    - toEndpoints:
+        - matchLabels: { app: credproxy }
+      toPorts:
+        - ports: [{ port: "9000", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels: { app: control-plane }
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]
+---
+# credproxy: ingress from gateway and control-plane; the only pod with egress beyond the cluster.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: credproxy
+  namespace: sbx-system
+spec:
+  endpointSelector:
+    matchLabels: { app: credproxy }
+  ingress:
+    - fromEndpoints:
+        - matchLabels: { app: gateway }
+        - matchLabels: { app: control-plane }
+      toPorts:
+        - ports: [{ port: "9000", protocol: TCP }]
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: lab-ext
+      toPorts:
+        - ports:
+            - { port: "8080", protocol: TCP }
+            - { port: "8443", protocol: TCP }
+    - toFQDNs:
+        - matchName: api.anthropic.com
+      toPorts:
+        - ports: [{ port: "443", protocol: TCP }]
+---
+# control-plane: ingress from host (NodePort), gateway, detector; egress to kube-apiserver, credproxy, git-lab.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: control-plane
+  namespace: sbx-system
+spec:
+  endpointSelector:
+    matchLabels: { app: control-plane }
+  ingress:
+    - fromEntities: [host, world]
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]
+    - fromEndpoints:
+        - matchLabels: { app: gateway }
+        - matchLabels: { app: detector }
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]
+  egress:
+    - toEntities: [kube-apiserver]
+    - toEndpoints:
+        - matchLabels: { app: credproxy }
+      toPorts:
+        - ports: [{ port: "9000", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels: { app: git-lab }
+      toPorts:
+        - ports: [{ port: "8080", protocol: TCP }]
+---
+# git-lab: reachable only by the control plane (sandboxes never talk to git).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: git-lab
+  namespace: sbx-system
+spec:
+  endpointSelector:
+    matchLabels: { app: git-lab }
+  ingress:
+    - fromEndpoints:
+        - matchLabels: { app: control-plane }
+      toPorts:
+        - ports: [{ port: "8080", protocol: TCP }]
+---
+# detector: egress to hubble-relay and control-plane only.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: detector
+  namespace: sbx-system
+spec:
+  endpointSelector:
+    matchLabels: { app: detector }
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: hubble-relay
+      toPorts:
+        - ports: [{ port: "4245", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels: { app: control-plane }
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]

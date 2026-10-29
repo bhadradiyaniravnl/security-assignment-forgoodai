@@ -1,0 +1,21 @@
+# All three namespaces enforce the "restricted" Pod Security Standard.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sbx-system
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sbx-sessions
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lab-ext
+  labels:
+    pod-security.kubernetes.io/enforce: restricted

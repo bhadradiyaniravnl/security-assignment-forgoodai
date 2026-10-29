@@ -386,18 +386,21 @@ spec:
 ## 13. Repo layout
 ```
 security-assignment-forgoodai/
-  cli/sbxctl.py
-  control_plane/        app.py, k8s.py, specs/ (schema, baseline, compiler), workspace.py, sessions.py
-  gateway/              ai.py, egress.py, policy.py, evidence.py, validate.py
-  credproxy/            app.py, routes.yaml
-  detector/             rules.py, hubble.py, main.py
-  lab/                  attacker_sink/, paste_mock/, git_lab/
-  images/               sandbox/Dockerfile, services/Dockerfile
-  deploy/               kind.yaml, runsc-install.sh, kustomization.yaml, namespaces/, netpol/, rbac/, apps/
-  specs/                bugfix-agent.yaml, bad-specs/
-  demo-repo/            toy package + tests, fixtures/injections/
-  harness/              run.sh, attacks.sh, report.py
-  spikes/               M0 spike manifests (kept as evidence)
+  src/sbx/                  one Python package, one services image
+    cli/                    sbxctl
+    control_plane/          app, k8s driver, specs/ (schema, baseline, compiler), workspace, sessions
+    gateway/                ai, egress, policy, evidence, validate
+    credproxy/              app, routes
+    detector/               rules, hubble, main
+    lab/                    sink.py (attacker-sink / paste-mock), git_lab
+  images/sandbox/           Dockerfile + entrypoint (waits for task.json, runs claude once)
+  images/services/          Dockerfile + requirements (all platform services)
+  deploy/                   up.sh, down.sh, images.sh, runsc-install.sh, secrets.sh, kind.yaml
+  deploy/k8s/               kustomize: namespaces, RuntimeClass, RBAC, network policies, PVC, lab, apps
+  specs/                    bugfix-agent.yaml, bad-specs/
+  demo-repo/                toy package + tests, fixtures/injections/
+  harness/                  m1_smoke.sh, run.sh, attacks.sh, report.py
+  spikes/                   M0 spike manifests (kept as evidence)
   Makefile  secrets/.example.env  docs/DESIGN.md  docs/THREAT_MODEL.md  docs/SETUP.md
 ```
 

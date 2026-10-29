@@ -1,0 +1,28 @@
+# L3/L4 boundary for sandboxes: deny everything, then let running sessions reach the gateway only.
+# No DNS, no kube-apiserver, no other pods. Containment adds a per-session egressDeny policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sessions-default-deny
+  namespace: sbx-sessions
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: sessions-allow-gateway
+  namespace: sbx-sessions
+spec:
+  endpointSelector:
+    matchLabels: { sbx/state: running }
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sbx-system
+            app: gateway
+      toPorts:
+        - ports:
+            - { port: "8080", protocol: TCP }
+            - { port: "3128", protocol: TCP }
