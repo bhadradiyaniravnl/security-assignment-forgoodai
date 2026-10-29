@@ -489,6 +489,15 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
 - **Lifecycle:** versions are immutable and monotonic. A new version that **widens** access (egress, secrets, tools, models, repos, TTL) needs `annotations.securityApproval`, which is recorded as a warning on the registration event. All 12 bad-spec fixtures in `specs/bad/` are rejected with a specific reason, and every rejection is in the control-plane evidence log.
 - **Admission backstop (`deploy/k8s/admission.yaml`):** a ValidatingAdmissionPolicy in `sbx-sessions` denies pods without `runtimeClassName: gvisor`, with an SA token, without an `sbx/session` label, or mounting hostPath/Secret/projected volumes. It is enforced by the API server even if the control plane is wrong or compromised.
   - **Designed, not built:** restricting pod creation to the `sbx-controller` identity. That would break the platform tests that create pods directly. Production would add it, with a break-glass group.
+
+**M7 results (2026-10-29):** README, THREAT_MODEL (2 pages) and SETUP written.
+- **Clean-room rebuild:** `make down && make up` took 4.6 min with cached images, then `make smoke` 12/12.
+- **Full `make security-test` on the fresh cluster:** exit 0, B 18/18, C pass.
+- **Found and fixed during M7:**
+  - **D3 false positive:** an `Edit` quoting the injected block in order to delete it. D3 and the harness now consider host/.env references only in acting tools (Bash, WebFetch, MCP); a canary in any tool input still fires.
+  - **Host extraction** dropped label hyphens (`paste-mock.lab-ext` became `paste-mock.lab`).
+  - **Detector crash-looped** until the control plane was ready; it now retries.
+- **New Phase A outcome:** "removed injection, did task". Across 18 trials, no agent told the user about the injection.
 - **Known gaps (for the write-up):**
   - D3 (tool_use inspection) is implemented but unexercised until API credits exist.
   - On restart, the detector re-verifies the whole chain but alerts only on events from the last 60s.

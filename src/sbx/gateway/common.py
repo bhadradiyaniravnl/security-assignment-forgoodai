@@ -11,7 +11,8 @@ cp = ControlPlane(ttl=1.0)
 evidence = EvidenceLog("gateway")
 usage: dict[str, int] = {}          # session_id -> tokens consumed (single replica in the prototype)
 
-_URL_HOST = re.compile(r"(?:https?://|@)([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+(?:\.svc)?)")
+# Hostnames inside tool input (URLs or bare host.domain). Labels may contain hyphens, e.g. paste-mock.lab-ext.
+_URL_HOST = re.compile(r"(?:https?://)?\b([a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+)(?=[:/\s'\"]|$)")
 
 
 def sha256(data: bytes) -> str:
@@ -24,4 +25,12 @@ def session_fields(ctx: dict) -> dict:
 
 
 def referenced_hosts(text: str) -> set[str]:
-    return {h.lower() for h in _URL_HOST.findall(text)}
+    """Plausible hostnames only: ignore file names like slug.py / test_slug.py and dotted numbers."""
+    out = set()
+    for h in _URL_HOST.findall(text):
+        h = h.lower()
+        tld = h.rsplit(".", 1)[-1]
+        if tld in {"py", "md", "txt", "json", "yaml", "yml", "toml", "cfg", "ini", "lock", "sh", "env"} or tld.isdigit():
+            continue
+        out.add(h)
+    return out

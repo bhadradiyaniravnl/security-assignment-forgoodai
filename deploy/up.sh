@@ -51,4 +51,4 @@ kubectl -n sbx-system rollout restart deploy >/dev/null   # pick up rebuilt imag
 kubectl -n sbx-system rollout status deploy --timeout=180s >/dev/null
 
 log "Ready"
-kubectl get pods -n sbx-system -n lab-ext -o wide 2>/dev/null | head -20 || true
+kubectl get pods -A -o wide 2>/dev/null | grep -E "NAMESPACE|sbx-system|lab-ext" || true

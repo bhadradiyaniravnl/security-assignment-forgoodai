@@ -124,8 +124,14 @@ async def tail_hubble(http: aiohttp.ClientSession) -> None:
 
 async def main() -> None:
     async with aiohttp.ClientSession(headers=internal.headers(), timeout=aiohttp.ClientTimeout(total=60)) as http:
-        async with http.get(f"{internal.CONTROL_PLANE_URL}/internal/alerts") as r:
-            sent.update(a.get("alert_id") for a in await r.json() if a.get("alert_id"))
+        for attempt in range(60):                     # the control plane may still be starting
+            try:
+                async with http.get(f"{internal.CONTROL_PLANE_URL}/internal/alerts") as r:
+                    sent.update(a.get("alert_id") for a in await r.json() if a.get("alert_id"))
+                break
+            except aiohttp.ClientError:
+                log(detector="waiting for control plane", attempt=attempt)
+                await asyncio.sleep(2)
         log(detector="started", known_alerts=len(sent))
         await asyncio.gather(tail_gateway(http), tail_hubble(http))
 

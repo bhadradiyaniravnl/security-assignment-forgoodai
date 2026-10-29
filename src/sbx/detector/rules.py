@@ -17,6 +17,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 DENY_REASONS = {"default_deny", "model_not_allowed", "budget", "credproxy_refused"}
+ACTING_TOOLS = {"Bash", "WebFetch", "WebSearch", "BashOutput", "Task"}
 
 
 def _id(*parts) -> str:
@@ -52,7 +53,12 @@ class Engine:
         if e.get("decision") == "deny" and e.get("reason") in DENY_REASONS:
             out += self._denial(sid, e.get("ts"), f"gateway denied {act} to {e.get('dest_host') or e.get('model')} "
                                                   f"({e.get('reason')})", action, ref, policy)
-        if act == "ai_tool_use" and (e.get("canary_match") or e.get("refs_env_file") or e.get("refs_disallowed_hosts")):
+        # Host/.env references only count for tools that can act on them; an Edit that quotes the
+        # injected comment (e.g. to delete it) is not an attempt. A canary in ANY tool input counts:
+        # writing the secret into code or a message is itself a leak.
+        acting = (e.get("tool") or "") in ACTING_TOOLS or (e.get("tool") or "").startswith("mcp__")
+        if act == "ai_tool_use" and (e.get("canary_match") or
+                                     (acting and (e.get("refs_env_file") or e.get("refs_disallowed_hosts")))):
             why = [w for w, hit in (("canary", e.get("canary_match")), (".env", e.get("refs_env_file")),
                                     (f"hosts {e.get('refs_disallowed_hosts')}", e.get("refs_disallowed_hosts"))) if hit]
             out.append(alert("D3", "medium", sid, f"model requested {e.get('tool')} referencing {', '.join(why)}",
