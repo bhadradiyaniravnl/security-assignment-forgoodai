@@ -27,7 +27,8 @@ if ! kubectl -n kube-system get ds cilium >/dev/null 2>&1; then
     --set kubeProxyReplacement=true \
     --set k8sServiceHost="$CLUSTER-control-plane" --set k8sServicePort=6443 \
     --set hubble.enabled=true --set hubble.relay.enabled=true \
-    --set ipam.mode=kubernetes
+    --set ipam.mode=kubernetes \
+    --set socketLB.hostNamespaceOnly=true   # gVisor bypasses socket-LB hooks; use per-packet LB for pods
 fi
 cilium status --wait --wait-duration 8m >/dev/null
 
@@ -41,8 +42,13 @@ deploy/images.sh
 
 log "Manifests"
 kubectl apply -k deploy/k8s >/dev/null
+if ! kubectl -n sbx-system get secret sbx-internal >/dev/null 2>&1; then
+  kubectl -n sbx-system create secret generic sbx-internal --from-literal=key="$(openssl rand -hex 32)" >/dev/null
+fi
 if [ -f secrets/.env ]; then deploy/secrets.sh; else echo "secrets/.env missing: credproxy will not start (see secrets/.example.env)"; fi
 kubectl -n lab-ext rollout status deploy --timeout=180s >/dev/null
+kubectl -n sbx-system rollout restart deploy >/dev/null   # pick up rebuilt images
+kubectl -n sbx-system rollout status deploy --timeout=180s >/dev/null
 
 log "Ready"
 kubectl get pods -n sbx-system -n lab-ext -o wide 2>/dev/null | head -20 || true

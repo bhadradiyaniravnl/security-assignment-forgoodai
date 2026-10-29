@@ -48,13 +48,15 @@ spec:
     - toEndpoints:
         - matchLabels: { app: credproxy }
       toPorts:
-        - ports: [{ port: "9000", protocol: TCP }]
+        - ports:
+            - { port: "9000", protocol: TCP }
+            - { port: "9001", protocol: TCP }
     - toEndpoints:
         - matchLabels: { app: control-plane }
       toPorts:
         - ports: [{ port: "8000", protocol: TCP }]
 ---
-# credproxy: ingress from gateway and control-plane; the only pod with egress beyond the cluster.
+# credproxy: ingress from gateway and control-plane; policy lookups to control-plane; the only pod with egress beyond the cluster.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -69,7 +71,15 @@ spec:
         - matchLabels: { app: control-plane }
       toPorts:
         - ports: [{ port: "9000", protocol: TCP }]
+    - fromEndpoints:
+        - matchLabels: { app: gateway }
+      toPorts:
+        - ports: [{ port: "9001", protocol: TCP }]
   egress:
+    - toEndpoints:
+        - matchLabels: { app: control-plane }
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: lab-ext
@@ -97,6 +107,7 @@ spec:
         - ports: [{ port: "8000", protocol: TCP }]
     - fromEndpoints:
         - matchLabels: { app: gateway }
+        - matchLabels: { app: credproxy }
         - matchLabels: { app: detector }
       toPorts:
         - ports: [{ port: "8000", protocol: TCP }]

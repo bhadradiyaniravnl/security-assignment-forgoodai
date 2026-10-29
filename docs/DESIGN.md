@@ -430,6 +430,13 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
 - Containment by relabel takes ~45s; a per-session `egressDeny` CNP takes ≤1s. The design now uses the deny policy (§4.5, §10).
 - No `/var/run/secrets` in the sandbox (`automountServiceAccountToken: false`).
 - Versions: kind v0.33.0, Kubernetes client v1.37.2, Cilium 1.20.1 (kube-proxy replacement, Hubble relay), containerd 2.3.4, gVisor release-20261019.0.
+
+**M2 results (2026-10-29):** `make e2e` passes 16 of 18 checks. The 2 remaining (`claude -p` end to end, and tool_use parsing on a live stream) are blocked only by API credits: the request reaches Anthropic with the injected key and is refused for billing.
+- **Cilium + gVisor:** with kube-proxy replacement, Service IPs are translated in socket-level (cgroup `connect`) hooks, and per-packet translation is skipped for pod traffic. gVisor's netstack never calls the host `connect()`, so sandbox traffic to a ClusterIP arrived untranslated, was classified as `world`, and was dropped by default-deny. Fix: `socketLB.hostNamespaceOnly=true` (pods use per-packet LB). Persisted in `deploy/up.sh`.
+- **httpoxy:** curl ignores upper-case `HTTP_PROXY`, so plain-HTTP requests went direct and were dropped by Cilium. This confirms the bypass path is closed. Sandboxes also get lower-case `http_proxy`/`https_proxy`/`no_proxy`.
+- **Compression:** gzip responses were relayed without their `Content-Encoding` header, which corrupted client responses and hid tool_use blocks from the gateway. credproxy now requests `Accept-Encoding: identity` upstream, because the gateway must inspect bodies.
+- **Claude Code model fallback:** with only `--model` set, Claude Code 2.1.1 also called `claude-sonnet-4-5-*` / `claude-haiku-4-5-*`, which the spec denied. Sandboxes now set `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` from the spec. This is a realistic D2 false-positive source.
+- **Secret-handling incident (contained):** a real API key was saved into the tracked `secrets/.example.env` and committed locally (never pushed). We rewrote history, purged the objects, rotated the key, and added a pre-commit guard (`scripts/git-hooks/pre-commit`, `make hooks`) that blocks `secrets/*`, filled-in templates and key-shaped strings.
 - **R6:** Cilium `toFQDNs` for credproxy needs DNS proxying through Cilium. If that's flaky in kind, fall back to `toEntities: world` for credproxy only, with the L7 allowlist kept in credproxy.
 - **Resolved:**
   - cuts accepted;

@@ -9,3 +9,4 @@ resources:
   - netpol-lab.yaml
   - evidence-pvc.yaml
   - lab.yaml
+  - apps.yaml

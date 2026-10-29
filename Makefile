@@ -1,4 +1,4 @@
-.PHONY: up down images apply secrets status smoke
+.PHONY: up down images apply secrets status smoke e2e hooks
 
 up:        ## Colima VM, kind cluster, Cilium, gVisor, images, manifests
 	deploy/up.sh
@@ -20,3 +20,9 @@ status:
 
 smoke:     ## M1 boundary smoke test (gVisor, Cilium policies, lab ingress, containment)
 	harness/m1_smoke.sh
+
+e2e:       ## M2 end-to-end test (gateways, credproxy, evidence)
+	harness/m2_e2e.sh
+
+hooks:     ## Enable the repo's git hooks (pre-commit secret guard)
+	git config core.hooksPath scripts/git-hooks
