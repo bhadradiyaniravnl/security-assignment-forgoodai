@@ -1,0 +1,17 @@
+# Default deny for every session pod; only sbx/state=running may reach the gateway on 8080.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: sessions-default-deny, namespace: spike-sessions }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: { name: sessions-allow-gateway, namespace: spike-sessions }
+spec:
+  endpointSelector: { matchLabels: { sbx/state: running } }
+  egress:
+  - toEndpoints:
+    - matchLabels: { k8s:io.kubernetes.pod.namespace: spike-system, app: gateway }
+    toPorts: [{ ports: [{ port: "8080", protocol: TCP }] }]
