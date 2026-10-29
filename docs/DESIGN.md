@@ -431,7 +431,7 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
 - No `/var/run/secrets` in the sandbox (`automountServiceAccountToken: false`).
 - Versions: kind v0.33.0, Kubernetes client v1.37.2, Cilium 1.20.1 (kube-proxy replacement, Hubble relay), containerd 2.3.4, gVisor release-20261019.0.
 
-**M2 results (2026-10-29):** `make e2e` passes 16 of 18 checks. The 2 remaining (`claude -p` end to end, and tool_use parsing on a live stream) are blocked only by API credits: the request reaches Anthropic with the injected key and is refused for billing.
+**M2 results (2026-10-29):** `make e2e` passes 19 of 19 with real model calls: `claude -p` runs through the gateway with the key injected by credproxy, and tool_use is parsed from the live stream. The test is ordered around D1, so the HTTP canary send comes last and the auto-containment it triggers is asserted.
 - **Cilium + gVisor:** with kube-proxy replacement, Service IPs are translated in socket-level (cgroup `connect`) hooks, and per-packet translation is skipped for pod traffic. gVisor's netstack never calls the host `connect()`, so sandbox traffic to a ClusterIP arrived untranslated, was classified as `world`, and was dropped by default-deny. Fix: `socketLB.hostNamespaceOnly=true` (pods use per-packet LB). Persisted in `deploy/up.sh`.
 - **httpoxy:** curl ignores upper-case `HTTP_PROXY`, so plain-HTTP requests went direct and were dropped by Cilium. This confirms the bypass path is closed. Sandboxes also get lower-case `http_proxy`/`https_proxy`/`no_proxy`.
 - **Compression:** gzip responses were relayed without their `Content-Encoding` header, which corrupted client responses and hid tool_use blocks from the gateway. credproxy now requests `Accept-Encoding: identity` upstream, because the gateway must inspect bodies.
@@ -452,6 +452,10 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
 - **Verification needs two independent sources to agree:** Hubble DROPPED flows from the pod after quarantine (218 in the test run) **and** no gateway `allow` for the session after revocation. The in-pod probe is recorded as a third, weaker signal (its output comes from the untrusted pod).
 - The alert is recorded at detection time. Containment and verification are separate records linked by `alert_id` in the hash-chained `alerts.jsonl`, so the timeline is preserved.
 - The detector reads evidence read-only and has no Kubernetes credentials. It can act only by asking the control plane.
+- **First real agent run (clean task, no injection):** `sbxctl run bugfix-agent … -f` fixed `slugkit/slug.py` (4/4 tests) in about 18 s, 7 turns, $0.085. The collected diff touches only `slug.py`.
+  - Gateway evidence: 10 allowed AI requests (sonnet + haiku, both in spec) and 6 tool_use events (Read/Glob/Edit/Bash).
+  - **Observed false positive:** one `CONNECT api.anthropic.com:443` via `HTTPS_PROXY`. Claude Code sends some side traffic outside `ANTHROPIC_BASE_URL` even with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. It was denied (not in `egress.allow`) and raised one medium D2 "first denial" alert, with no containment.
+  - Tuning options: allowlist it per spec (this widens a channel to the model provider), route it via the AI gateway, or accept it as known noise (current choice: documented, below the burst threshold).
 - **Known gaps (for the write-up):**
   - D3 (tool_use inspection) is implemented but unexercised until API credits exist.
   - On restart, the detector re-verifies the whole chain but alerts only on events from the last 60s.
