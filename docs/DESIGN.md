@@ -471,6 +471,24 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
 - **Phase C:** the clean task passes with all controls enabled. Tests are re-run on the collected diff in a fresh `--network none` container, not in the agent's pod.
 - **Harness pitfall found:** `git apply` run inside another repo's work tree silently skips paths outside the cwd and exits 0, which made every task look failed. The harness now uses `patch -p1`.
 - **Every run shows D2/medium:** the Claude Code side-channel `CONNECT api.anthropic.com` false positive.
+
+**M6 results (2026-10-29):** `make specs` passes 28 of 28. `make security-test` Phase B is now 18/18 (adds B14, B15). M1, M3 and M4 regressions pass.
+- **Registry:** specs are registered via `POST /specs` / `sbxctl spec register` by listed spec authors only (`SBX_SPEC_AUTHORS`). They are stored by (name, version) with a digest, and runs always use the latest *registered* version, bound by digest. Shipped specs go through the same gate at startup (`system:bootstrap`).
+- **Org baseline (`control_plane/baseline.py`):**
+  - strict schema (unknown fields rejected);
+  - image from an approved prefix and digest-pinned (documented local-dev exception for kind-loaded `:dev` tags, recorded as a warning);
+  - gVisor only;
+  - TTL ≤ 2h; CPU/memory caps;
+  - approved models; token cap;
+  - egress = exact hostnames from an approved destination catalogue (no wildcards, URLs or IPs);
+  - secrets only from the credproxy catalogue;
+  - `repo.access: read`;
+  - unrestricted Bash only with `annotations.riskAcceptance`;
+  - parameters must be bounded strings and never policy keys;
+  - D2 burst bounds.
+- **Lifecycle:** versions are immutable and monotonic. A new version that **widens** access (egress, secrets, tools, models, repos, TTL) needs `annotations.securityApproval`, which is recorded as a warning on the registration event. All 12 bad-spec fixtures in `specs/bad/` are rejected with a specific reason, and every rejection is in the control-plane evidence log.
+- **Admission backstop (`deploy/k8s/admission.yaml`):** a ValidatingAdmissionPolicy in `sbx-sessions` denies pods without `runtimeClassName: gvisor`, with an SA token, without an `sbx/session` label, or mounting hostPath/Secret/projected volumes. It is enforced by the API server even if the control plane is wrong or compromised.
+  - **Designed, not built:** restricting pod creation to the `sbx-controller` identity. That would break the platform tests that create pods directly. Production would add it, with a break-glass group.
 - **Known gaps (for the write-up):**
   - D3 (tool_use inspection) is implemented but unexercised until API credits exist.
   - On restart, the detector re-verifies the whole chain but alerts only on events from the last 60s.

@@ -1,0 +1,35 @@
+# Admission backstop for session pods, enforced by the API server independently of the control
+# plane: even a buggy or compromised controller cannot launch a weaker sandbox. Complements the
+# "restricted" Pod Security Standard on the namespace (no privileged/hostPath/hostNetwork, etc.).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: sbx-session-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'"
+      message: "session pods must run under the gvisor RuntimeClass"
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      message: "session pods must not mount a service account token"
+    - expression: "has(object.metadata.labels) && 'sbx/session' in object.metadata.labels"
+      message: "session pods must carry an sbx/session label (attribution and quarantine selector)"
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath) && !has(v.secret) && !has(v.projected))"
+      message: "session pods may not mount hostPath, Secret or projected volumes"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sbx-session-pods
+spec:
+  policyName: sbx-session-pods
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels: { kubernetes.io/metadata.name: sbx-sessions }

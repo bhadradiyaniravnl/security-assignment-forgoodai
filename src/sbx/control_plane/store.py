@@ -26,6 +26,16 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at   REAL NOT NULL,
   ended_at     REAL
 );
+CREATE TABLE IF NOT EXISTS specs (
+  name          TEXT NOT NULL,
+  version       INTEGER NOT NULL,
+  digest        TEXT NOT NULL,
+  body          BLOB NOT NULL,
+  registered_by TEXT NOT NULL,
+  warnings      TEXT NOT NULL DEFAULT '[]',
+  registered_at REAL NOT NULL,
+  PRIMARY KEY (name, version)
+);
 """
 
 
@@ -63,6 +73,18 @@ class Store:
     def by_token(self, token: str) -> dict | None:
         row = self.db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash(token),)).fetchone()
         return _row(row)
+
+    def add_spec(self, name: str, version: int, digest: str, body: bytes, by: str, warnings: list) -> None:
+        self.db.execute("INSERT INTO specs VALUES (?,?,?,?,?,?,?)",
+                        (name, version, digest, body, by, json.dumps(warnings), time.time()))
+
+    def latest_spec(self, name: str) -> dict | None:
+        row = self.db.execute("SELECT * FROM specs WHERE name=? ORDER BY version DESC LIMIT 1", (name,)).fetchone()
+        return dict(row) if row else None
+
+    def list_specs(self) -> list[dict]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT name, version, digest, registered_by, warnings, registered_at FROM specs ORDER BY name, version")]
 
     def list(self) -> list[dict]:
         return [_row(r) for r in self.db.execute("SELECT * FROM sessions ORDER BY created_at DESC")]

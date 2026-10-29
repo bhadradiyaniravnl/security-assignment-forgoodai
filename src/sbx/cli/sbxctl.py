@@ -3,6 +3,7 @@
   sbxctl run bugfix-agent -p repo=demo/app -p task="Make the tests pass" [-f]
   sbxctl ls | status SID | logs SID [-f] [--raw] | stop SID | diff SID | destroy SID
   sbxctl contain SID | alerts
+  sbxctl spec register FILE | spec ls
 """
 from __future__ import annotations
 
@@ -18,9 +19,11 @@ API = os.environ.get("SBX_API", "http://127.0.0.1:8443")
 USER = os.environ.get("SBX_USER", getpass.getuser())
 
 
-def call(method: str, path: str, body: dict | None = None, stream: bool = False):
-    req = urllib.request.Request(API + path, method=method, headers={"X-User": USER, "Content-Type": "application/json"},
-                                 data=json.dumps(body).encode() if body is not None else None)
+def call(method: str, path: str, body: dict | bytes | None = None, stream: bool = False):
+    raw = isinstance(body, bytes)
+    req = urllib.request.Request(API + path, method=method,
+                                 headers={"X-User": USER, "Content-Type": "application/yaml" if raw else "application/json"},
+                                 data=body if raw else (json.dumps(body).encode() if body is not None else None))
     try:
         resp = urllib.request.urlopen(req, timeout=None if stream else 300)
     except urllib.error.HTTPError as e:
@@ -29,6 +32,8 @@ def call(method: str, path: str, body: dict | None = None, stream: bool = False)
             detail = json.loads(detail).get("detail", detail)
         except ValueError:
             pass
+        if isinstance(detail, dict) and detail.get("reasons"):
+            detail = detail["error"] + "".join(f"\n  - {r}" for r in detail["reasons"])
         sys.exit(f"error {e.code}: {detail}")
     except urllib.error.URLError as e:
         sys.exit(f"control plane unreachable at {API}: {e.reason}")
@@ -89,6 +94,9 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("-f", "--follow", action="store_true", help="stream progress until the agent exits")
     sub.add_parser("ls", help="list your sessions")
     sub.add_parser("alerts", help="detections and containment verifications for your sessions")
+    sp = sub.add_parser("spec", help="register or list agent specs")
+    sp.add_argument("action", choices=["register", "ls"])
+    sp.add_argument("file", nargs="?")
     for name in ("status", "stop", "diff", "destroy", "contain"):
         sub.add_parser(name).add_argument("sid")
     lg = sub.add_parser("logs", help="agent progress (from pod stdout; not security evidence)")
@@ -125,6 +133,17 @@ def main(argv: list[str] | None = None) -> None:
             print(f"{e['seq']:>4} {e['rule']:<3} {e['severity']:<6} {e.get('session_id') or '-':<10} "
                   f"user={e.get('user')} spec={e.get('spec')}\n     {e['summary']}"
                   + (f"\n     contained in {c.get('elapsed_s')}s probe_blocked={c.get('probe_blocked')}" if c.get('quarantined_at') else ""))
+    elif a.cmd == "spec" and a.action == "register":
+        if not a.file:
+            sys.exit("spec register needs a FILE")
+        r = call("POST", "/specs", open(a.file, "rb").read())
+        print(f"registered {r['name']} v{r['version']} {r['digest'][:19]}…" + (" (unchanged)" if r.get("unchanged") else ""))
+        for w in r.get("warnings", []):
+            print(f"  warning: {w}")
+    elif a.cmd == "spec":
+        for r in call("GET", "/specs"):
+            print(f"{r['name']:<20} v{r['version']:<3} {r['digest'][:19]}…  by {r['registered_by']:<17} "
+                  f"warnings={len(json.loads(r['warnings']))}")
     elif a.cmd == "destroy":
         print(json.dumps(call("DELETE", f"/sessions/{a.sid}")))
 

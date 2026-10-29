@@ -28,6 +28,7 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: CP_DB, value: /data/cp.db }
+            - { name: SBX_SPEC_AUTHORS, value: monalir }      # who may register specs (prototype; prod: CODEOWNERS + CI)
             - name: SBX_INTERNAL_KEY
               valueFrom: { secretKeyRef: { name: sbx-internal, key: key } }
           ports: [{ containerPort: 8000 }]

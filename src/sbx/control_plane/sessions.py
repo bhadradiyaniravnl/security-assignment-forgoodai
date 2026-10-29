@@ -39,7 +39,7 @@ class SessionError(Exception):
 
 def run(store: Store, user: str, spec_name: str, params: dict) -> dict:
     try:
-        spec, digest = specs.load(spec_name)
+        spec, digest = specs.load(store, spec_name)
         specs.authorize(spec, user)
         specs.validate_params(spec, params)
         policy = specs.compile_policy(spec)

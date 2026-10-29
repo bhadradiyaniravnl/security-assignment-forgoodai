@@ -1,8 +1,6 @@
-"""Agent specs: loading, parameter validation and compilation into a per-session policy.
-
-M3 keeps this minimal (load, digest, owner check, parameter schema, compile). The org
-baseline checks at registration time arrive in M6.
-"""
+"""Agent specs: registry (baseline-checked, versioned, immutable), parameter validation and
+compilation into a per-session policy. Runs always use the latest *registered* version, bound
+by digest; nothing reads spec files at run time."""
 from __future__ import annotations
 
 import fnmatch
@@ -13,23 +11,67 @@ import re
 import jsonschema
 import yaml
 
+from sbx.control_plane import baseline
+
 SPECS_DIR = os.environ.get("SPECS_DIR", "/app/specs")
+SPEC_AUTHORS = set(filter(None, os.environ.get("SBX_SPEC_AUTHORS", "").split(",")))
 NAME_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 
 
 class SpecError(ValueError):
-    pass
+    def __init__(self, msg: str, details: list | None = None):
+        super().__init__(msg)
+        self.details = details or []
 
 
-def load(name: str) -> tuple[dict, str]:
-    """Returns (spec, digest). The digest binds every session to the exact spec bytes."""
+def digest_of(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def register(store, raw: bytes, by: str) -> dict:
+    """Baseline-checks and stores a new spec version. Returns {name, version, digest, warnings}."""
+    if by not in SPEC_AUTHORS and not by.startswith("system:"):
+        raise PermissionError(f"{by} is not a spec author")
+    try:
+        spec = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        raise SpecError(f"not valid YAML: {e}") from None
+    if not isinstance(spec, dict):
+        raise SpecError("spec must be a mapping")
+    name = (spec.get("metadata") or {}).get("name", "")
+    prev_row = store.latest_spec(name) if isinstance(name, str) and NAME_RE.match(name) else None
+    prev = yaml.safe_load(prev_row["body"]) if prev_row else None
+    digest = digest_of(raw)
+    if prev_row and prev_row["digest"] == digest:
+        return {"name": name, "version": prev_row["version"], "digest": digest, "warnings": [], "unchanged": True}
+    errors, warnings = baseline.check(spec, prev)
+    if errors:
+        raise SpecError("rejected by org baseline", errors)
+    store.add_spec(name, spec["metadata"]["version"], digest, raw, by, warnings)
+    return {"name": name, "version": spec["metadata"]["version"], "digest": digest, "warnings": warnings}
+
+
+def bootstrap(store) -> list[dict]:
+    """Registers the specs shipped with the deployment through the same baseline gate."""
+    out = []
+    for f in sorted(os.listdir(SPECS_DIR)):
+        if f.endswith(".yaml"):
+            raw = open(os.path.join(SPECS_DIR, f), "rb").read()
+            try:
+                out.append(register(store, raw, "system:bootstrap"))
+            except SpecError as e:
+                out.append({"file": f, "rejected": e.details or str(e)})
+    return out
+
+
+def load(store, name: str) -> tuple[dict, str]:
+    """Returns (spec, digest) of the latest registered version."""
     if not NAME_RE.match(name):
         raise SpecError("invalid spec name")
-    path = os.path.join(SPECS_DIR, f"{name}.yaml")
-    if not os.path.exists(path):
+    row = store.latest_spec(name)
+    if row is None:
         raise SpecError(f"unknown spec {name}")
-    raw = open(path, "rb").read()
-    return yaml.safe_load(raw), "sha256:" + hashlib.sha256(raw).hexdigest()
+    return yaml.safe_load(row["body"]), row["digest"]
 
 
 def authorize(spec: dict, user: str) -> None:

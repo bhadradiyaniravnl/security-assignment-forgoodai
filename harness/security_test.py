@@ -325,6 +325,37 @@ def phase_b() -> list[dict]:
     case("B12", "trigger cannot widen policy", "400 / 400 / 403", f"{st1} / {st2} / {st3}",
          (st1, st2, st3) == (400, 400, 403), {"control_plane": "run_rejected events"})
 
+    # B14 unsafe specs never reach the registry (org baseline at registration)
+    bad_dir = os.path.join(ROOT, "specs", "bad")
+    outcomes = {}
+    for f in sorted(os.listdir(bad_dir)):
+        req = urllib.request.Request(API + "/specs", method="POST", data=open(os.path.join(bad_dir, f), "rb").read(),
+                                     headers={"X-User": USER, "Content-Type": "application/yaml"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                outcomes[f] = r.status
+        except urllib.error.HTTPError as e:
+            outcomes[f] = e.code
+    rejected = sum(1 for c in outcomes.values() if c == 422)
+    case("B14", "unsafe specs rejected at registration", f"{len(outcomes)}/{len(outcomes)} rejected (422)",
+         f"{rejected}/{len(outcomes)} rejected", rejected == len(outcomes), {"control_plane": outcomes})
+
+    # B15 API-server admission backstop: a pod without gVisor cannot be created in sbx-sessions
+    manifest = json.dumps({"apiVersion": "v1", "kind": "Pod",
+                           "metadata": {"name": "weak-harness", "namespace": "sbx-sessions", "labels": {"sbx/session": "x"}},
+                           "spec": {"automountServiceAccountToken": False,
+                                    "securityContext": {"runAsNonRoot": True, "runAsUser": 1000,
+                                                        "seccompProfile": {"type": "RuntimeDefault"}},
+                                    "containers": [{"name": "a", "image": "sbx/sandbox:dev", "imagePullPolicy": "Never",
+                                                    "command": ["sleep", "5"],
+                                                    "securityContext": {"allowPrivilegeEscalation": False,
+                                                                        "capabilities": {"drop": ["ALL"]}}}]}})
+    rc, out = sh(["kubectl", "apply", "-f", "-"], input_=manifest)
+    sh(["kubectl", "-n", "sbx-sessions", "delete", "pod", "weak-harness", "--wait=false"])
+    denied = rc != 0 and "sbx-session-pods" in out
+    case("B15", "admission policy blocks a non-gVisor session pod", "denied by ValidatingAdmissionPolicy",
+         "denied" if denied else f"ADMITTED rc={rc}", denied, {"api_server": out.strip()[-160:]})
+
     for sid in (gw, net):
         api("DELETE", f"/sessions/{sid}")
     return results

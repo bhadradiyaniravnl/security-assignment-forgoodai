@@ -6,12 +6,12 @@ Internal (X-Sbx-Internal): token validation, compiled policy, revocation, regist
 """
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from sbx.common import internal
-from sbx.control_plane import k8s, sessions
+from sbx.control_plane import k8s, sessions, specs
 from sbx.control_plane.store import Store
 
 app = FastAPI(title="sbx control plane")
@@ -19,7 +19,10 @@ store = Store()
 
 
 @app.on_event("startup")
-def _start_reconciler() -> None:
+def _startup() -> None:
+    for r in specs.bootstrap(store):
+        action = "spec_rejected" if "rejected" in r else "spec_registered"
+        sessions.evidence.write_sync(action, by="system:bootstrap", **{k: v for k, v in r.items() if k != "unchanged"})
     sessions.reconcile_forever(store)
 
 
@@ -39,6 +42,28 @@ def _call(fn, *args):
         return fn(store, *args)
     except sessions.SessionError as e:
         raise HTTPException(e.status, str(e)) from None
+
+
+@app.post("/specs")
+async def register_spec(request: Request, user: str = Depends(require_user)) -> dict:
+    """Spec authors register a new version (raw YAML body). Rejected specs never reach the registry."""
+    raw = await request.body()
+    try:
+        r = specs.register(store, raw, user)
+    except PermissionError as e:
+        sessions.evidence.write_sync("spec_rejected", by=user, digest=specs.digest_of(raw), reasons=[str(e)])
+        raise HTTPException(403, str(e)) from None
+    except specs.SpecError as e:
+        sessions.evidence.write_sync("spec_rejected", by=user, digest=specs.digest_of(raw), reasons=e.details or [str(e)])
+        raise HTTPException(422, {"error": str(e), "reasons": e.details or [str(e)]}) from None
+    if not r.get("unchanged"):
+        sessions.evidence.write_sync("spec_registered", by=user, **r)
+    return r
+
+
+@app.get("/specs")
+def list_specs(user: str = Depends(require_user)) -> list:
+    return store.list_specs()
 
 
 class RunIn(BaseModel):

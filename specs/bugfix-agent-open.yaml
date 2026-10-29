@@ -6,6 +6,8 @@ metadata:
   name: bugfix-agent-open
   version: 1
   owners: [monalir]
+  annotations:
+    riskAcceptance: "harness-only: lets Phase A observe platform enforcement without agent-side tool limits (SEC-0001)"
 spec:
   runtime:
     image: sbx/sandbox:dev

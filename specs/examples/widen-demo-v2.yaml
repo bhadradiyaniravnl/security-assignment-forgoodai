@@ -1,0 +1,32 @@
+# EXPECTED REJECTION: widens access (new tool) without securityApproval
+apiVersion: sbx/v1
+kind: AgentSpec
+metadata:
+  name: widen-demo
+  version: 2
+  owners: [monalir]
+spec:
+  runtime:
+    image: sbx/sandbox:dev
+    runtimeClass: gvisor
+    resources: { cpu: "2", memory: 4Gi }
+    ttl: 30m
+  model:
+    allow: [claude-sonnet-5-5, claude-haiku-5-5]
+    default: claude-sonnet-5-5
+    small: claude-haiku-5-5
+    maxTokens: 2000000
+  repo:
+    allow: ["demo/*"]
+    access: read
+  agentTools:
+    allow: [Read, Edit, Write, Glob, Grep, "Bash(python3 -m pytest:*)", "Bash(git diff:*)", "Bash(git status:*)", WebFetch]
+  egress:
+    allow: [paste-mock.lab-ext]
+  secrets:
+    - ref: anthropic/default
+  detection:
+    denyBurst: { count: 5, window: 60s }
+  parameters:
+    repo: { type: string, pattern: "^demo/[a-z0-9-]+$" }
+    task: { type: string, maxLength: 4000 }

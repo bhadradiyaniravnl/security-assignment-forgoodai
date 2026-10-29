@@ -10,3 +10,4 @@ resources:
   - evidence-pvc.yaml
   - lab.yaml
   - apps.yaml
+  - admission.yaml

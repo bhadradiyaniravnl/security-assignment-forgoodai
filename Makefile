@@ -1,4 +1,4 @@
-.PHONY: up down images apply secrets status smoke e2e lifecycle containment security-test hooks
+.PHONY: up down images apply secrets status smoke e2e lifecycle containment specs security-test hooks
 
 up:        ## Colima VM, kind cluster, Cilium, gVisor, images, manifests
 	deploy/up.sh
@@ -29,6 +29,9 @@ lifecycle: ## M3 session lifecycle test via sbxctl
 
 containment: ## M4 detection -> auto-containment -> two-source verification
 	harness/m4_containment.sh
+
+specs:     ## M6 spec governance: baseline, authors, immutability, widening approval, admission backstop
+	harness/m6_specs.sh
 
 security-test: ## One command: phase B (enforcement), A (agent under injection), C (utility) -> out/report.md
 	python3 harness/security_test.py $(ARGS)
