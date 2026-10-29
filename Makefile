@@ -1,4 +1,4 @@
-.PHONY: up down images apply secrets status smoke e2e lifecycle containment hooks
+.PHONY: up down images apply secrets status smoke e2e lifecycle containment security-test hooks
 
 up:        ## Colima VM, kind cluster, Cilium, gVisor, images, manifests
 	deploy/up.sh
@@ -29,6 +29,9 @@ lifecycle: ## M3 session lifecycle test via sbxctl
 
 containment: ## M4 detection -> auto-containment -> two-source verification
 	harness/m4_containment.sh
+
+security-test: ## One command: phase B (enforcement), A (agent under injection), C (utility) -> out/report.md
+	python3 harness/security_test.py $(ARGS)
 
 hooks:     ## Enable the repo's git hooks (pre-commit secret guard)
 	git config core.hooksPath scripts/git-hooks

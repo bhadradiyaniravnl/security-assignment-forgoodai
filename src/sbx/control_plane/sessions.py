@@ -82,9 +82,11 @@ def run(store: Store, user: str, spec_name: str, params: dict) -> dict:
 
 def stop(store: Store, sid: str, user: str) -> dict:
     s = _owned(store, sid, user)
-    if s["state"] not in ("running", "creating"):
+    if s["state"] not in ("running", "creating", "contained"):
         raise SessionError(409, f"session is {s['state']}")
-    store.update(sid, state="stopping")                                 # gateway rejects from here on
+    was_contained = s["state"] == "contained"
+    if not was_contained:
+        store.update(sid, state="stopping")                             # gateway rejects from here on
     diff, rc = "", None
     if k8s.pod_status(sid):
         rc, diff, _ = k8s.exec_(sid, ["sh", "-c", "cd /workspace/repo && git add -A >/dev/null 2>&1; "
@@ -92,6 +94,11 @@ def stop(store: Store, sid: str, user: str) -> dict:
     os.makedirs(RESULTS, exist_ok=True)
     with open(os.path.join(RESULTS, f"{sid}.diff"), "w") as f:
         f.write(diff)
+    if was_contained:                                                   # keep the frozen pod for forensics
+        evidence.write_sync("session_stop", session_id=sid, user=user, spec=s["spec_name"],
+                            spec_digest=s["spec_digest"], diff_bytes=len(diff),
+                            diff_sha256=hashlib.sha256(diff.encode()).hexdigest(), exec_rc=rc, pod_kept=True)
+        return {"session_id": sid, "state": "contained", "diff_bytes": len(diff)}
     k8s.delete_pod(sid)
     store.update(sid, state="stopped", detail="stopped by user", ended=True)
     evidence.write_sync("session_stop", session_id=sid, user=user, spec=s["spec_name"], spec_digest=s["spec_digest"],

@@ -19,6 +19,7 @@ RUN mkdir -p /etc/lab-tls && openssl req -x509 -newkey rsa:2048 -nodes -days 365
 COPY src /app/src
 COPY specs /app/specs
 COPY demo-repo /app/demo-repo
+COPY fixtures /app/fixtures
 ENV PYTHONPATH=/app/src PYTHONUNBUFFERED=1
 USER 10001
 WORKDIR /app
