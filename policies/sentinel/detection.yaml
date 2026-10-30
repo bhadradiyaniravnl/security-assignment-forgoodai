@@ -1,0 +1,121 @@
+# Sentinel detection policy: which rules run, how they are tuned, and what each does when it fires.
+# Deploy:   make sentinel-policy            (validate + diff in the sentinel, apply, hot-reload, confirm digest)
+# Inspect:  kubectl -n sbx-security exec deploy/sentinel -- python -m sbx.sentinel.ctl policy
+#
+# Floor (compiled into the sentinel, a policy that breaks it is rejected and the last good one stays):
+#   D1, EV, S6 always enabled in enforce mode; D1 and S6 must quarantine or freeze; thresholds bounded;
+#   only high-severity rules may freeze; platform-flow rules can't quarantine (no session).
+apiVersion: sbx.forgood.ai/v1
+kind: DetectionPolicy
+metadata:
+  name: default
+  version: 1
+spec:
+  # Response actions. Steps: quarantine | verify | freeze | notify-control-plane.
+  # Every alert is always written to the sentinel's own hash-chained log.
+  responses:
+    record:
+      description: alert only; the control plane records it for users
+      steps: [notify-control-plane]
+    contain:
+      description: sentinel's own deny policy on the session, Hubble-verified; control plane revokes and snapshots
+      steps: [quarantine, verify, notify-control-plane]
+    freeze-fleet:
+      description: cut every session (sentinel-freeze); lifted only with `ctl unfreeze`
+      steps: [freeze, notify-control-plane]
+
+  rules:
+    # ---- built-in rules (logic in code; tuned here) -------------------------------------
+    - id: D1
+      description: canary (any supported encoding) in an outbound request
+      severity: high
+      response: contain
+
+    - id: D2
+      description: denied request or dropped flow from a session; first one, then a burst
+      severity: high
+      response: contain
+      stages:
+        first: { severity: medium, response: record }
+      params:
+        default_burst: { count: 5, window_s: 60 }        # an agent spec's runtime.denyBurst overrides this
+        deny_reasons: [default_deny, model_not_allowed, budget, credproxy_refused, path_not_allowed,
+                       provider_side_capability, provider_side_tool, remote_content_source,
+                       malformed_request, write_not_allowed]
+
+    - id: D3
+      description: model tool_use carrying the canary, or an acting tool referencing .env or a non-allowed host
+      severity: medium
+      response: record
+      params:
+        acting_tools: [Bash, WebFetch, WebSearch, BashOutput, Task]
+        acting_tool_prefixes: [mcp__]
+
+    - id: EV
+      description: shipped evidence has a sequence gap or a broken hash chain
+      severity: high
+      response: record
+
+    - id: S1
+      description: the datapath saw materially more requests than the gateway logged
+      severity: high
+      response: contain
+      params: { horizon_s: 20, min_deficit: 3, min_ratio: 0.25, interval_s: 10 }
+
+    - id: S2
+      description: platform pod with a policy-dropped connection or unexpected world egress
+      severity: high
+      response: record                                   # isolating platform pods needs a human
+      params:
+        world_allowlist:
+          credproxy: [api.anthropic.com, github.com, api.github.com]
+
+    - id: S6
+      description: traffic forwarded from a session after its containment took effect
+      severity: high
+      response: contain
+      params: { grace_s: 3 }
+
+    # ---- custom match rules -----------------------------------------------------------
+    # source: gateway | control-plane | hubble-sessions | hubble-platform
+    # match:  field -> value (equals) | [values] (in) | {eq, ne, in, not_in, regex, gt, gte, lt, lte, exists, contains}
+    #         gateway/control-plane fields are the evidence fields (action, method, dest_host, tool, reason, ...);
+    #         Hubble fields: verdict, direction, proto, dest_port, dest_ip, dest_names, dest_namespace, dest_pod,
+    #         dest_world, drop_reason, src_pod, src_app, session, http_method, http_url, http_code, l7_type
+    # threshold (optional): count within window_s, per groupBy (session | pod | global)
+    - id: GH-WRITE-ATTEMPT
+      description: a session tries to write to GitHub through the egress proxy (agents must publish via the control plane)
+      type: match
+      source: gateway
+      match:
+        action: [egress_http, egress_connect, egress_deny]
+        dest_host: { regex: '(^|\.)github\.com$' }
+        method: { in: [POST, PUT, PATCH, DELETE, CONNECT] }
+      severity: medium
+      response: record
+      summary: "{method} to {dest_host} from the sandbox"
+
+    - id: MODEL-PROBING
+      description: repeated requests for models outside the spec (probing for a stronger or cheaper model)
+      type: match
+      source: gateway
+      match:
+        decision: deny
+        reason: model_not_allowed
+      threshold: { count: 3, window_s: 120 }
+      severity: medium
+      response: record
+      summary: "model probing: {model}"
+
+    - id: SANDBOX-DNS-EXFIL
+      description: many DNS lookups from one session (DNS tunnelling shape); sandboxes only resolve a handful of names
+      type: match
+      source: hubble-sessions
+      match:
+        dest_port: 53
+        verdict: FORWARDED
+      threshold: { count: 200, window_s: 60 }
+      severity: high
+      response: contain
+      mode: monitor                                     # tuning: watch false positives before enforcing
+      summary: "DNS burst from session {session}"

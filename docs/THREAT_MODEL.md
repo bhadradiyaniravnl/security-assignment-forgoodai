@@ -78,6 +78,8 @@ telling the agent to POST `.env` to a lab destination.
 | E | Run-time policy widening; session back door; state races | Parameters only; endpoint removed; compare-and-set; admin-only release; durable state + orphan sweep | D (B12, B19, m4) |
 | E | gVisor escape; control-plane `pods/exec` abuse | gVisor; scoped RBAC | Des (microVM; volume delivery) |
 | E | Compromised control plane lifts containment or is down | Sentinel: own node, own deny policies (protected by admission), S6 re-quarantine, S2 platform-egress alerts | D (m9: containment with the control plane scaled to zero) |
+| T | Detection weakened by a policy change (rule disabled, response downgraded) | Compiled-in floor (D1/EV/S6 on, D1/S6 contain, bounded thresholds); a rejected policy keeps the last good one and raises POL; every load is in the sentinel's chained log | D (m11); no second-person review yet |
+| R | Compromised or buggy gateway under-reports (drops evidence for a session) | S1: sentinel reconciles Hubble L7/L4 request counts with shipped gateway evidence; Hubble redacts credentials | D (m10: lab fault injection, AI and egress channels) |
 
 ## Evidence summary
 

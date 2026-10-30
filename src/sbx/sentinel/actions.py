@@ -7,6 +7,8 @@ from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
 SESSIONS = "sbx-sessions"
+SECURITY = "sbx-security"
+POLICY_CM, POLICY_KEY = "sentinel-detection", "detection.yaml"
 MANAGED = {"app.kubernetes.io/managed-by": "sentinel"}
 FREEZE = "sentinel-freeze"
 _api: client.CustomObjectsApi | None = None
@@ -74,3 +76,15 @@ def live_sessions() -> set[str]:
     _crd()
     pods = _core.list_namespaced_pod(SESSIONS, label_selector="sbx/session").items
     return {p.metadata.labels["sbx/session"] for p in pods}
+
+
+def read_policy() -> tuple[str, str] | None:
+    """(resourceVersion, policy YAML) from the sentinel's own ConfigMap, or None if it doesn't exist."""
+    _crd()
+    try:
+        cm = _core.read_namespaced_config_map(POLICY_CM, SECURITY)
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    return cm.metadata.resource_version, (cm.data or {}).get(POLICY_KEY, "")

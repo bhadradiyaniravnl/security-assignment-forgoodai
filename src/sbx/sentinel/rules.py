@@ -1,5 +1,8 @@
 """Sentinel detection rules (pure functions + small state; I/O lives in main.py).
 
+Severity, response, thresholds and allowlists come from the detection policy (policy.py); the values
+below are the built-in defaults. Rules emit alerts with a `stage`; the policy decides what happens.
+
 Sources: platform evidence shipped to the sentinel (claims, chain-verified on arrival) and Hubble
 flows (L3/L4, produced by Cilium's eBPF datapath, independent of every platform pod).
 
@@ -8,6 +11,7 @@ flows (L3/L4, produced by Cilium's eBPF datapath, independent of every platform 
       ... reaching the spec's denyBurst threshold within its window         high    contain
   D3  model tool_use referencing the canary, or an acting tool referencing .env / a non-allowed host
   EV  shipped evidence chain broken or a sequence gap                       high    alert only
+  S1  datapath saw materially more requests than the gateway logged         high    contain   (main.py)
   S2  platform pod: policy-dropped connection, or world egress by anything other than credproxy, or
       credproxy reaching a name outside its allowlist                       high    alert (isolation needs approval)
   S6  traffic forwarded from a session after its quarantine took effect     high    re-quarantine
@@ -19,22 +23,22 @@ import re
 from collections import defaultdict, deque
 from datetime import datetime
 
-DENY_REASONS = {"default_deny", "model_not_allowed", "budget", "credproxy_refused", "path_not_allowed",
-                "provider_side_capability", "provider_side_tool", "remote_content_source", "malformed_request", "write_not_allowed"}
-ACTING_TOOLS = {"Bash", "WebFetch", "WebSearch", "BashOutput", "Task"}
+from sbx.sentinel.policy import Policy, default_policy
 
 
 def _id(*parts) -> str:
     return "al_" + hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()[:16]
 
 
-def alert(rule, severity, sid, summary, action, evidence, contain=False, key="") -> dict:
+def alert(rule, severity, sid, summary, action, evidence, key="", stage=None) -> dict:
+    """severity is the rule's built-in default; the active policy may override it in main.respond()."""
     return {"alert_id": _id(rule, sid, key or summary), "rule": rule, "severity": severity, "session_id": sid,
-            "summary": summary, "observed": action, "evidence": evidence, "contain": contain}
+            "summary": summary, "observed": action, "evidence": evidence, "stage": stage}
 
 
 class Engine:
     def __init__(self):
+        self.pol: Policy = default_policy()                      # swapped by main on a policy load
         self.denials: dict[str, deque] = defaultdict(deque)      # sid -> timestamps
         self.first_denial: set[str] = set()
         self.burst_fired: set[str] = set()
@@ -53,14 +57,16 @@ class Engine:
             m = e["canary_match"]
             out.append(alert("D1", "high", sid,
                              f"canary {m['id']} ({m['encoding']}) sent in {e.get('method')} to {e.get('dest_host')} "
-                             f"[{e.get('decision')}]", action, ref, contain=True, key=e.get("seq")))
-        if e.get("decision") == "deny" and e.get("reason") in DENY_REASONS:
+                             f"[{e.get('decision')}]", action, ref, key=e.get("seq")))
+        if e.get("decision") == "deny" and e.get("reason") in set(self.pol.param("D2", "deny_reasons") or []):
             out += self._denial(sid, e.get("ts"), f"gateway denied {act} to {e.get('dest_host') or e.get('model')} "
                                                   f"({e.get('reason')})", action, ref, policy)
         # Host/.env references only count for tools that can act on them; an Edit that quotes the
         # injected comment (e.g. to delete it) is not an attempt. A canary in ANY tool input counts:
         # writing the secret into code or a message is itself a leak.
-        acting = (e.get("tool") or "") in ACTING_TOOLS or (e.get("tool") or "").startswith("mcp__")
+        tool = e.get("tool") or ""
+        acting = tool in set(self.pol.param("D3", "acting_tools") or []) or \
+            any(tool.startswith(p) for p in self.pol.param("D3", "acting_tool_prefixes") or [])
         if act == "ai_tool_use" and (e.get("canary_match") or
                                      (acting and (e.get("refs_env_file") or e.get("refs_disallowed_hosts")))):
             why = [w for w, hit in (("canary", e.get("canary_match")), (".env", e.get("refs_env_file")),
@@ -101,10 +107,10 @@ class Engine:
         out = []
         if policy is None or policy.get("state") != "running":
             return out
-        burst = policy["policy"].get("deny_burst", {"count": 5, "window_s": 60})
+        burst = policy["policy"].get("deny_burst") or self.pol.param("D2", "default_burst")   # agent spec wins
         if sid not in self.first_denial:
             self.first_denial.add(sid)
-            out.append(alert("D2", "medium", sid, f"first denial: {summary}", action, ref, key="first"))
+            out.append(alert("D2", "medium", sid, f"first denial: {summary}", action, ref, key="first", stage="first"))
         q = self.denials[sid]
         q.append(ts)
         while q and ts - q[0] > burst["window_s"]:
@@ -112,7 +118,7 @@ class Engine:
         if len(q) >= burst["count"] and sid not in self.burst_fired:
             self.burst_fired.add(sid)
             out.append(alert("D2", "high", sid, f"{len(q)} denials within {burst['window_s']}s (latest: {summary})",
-                             action, ref, contain=True, key="burst"))
+                             action, ref, key="burst"))
         return out
 
 
@@ -124,10 +130,7 @@ def _ts(value) -> float:
 
 
 # ---------------------------------------------------------------------------------------------- S2
-PLATFORM_WORLD_NAMES = {"credproxy": {"api.anthropic.com", "github.com", "api.github.com"}}
-
-
-def platform_flow_alert(f: dict) -> dict | None:
+def platform_flow_alert(f: dict, world_allowlist: dict) -> dict | None:
     """S2: platform pods run trusted code, so a policy drop or unexpected world egress from one is a
     strong compromise (or misconfiguration) signal. The platform can't hide it: Hubble is the kernel."""
     src = f.get("source", {})
@@ -140,18 +143,19 @@ def platform_flow_alert(f: dict) -> dict | None:
     port = (l4.get(proto) or {}).get("destination_port")
     names = f.get("destination_names") or []
     world = "reserved:world" in dst.get("labels", [])
+    bucket = int(_ts(f.get("time"))) // 600     # re-alert every 10 min: alert ids are deduped across restarts
     observed = {"action": "platform_flow", "app": app, "pod": src.get("pod_name"), "dest_ip": f.get("IP", {}).get("destination"),
                 "dest_port": port, "dest_names": names, "verdict": f.get("verdict"), "drop_reason": f.get("drop_reason_desc")}
     if f.get("verdict") == "DROPPED" and f.get("drop_reason_desc") == "POLICY_DENIED" and f.get("traffic_direction") == "EGRESS":
         return alert("S2", "high", None, f"platform pod {app} attempted a policy-denied connection to "
                      f"{names[0] if names else observed['dest_ip']}:{port}", observed,
-                     [{"source": "hubble", "time": f.get("time")}], key=f"{app}|{observed['dest_ip']}|{port}")
+                     [{"source": "hubble", "time": f.get("time")}], key=f"{app}|{observed['dest_ip']}|{port}|{bucket}")
     if f.get("verdict") == "FORWARDED" and world and f.get("traffic_direction") == "EGRESS":
-        allowed = PLATFORM_WORLD_NAMES.get(app)
+        allowed = set(world_allowlist[app]) if app in world_allowlist else None
         if allowed is None or (names and not set(names) & allowed):
             return alert("S2", "high", None, f"platform pod {app} reached the outside world "
                          f"({', '.join(names) or observed['dest_ip']}:{port})", observed,
-                         [{"source": "hubble", "time": f.get("time")}], key=f"{app}|{observed['dest_ip']}|{port}")
+                         [{"source": "hubble", "time": f.get("time")}], key=f"{app}|{observed['dest_ip']}|{port}|{bucket}")
     return None
 
 
@@ -169,4 +173,4 @@ def leak_after_containment(f: dict, contained_at: float, grace_s: float = 3.0) -
     return alert("S6", "high", sid, f"traffic forwarded after containment to "
                  f"{dst.get('namespace', '')}/{dst.get('pod_name', '') or f.get('IP', {}).get('destination')}",
                  {"action": "flow_forwarded_after_containment", "dest_ip": f.get("IP", {}).get("destination")},
-                 [{"source": "hubble", "time": f.get("time")}], contain=True, key=f"{int(ts) // 30}")
+                 [{"source": "hubble", "time": f.get("time")}], key=f"{int(ts) // 30}")

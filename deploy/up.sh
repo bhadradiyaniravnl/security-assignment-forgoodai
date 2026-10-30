@@ -28,7 +28,11 @@ if ! kubectl -n kube-system get ds cilium >/dev/null 2>&1; then
     --set k8sServiceHost="$CLUSTER-control-plane" --set k8sServicePort=6443 \
     --set hubble.enabled=true --set hubble.relay.enabled=true \
     --set ipam.mode=kubernetes \
-    --set socketLB.hostNamespaceOnly=true   # gVisor bypasses socket-LB hooks; use per-packet LB for pods
+    --set socketLB.hostNamespaceOnly=true \
+    --set hubble.redact.enabled=true --set 'hubble.redact.http.headers.deny={x-api-key,authorization,proxy-authorization}' \
+    --set hubble.redact.http.userInfo=true
+  # socketLB.hostNamespaceOnly: gVisor bypasses socket-LB hooks, so pods use per-packet LB.
+  # hubble.redact: L7 flows would otherwise carry session tokens (x-api-key) into flow logs.
 fi
 cilium status --wait --wait-duration 8m >/dev/null
 
@@ -68,6 +72,7 @@ kubectl -n sbx-system rollout restart deploy >/dev/null   # pick up rebuilt imag
 kubectl -n sbx-system rollout status deploy --timeout=180s >/dev/null
 kubectl -n sbx-security rollout restart deploy/sentinel >/dev/null
 kubectl -n sbx-security rollout status deploy/sentinel --timeout=180s >/dev/null
+deploy/sentinel-policy.sh >/dev/null       # detection rules + response actions (policies/sentinel/)
 
 log "Ready"
 kubectl get pods -A -o wide 2>/dev/null | grep -E "NAMESPACE|sbx-system|lab-ext" || true

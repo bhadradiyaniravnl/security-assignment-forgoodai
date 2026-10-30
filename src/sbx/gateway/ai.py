@@ -128,7 +128,8 @@ async def handle(request: web.Request) -> web.StreamResponse:
         if not streaming and up.status == 200:
             await parser.feed_json(buf)
         await resp.write_eof()
-        store_bodies(ctx["session_id"], req_event["seq"], body, bytes(kept), canaries, up.status)
+        if req_event.get("seq", -1) > 0:
+            store_bodies(ctx["session_id"], req_event["seq"], body, bytes(kept), canaries, up.status)
         return resp
 
 
@@ -216,6 +217,8 @@ _inflight: dict[str, int] = {}
 async def per_ip_limit(request: web.Request, handler):
     ip = request.remote or ""
     if _inflight.get(ip, 0) >= MAX_INFLIGHT_PER_IP:
+        if request.path != "/healthz":    # every answered request is in evidence (sentinel S1 reconciles counts)
+            await evidence.write("ai_request", pod_ip=ip, path=request.path, decision="deny", reason="inflight_limit")
         return web.json_response({"type": "error", "error": {"type": "rate_limit_error",
                                   "message": "sbx: too many concurrent requests"}}, status=429)
     _inflight[ip] = _inflight.get(ip, 0) + 1

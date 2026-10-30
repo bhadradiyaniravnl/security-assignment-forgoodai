@@ -89,7 +89,7 @@ with no tests.
 | Egress forward proxy | Allowlist, canary scanning, CONNECT tunnelling via credproxy |
 | Credentials proxy | Per-session grant re-checks |
 | Control plane | Spec registry with org baseline, immutability and widening approval; session lifecycle; workspace delivery; reconciler; containment and evidence snapshots; alert sink |
-| Sentinel | Continuous detection (D1–D3, EV, S2 platform egress, S6 leak after containment) and **independent response** (own protected deny policies, works with the control plane down); evidence shipper |
+| Sentinel | Continuous detection (D1–D3, EV, S1 gateway completeness, S2 platform egress, S6 leak after containment) and **independent response** (own protected deny policies, works with the control plane down); rules and response actions are a validated, hot-reloaded **detection policy** (`policies/sentinel/`) with custom match rules and monitor mode; evidence shipper |
 | Supporting pieces | Hash-chained evidence log, multi-encoding canary matcher, `sbxctl` CLI |
 | Deployment | Kubernetes manifests (network policies, RBAC, admission) and bring-up/teardown scripts |
 | Test harness | Phases A/B/C, plus the injection fixtures and bad-spec fixtures |

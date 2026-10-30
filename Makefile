@@ -1,4 +1,4 @@
-.PHONY: up down images apply secrets status smoke e2e lifecycle containment specs github sentinel security-test hooks
+.PHONY: up down images apply secrets status smoke e2e lifecycle containment specs github sentinel sentinel-s1 sentinel-policy sentinel-policy-test security-test hooks
 
 up:        ## Colima VM, kind cluster, Cilium, gVisor, images, manifests
 	deploy/up.sh
@@ -38,6 +38,15 @@ github:    ## GitHub flow: scoped tokens, clone via credproxy, PR refusals (AGEN
 
 sentinel:  ## S-P1: independent detection & response plane (incl. containment with the control plane down)
 	harness/m9_sentinel.sh
+
+sentinel-policy: ## Validate, diff and deploy the sentinel detection policy (FILE=policies/sentinel/detection.yaml; CHECK_ONLY=1)
+	deploy/sentinel-policy.sh $(FILE)
+
+sentinel-policy-test: ## Detection policy: floor, hot reload, monitor mode, custom match rules, response actions
+	harness/m11_sentinel_policy.sh
+
+sentinel-s1: ## S-P2: independent L7/L4 counts vs gateway evidence (S1), via lab fault injection
+	harness/m10_sentinel_s1.sh
 
 security-test: ## One command: phase B (enforcement), A (agent under injection), C (utility) -> out/report.md
 	python3 harness/security_test.py $(ARGS)

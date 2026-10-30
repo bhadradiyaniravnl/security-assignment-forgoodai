@@ -23,6 +23,13 @@ spec:
             k8s:io.kubernetes.pod.namespace: sbx-system
             app: gateway
       toPorts:
+        # AI gateway: through Cilium's Envoy for L7 HTTP visibility (allow-all HTTP rule). Hubble then reports
+        # every request/response per session, independent of the gateway's own log (sentinel S1).
         - ports:
             - { port: "8080", protocol: TCP }
+          rules:
+            http: [{}]
+        # Egress proxy: L4 only. It closes the connection after each request, so one TCP connection is one
+        # request (L4 counting is enough), and L7 parsing would interfere with CONNECT tunnels.
+        - ports:
             - { port: "3128", protocol: TCP }

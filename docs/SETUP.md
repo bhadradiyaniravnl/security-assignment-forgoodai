@@ -84,7 +84,8 @@ bin/sbxctl attach <sid>    # history + live stream; typed lines become follow-up
 bin/sbxctl contain <sid>   # manual containment
 SBX_USER=secops bin/sbxctl freeze "reason"   # fleet kill switch: contain all, deny all, block new runs
 SBX_USER=secops bin/sbxctl unfreeze          # lift the network deny (frozen sessions stay contained)
-kubectl -n sbx-security exec deploy/sentinel -- python -m sbx.sentinel.ctl status   # sentinel: also alerts | freeze R | unfreeze | release SID
+kubectl -n sbx-security exec deploy/sentinel -- python -m sbx.sentinel.ctl status   # sentinel: also alerts | freeze R | unfreeze | release SID | policy
+make sentinel-policy                                # edit policies/sentinel/detection.yaml, then validate + diff + deploy (CHECK_ONLY=1 to only check)
 bin/sbxctl alerts          # detections + containment verification
 bin/sbxctl destroy <sid>
 SBX_USER=secops bin/sbxctl spec approve specs/examples/widen-demo-v1.yaml   # a security approver approves the digest
@@ -101,6 +102,8 @@ bin/sbxctl spec register specs/examples/widen-demo-v1.yaml                  # th
 | `make containment` | D1/D2 → auto-containment → verification, fleet freeze (25) | ~$0.01 |
 | `make specs` | Baseline, authors, two-person approval, immutability, admission (36) | ~$0.01 |
 | `make sentinel` | Sentinel: placement and least privilege, verified shipping, containment **with the control plane down**, self-protection, S2, S6, own freeze (24) | ~$0.01 |
+| `make sentinel-s1` | S1: Hubble L7 sees sandbox requests with credentials redacted; an honest gateway raises nothing; a gateway dropping one session's evidence (lab fault injection) is caught on the AI and egress channels and the session quarantined (7) | ~$0 (count_tokens) |
+| `make sentinel-policy-test` | Detection policy: deploy + digest check, floor rejects a blinding policy (before apply, and in the sentinel with a POL alert), custom evidence and Hubble rules, `contain` vs `record`, monitor mode (16) | ~$0.01 |
 | `make github` | Scoped App tokens, clone via credproxy, workflow/canary PR refusals (10); `AGENT=1` opens a real PR | ~$0.01 / ~$0.40 |
 | **`make security-test`** | **Phase B (18 deterministic cases), Phase A (agent under injection), Phase C (utility); writes `out/report.{md,json}`** | **~$1, ~10 min** |
 

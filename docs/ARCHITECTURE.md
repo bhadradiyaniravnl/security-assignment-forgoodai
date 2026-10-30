@@ -253,8 +253,15 @@ use an **uncached** policy lookup.
 - **Not seen yet:**
   - processes and files inside gVisor;
   - Kubernetes API actions (S-P3, audit webhook);
-  - platform-pod processes (S-P4, Tetragon);
-  - an independent L7 count to check the gateway's completeness (S-P2).
+  - platform-pod processes (S-P4, Tetragon).
+- **Completeness check (S-P2):** Cilium's L7 proxy parses every sandbox request to the AI gateway
+  (method, path, session labels; credentials redacted by Hubble), and every connection to the egress
+  proxy is a SYN. The sentinel counts both per session and reconciles them with the shipped gateway
+  evidence, so a gateway that silently stops logging is caught (S1).
+  It checks counts, not content: a gateway that logs one benign-looking record per request is not
+  caught. The test drives it with a **lab-only** switch (`SBX_FAULT_INJECTION=1` in `apps.yaml`; the
+  gateway then drops evidence for session IDs listed in `/tmp/sbx-fault/drop-sessions`), which must
+  be removed outside the lab.
 
 `src/sbx/sentinel/` is a separate security plane in its own namespace (`sbx-security`) on its own
 node (`sbx/pool=security`). The platform has no permissions there and no network path in, except the
@@ -267,7 +274,7 @@ evidence shipper's push.
 - **Hubble, from session pods and from platform pods.** This comes from the kernel datapath, so no
   platform pod can fake it.
 
-**Rules** (`rules.py`, pure functions):
+**Built-in rules** (`rules.py`, pure functions; the actions shown are the default policy's):
 
 | Rule | Signal (source) | Action |
 |---|---|---|
@@ -276,12 +283,47 @@ evidence shipper's push.
 | **D3** | Model `tool_use` with the canary, or an *acting* tool (Bash, WebFetch, MCP) referencing `.env` or a non-allowed host | Medium alert |
 | **EV** | Shipped evidence: sequence gap or hash-chain break | High alert |
 | **S2** | **Platform pod** (gateway, credproxy, control plane…) has a policy-dropped connection, or reaches the outside world when it isn't credproxy, or credproxy reaches a name outside its allowlist | High alert (isolating platform pods needs approval) |
+| **S1** | Gateway evidence incomplete: the datapath (Hubble L7 for the AI gateway, L4 connections for the egress proxy) saw at least 3 more requests than the gateway logged, and at least 25% of them, over a window that ended 20 s ago | High; **quarantine** the session |
 | **S6** | Traffic still forwarded from a session after its containment took effect (e.g. a compromised control plane lifted its own quarantine) | High; **re-quarantine** |
 
 The control plane still raises D1 itself for a canary in a PR diff or agent summary, and INJ for the
 content scan.
 
+**Detection policy: rules and response actions as configuration** (`policies/sentinel/detection.yaml`,
+`policy.py`). It works like agent specs, but for the security plane:
+- **Response actions** are named lists of steps: `quarantine` (the sentinel's own deny policy), `verify` (Hubble check),
+  `freeze` (fleet-wide deny) and `notify-control-plane` (revoke the token, snapshot evidence). Every alert is always written
+  to the sentinel's own log. The defaults are `record`, `contain` and `freeze-fleet`.
+- **Built-in rules** (above) keep their logic in code. The policy sets `enabled`, `mode`, `severity`, `response`, per-stage
+  overrides (D2's first denial vs burst) and `params`: thresholds and allowlists such as D2's deny reasons and default burst,
+  D3's acting tools, the S1 window and deficit, the S2 world allowlist and the S6 grace period.
+- **Custom match rules** add a detection without a code change. Each has a `source` (`gateway`, `control-plane`,
+  `hubble-sessions` or `hubble-platform`), field matchers (equals, `in`, `regex`, numeric comparisons, `exists`, `contains`),
+  an optional `threshold` of a count within a window per session, pod or globally, a severity, a response and a summary
+  template. Examples shipped: `GH-WRITE-ATTEMPT`, `MODEL-PROBING`, and `SANDBOX-DNS-EXFIL` (in monitor mode).
+- **`mode: monitor`** records the alert and the steps it *would* have run, and does nothing else, so a new rule can be tuned
+  before it is enforced.
+- **The floor** is compiled into the image and cannot be configured away:
+  - D1, EV and S6 always stay enabled in enforce mode;
+  - D1 and S6 must quarantine or freeze;
+  - thresholds are bounded (e.g. an S1 deficit of 1–20, a D2 burst of 1–50);
+  - only high-severity rules may freeze;
+  - platform-flow rules cannot quarantine, because there is no session;
+  - unknown fields, steps, params and bad regexes are rejected.
+- **Deploy** with `make sentinel-policy`:
+  1. validate the file and diff it against the active policy, inside the sentinel and with the same code that will load it;
+  2. apply it as the ConfigMap `sentinel-detection` in `sbx-security`;
+  3. hot-reload it (the sentinel also polls every 10 s);
+  4. confirm the sentinel now runs exactly that file's digest.
+- **A broken policy cannot blind the sentinel.** If one is applied by hand, the sentinel rejects it, raises a **POL** alert and
+  keeps its last good policy. Every load and every rejection is in its hash-chained log, with the digest and the rules disabled
+  or in monitor mode.
+- **Who can change it:** the sentinel's service account can only *read* that one ConfigMap. Writing it needs cluster access to
+  `sbx-security`, which the platform's identities don't have. There is no second-person review yet; that was a deliberate
+  scope choice.
+
 **Response is independent of the control plane:**
+For a `contain` response (the steps the policy lists):
 1. The sentinel creates its **own** Cilium deny policy (`sentinel-q-<sid>`) with its own service
    account. That account can only manage Cilium policies and list pods in `sbx-sessions`: no exec, no Secrets.
 2. Then, best effort, it asks the control plane to revoke the token, snapshot evidence and record the alert.
@@ -300,7 +342,7 @@ and verifications, plus the verified evidence copies.
 
 **Operator interface:** a localhost-only admin API, reached with
 `kubectl -n sbx-security exec deploy/sentinel -- python -m sbx.sentinel.ctl …`:
-`status`, `alerts`, `freeze`, `unfreeze`, `release`. Cluster access to `sbx-security` is the
+`status`, `alerts`, `freeze`, `unfreeze`, `release`, `policy`, `reload`, `validate`. Cluster access to `sbx-security` is the
 authorisation, and it shows up in the audit log.
 
 ### 5.7 Evidence store
@@ -518,6 +560,9 @@ and SHA-256, not the text. `attach` replays history and streams live.
 | `make containment` | D1/D2 → auto-containment → two-source verification | 17 |
 | `make specs` | Baseline, authors, two-person approval, immutability, admission | 35 |
 | `make github` | Scoped tokens, clone via credproxy, forged-diff/workflow/canary PR refusals | 14 |
+| `make sentinel` | Independent detection and response, containment with the control plane down, S2, S6 | 24 |
+| `make sentinel-s1` | S1 gateway completeness via lab fault injection | 7 |
+| `make sentinel-policy-test` | Detection policy: deploy and digest, floor (pre-apply and in the sentinel), custom rules, contain vs record, monitor mode | 16 |
 | **`make security-test`** | **Phase B** 22 deterministic compromised-agent cases · **Phase A** agent under prompt injection, outcomes classified · **Phase C** utility | → `out/report.md` |
 
 Harness rules:
@@ -560,11 +605,12 @@ src/sbx/
   control_plane/             app, sessions, specs, baseline, k8s, store
   gateway/                   ai (AI gateway), egress (forward proxy), common, main
   credproxy/                 app (inference/egress/tunnel/GitHub routes), github (App tokens, clone, publish)
-  sentinel/                  rules (D1-D3, EV, S2, S6), main (ingest, Hubble, respond, verify), actions, shipper, ctl
+  sentinel/                  rules (D1-D3, EV, S1, S2, S6), policy (detection policy + floor + custom rules), main, actions, shipper, ctl
   common/                    canary, evidence (hash chain), internal (component keys), policy
   lab/                       sink (paste-mock / attacker-sink), git_lab
 images/                      sandbox, sandbox-pyweb, services
 deploy/                      up.sh, down.sh, images.sh, runsc-install.sh, secrets.sh, kind.yaml, k8s/
+policies/sentinel/           detection.yaml: the sentinel's rules and response actions
 specs/                       bugfix-agent(.yaml|-open), testwriter-agent, bad/ (12), examples/
 fixtures/injections/         prompt-injection variants
 demo-repo/, samples/         task repos (slugkit; items-api-sample)
