@@ -22,6 +22,11 @@ BASELINE = {
     "models": ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"],
     "max_tokens": 5_000_000,
     "secret_catalogue": ["anthropic/default"],
+    # GitHub repos the platform's GitHub App may act on. A spec may reference `github-app/<repo>` only
+    # for a repo listed here AND named exactly in its own repo.allow.
+    "github_repos": ["bhadradiyaniravnl/items-api-sample"],
+    "output_types": ["branch", "pull_request"],
+    "required_protected_paths": [".github/", ".git/"],
     "approved_destinations": ["paste-mock.lab-ext"],    # destinations a spec may allowlist at all
     "repo_access": ["read"],
     "broad_tools": ["Bash", "Bash(*)", "Bash(*:*)"],     # need an explicit risk acceptance
@@ -139,9 +144,26 @@ def check(spec: dict, previous: dict | None = None) -> tuple[list[str], list[str
             errors.append(f"egress.allow {h}: not in the approved destination catalogue")
 
     # secrets and repo
+    gh_allowed = {p[len("github:"):] for p in s["repo"]["allow"] if p.startswith("github:")}
+    for p in gh_allowed:
+        if p not in B["github_repos"] or any(c in p for c in "*?["):
+            errors.append(f"repo.allow github:{p}: not an approved GitHub repo (exact names only)")
     for g in s["secrets"]:
-        if g.get("ref") not in B["secret_catalogue"]:
-            errors.append(f"secrets {g.get('ref')}: unknown credential (not in credproxy catalogue)")
+        ref = g.get("ref", "")
+        if ref.startswith("github-app/"):
+            if ref[len("github-app/"):] not in gh_allowed or ref[len("github-app/"):] not in B["github_repos"]:
+                errors.append(f"secrets {ref}: GitHub credential must match an approved repo in repo.allow")
+        elif ref not in B["secret_catalogue"]:
+            errors.append(f"secrets {ref}: unknown credential (not in credproxy catalogue)")
+    out = s["repo"].get("output", {})
+    if out.get("type", "branch") not in B["output_types"]:
+        errors.append(f"repo.output.type {out.get('type')}: must be one of {B['output_types']}")
+    if out.get("type") == "pull_request":
+        if out.get("draft") is not True:
+            errors.append("repo.output.draft: agent PRs must be drafts (human review required)")
+        missing = [p for p in B["required_protected_paths"] if p not in out.get("protectedPaths", [])]
+        if missing:
+            errors.append(f"repo.output.protectedPaths: must include {missing} (e.g. CI workflows)")
     if s["repo"]["access"] not in B["repo_access"]:
         errors.append(f"repo.access {s['repo']['access']}: sandboxes get read-only copies; writes are the control plane's")
     for p in s["repo"]["allow"]:

@@ -39,6 +39,24 @@ make security-test                             # phases B, A, C -> out/report.md
 make down
 ```
 
+## Real GitHub flow
+
+`testwriter-agent` runs against the private
+[`bhadradiyaniravnl/items-api-sample`](https://github.com/bhadradiyaniravnl/items-api-sample), a FastAPI CRUD service
+with no tests.
+1. **Clone:** credproxy mints a GitHub App installation token **scoped to that one repo with `contents: read`**,
+   clones, revokes the token, and hands the control plane a tarball.
+2. **Work:** the agent writes tests offline in a per-repo image that has FastAPI baked in.
+3. **Publish:** on `stop`, a second token (`contents` + `pull_requests: write`) pushes `agent/<sid>` and opens a
+   **draft PR authored by the App**, then is revoked.
+   - The PR body carries user, session, spec and digest, and quotes the agent's summary as untrusted text.
+   - Publication is refused for diffs that touch `.github/`, `.git/` or `requirements.txt`, or that contain the
+     canary. The canary case raises a D1 alert, because the PR is an egress channel too.
+
+**First real run:** 52 passing tests, plus 9 strict xfails documenting 4 real bugs, in
+[PR #1](https://github.com/bhadradiyaniravnl/items-api-sample/pull/1).
+`make github` re-runs the checks (10/10); `AGENT=1` also opens a new PR.
+
 ## Results at a glance
 
 | | |

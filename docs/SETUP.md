@@ -30,6 +30,20 @@ The real key exists only on your host (in a gitignored file) and inside the cred
    make hooks
    ```
 
+### Optional: GitHub flow (`testwriter-agent`)
+
+1. **Create a private repo** with the sample app:
+   `gh repo create <you>/items-api-sample --private --source samples/items-api-sample --push`
+   (run it from a `git init`-ed copy). Then update `BASELINE["github_repos"]` and the spec to match your repo name.
+2. **Create a GitHub App** (Settings → Developer settings → GitHub Apps):
+   - Webhook off.
+   - Repository permissions: **Contents: Read & write** and **Pull requests: Read & write** only. No Workflows access.
+   - Installable "only on this account".
+3. **Generate a private key** and save it as `secrets/github-app.pem` (`chmod 600`).
+4. **Add the App ID** to `secrets/.env` as `GITHUB_APP_ID=<number>`. Make sure the file ends with a newline.
+5. **Install the App** on that one repository only.
+6. **Load and check:** `make secrets`, then `kubectl -n sbx-system rollout restart deploy/credproxy`, then `make github`.
+
 ## 3. Bring up
 
 ```bash
@@ -79,6 +93,7 @@ bin/sbxctl spec register specs/examples/widen-demo-v1.yaml
 | `make lifecycle` | `sbxctl` lifecycle, trigger rejections, reconciler (21) | ~$0.01 |
 | `make containment` | D1/D2 → auto-containment → two-source verification (16) | ~$0.01 |
 | `make specs` | Baseline, authors, immutability, widening approval, admission (28) | ~$0.01 |
+| `make github` | Scoped App tokens, clone via credproxy, workflow/canary PR refusals (10); `AGENT=1` opens a real PR | ~$0.01 / ~$0.40 |
 | **`make security-test`** | **Phase B (18 deterministic cases), Phase A (agent under injection), Phase C (utility); writes `out/report.{md,json}`** | **~$1, ~10 min** |
 
 `make security-test` options:

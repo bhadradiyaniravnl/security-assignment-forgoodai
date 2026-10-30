@@ -1,4 +1,4 @@
-.PHONY: up down images apply secrets status smoke e2e lifecycle containment specs security-test hooks
+.PHONY: up down images apply secrets status smoke e2e lifecycle containment specs github security-test hooks
 
 up:        ## Colima VM, kind cluster, Cilium, gVisor, images, manifests
 	deploy/up.sh
@@ -32,6 +32,9 @@ containment: ## M4 detection -> auto-containment -> two-source verification
 
 specs:     ## M6 spec governance: baseline, authors, immutability, widening approval, admission backstop
 	harness/m6_specs.sh
+
+github:    ## GitHub flow: scoped tokens, clone via credproxy, PR refusals (AGENT=1 also opens a real draft PR)
+	harness/m8_github.sh
 
 security-test: ## One command: phase B (enforcement), A (agent under injection), C (utility) -> out/report.md
 	python3 harness/security_test.py $(ARGS)

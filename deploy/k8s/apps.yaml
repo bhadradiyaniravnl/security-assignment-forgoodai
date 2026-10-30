@@ -29,6 +29,8 @@ spec:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: CP_DB, value: /data/cp.db }
             - { name: SBX_SPEC_AUTHORS, value: monalir }      # who may register specs (prototype; prod: CODEOWNERS + CI)
+            - name: SBX_CP_KEY
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: cp-key } }
             - name: SBX_INTERNAL_KEY
               valueFrom: { secretKeyRef: { name: sbx-internal, key: key } }
           ports: [{ containerPort: 8000 }]
@@ -109,6 +111,7 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
+        fsGroup: 10001
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: credproxy
@@ -123,6 +126,11 @@ spec:
               valueFrom: { secretKeyRef: { name: credproxy-secrets, key: ANTHROPIC_API_KEY } }
             - name: ANTHROPIC_WORKSPACE_ID
               valueFrom: { secretKeyRef: { name: credproxy-secrets, key: ANTHROPIC_WORKSPACE_ID, optional: true } }
+            - name: GITHUB_APP_ID
+              valueFrom: { secretKeyRef: { name: credproxy-secrets, key: GITHUB_APP_ID, optional: true } }
+            - name: SBX_CP_KEY          # GitHub operations: control plane only (the gateway never has this key)
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: cp-key } }
+            - { name: HOME, value: /tmp }
           ports:
             - { containerPort: 9000 }
             - { containerPort: 9001 }
@@ -131,6 +139,14 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: github-app, mountPath: /secrets/github, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: github-app
+          secret: { secretName: github-app, optional: true, defaultMode: 0440 }   # group-readable via fsGroup
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

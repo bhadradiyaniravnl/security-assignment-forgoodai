@@ -6,5 +6,6 @@ CLUSTER="${CLUSTER:-sbx}"
 TAG="${TAG:-dev}"
 
 docker build -q -t "sbx/sandbox:$TAG" -f images/sandbox/Dockerfile images/sandbox
+docker build -q -t "sbx/sandbox-pyweb:$TAG" -f images/sandbox-pyweb/Dockerfile images/sandbox-pyweb
 docker build -q -t "sbx/services:$TAG" -f images/services/Dockerfile .
-kind load docker-image --name "$CLUSTER" "sbx/sandbox:$TAG" "sbx/services:$TAG"
+kind load docker-image --name "$CLUSTER" "sbx/sandbox:$TAG" "sbx/sandbox-pyweb:$TAG" "sbx/services:$TAG"

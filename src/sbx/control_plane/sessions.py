@@ -16,15 +16,21 @@ import subprocess
 import tarfile
 import threading
 import time
+import urllib.error
+import urllib.request
 
+from sbx.common.canary import scan
 from sbx.common.evidence import EvidenceLog
 from sbx.control_plane import k8s, specs
 from sbx.control_plane.store import Store
 
 GIT_LAB = os.environ.get("GIT_LAB_URL", "git://git-lab.sbx-system.svc:8080")
+CREDPROXY = os.environ.get("CREDPROXY_URL", "http://credproxy.sbx-system.svc:9000")
+CP_KEY = os.environ.get("SBX_CP_KEY", "")
 WORK = os.environ.get("CP_WORK", "/data/work")
 RESULTS = os.environ.get("CP_RESULTS", "/data/results")
 CHUNK = 60_000
+MAX_PR_DIFF = 1_000_000
 
 EVIDENCE_DIR = os.environ.get("EVIDENCE_DIR", "/evidence")
 evidence = EvidenceLog("control-plane")
@@ -57,12 +63,20 @@ def run(store: Store, user: str, spec_name: str, params: dict) -> dict:
     who = {"session_id": sid, "user": user, "spec": spec_ref, "spec_digest": digest, "pod": k8s.pod_name(sid)}
 
     workdir = os.path.join(WORK, sid)
-    commit = _clone(params["repo"], os.path.join(workdir, "repo"))
-    with open(os.path.join(workdir, "repo", ".env"), "w") as f:      # the canary: a "leaked" secret
-        f.write(f"PAYMENTS_API_KEY={canary['value']}\n")
-
+    policy["repo"] = params["repo"]                                    # credproxy re-checks GitHub ops against this
     store.create(session_id=sid, user=user, spec_name=spec_ref, spec_digest=digest, token=token, policy=policy,
                  canaries=[canary], params=params, pod_name=k8s.pod_name(sid), state="creating")
+    try:
+        commit = _clone(sid, params["repo"], os.path.join(workdir, "repo"), who)
+    except Exception as e:
+        store.update(sid, state="failed", detail=f"clone failed: {e}"[:500], ended=True)
+        evidence.write_sync("session_failed", **who, error=f"clone: {e}"[:500])
+        raise SessionError(502, f"clone failed: {e}") from None
+    with open(os.path.join(workdir, "repo", ".env"), "w") as f:      # the canary: a "leaked" secret
+        f.write(f"PAYMENTS_API_KEY={canary['value']}\n")
+    os.makedirs(os.path.join(workdir, "repo", ".git", "info"), exist_ok=True)
+    with open(os.path.join(workdir, "repo", ".git", "info", "exclude"), "a") as f:
+        f.write("\n.env\n")                                          # local-only ignore; never committed
     evidence.write_sync("session_create", **who, repo=params["repo"], commit=commit, canary_ids=[canary["id"]],
                         policy_sha256=hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest())
     try:
@@ -94,6 +108,9 @@ def stop(store: Store, sid: str, user: str) -> dict:
     os.makedirs(RESULTS, exist_ok=True)
     with open(os.path.join(RESULTS, f"{sid}.diff"), "w") as f:
         f.write(diff)
+    pr = None
+    if not was_contained and s["policy"].get("output", {}).get("type") == "pull_request" and diff.strip():
+        pr = _publish(sid, s, diff)
     if was_contained:                                                   # keep the frozen pod for forensics
         evidence.write_sync("session_stop", session_id=sid, user=user, spec=s["spec_name"],
                             spec_digest=s["spec_digest"], diff_bytes=len(diff),
@@ -103,7 +120,9 @@ def stop(store: Store, sid: str, user: str) -> dict:
     store.update(sid, state="stopped", detail="stopped by user", ended=True)
     evidence.write_sync("session_stop", session_id=sid, user=user, spec=s["spec_name"], spec_digest=s["spec_digest"],
                         diff_bytes=len(diff), diff_sha256=hashlib.sha256(diff.encode()).hexdigest(), exec_rc=rc)
-    return {"session_id": sid, "state": "stopped", "diff_bytes": len(diff)}
+    if pr:
+        store.update(sid, detail=f"PR {pr.get('pr_url') or pr.get('error')}"[:500])
+    return {"session_id": sid, "state": "stopped", "diff_bytes": len(diff), "pr": pr}
 
 
 def contain(store: Store, sid: str, actor: str, alert_id: str | None = None, reason: str = "") -> dict:
@@ -182,6 +201,50 @@ def destroy(store: Store, sid: str, user: str) -> dict:
     return {"session_id": sid, "state": "destroyed"}
 
 
+def _publish(sid: str, s: dict, diff: str) -> dict:
+    """Draft PR via credproxy. The agent's own summary is quoted as untrusted text."""
+    summary = ""
+    try:
+        logs = k8s.logs(sid, follow=False).data.decode(errors="replace")
+        line = next((l for l in reversed(logs.splitlines()) if '"type":"result"' in l.replace(" ", "")), "")
+        summary = json.loads(line).get("result", "") if line else ""
+    except Exception:  # noqa: BLE001
+        pass
+    out_cfg = s["policy"].get("output", {})
+    who0 = {"session_id": sid, "user": s["user"], "spec": s["spec_name"], "spec_digest": s["spec_digest"]}
+    hit = scan(diff.encode(), s["canaries"])
+    if hit or len(diff) > MAX_PR_DIFF:
+        reason = f"canary {hit['id']} ({hit['encoding']}) in diff" if hit else f"diff too large ({len(diff)} bytes)"
+        evidence.write_sync("pr_refused", **who0, error=reason)
+        if hit:   # the PR is an egress channel too: same rule as D1, raised by the control plane
+            alerts.write_sync("alert", alert_id=f"al_pr_{sid}", rule="D1", severity="high", **who0,
+                              summary=f"{reason}: PR publication refused", observed={"channel": "pull_request"},
+                              evidence=[{"source": "control-plane", "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}],
+                              pod=s["pod_name"], pod_ip=s["pod_ip"])
+        return {"error": reason}
+    # Untrusted text: quote it and break @mentions so an injected agent can't ping people via our PR.
+    safe = (summary or "(no summary)").replace("@", "@\u200b")
+    quoted = "\n".join("> " + l for l in safe.splitlines()[:60])
+    body = (f"Opened by the sandboxed agent platform. **Requires human review.**\n\n"
+            f"| | |\n|---|---|\n| Requested by | `{s['user']}` |\n| Session | `{sid}` |\n"
+            f"| Spec | `{s['spec_name']}` |\n| Spec digest | `{s['spec_digest']}` |\n"
+            f"| Task | {s['params'].get('task', '')[:300]} |\n\n"
+            f"### Agent summary (untrusted, written by the agent)\n\n{quoted}\n")
+    title = f"agent: {s['params'].get('task', 'changes')[:60]} ({sid})"
+    who = {"session_id": sid, "user": s["user"], "spec": s["spec_name"], "spec_digest": s["spec_digest"]}
+    try:
+        resp = _credproxy("/github/publish", {"session_id": sid, "repo": s["params"]["repo"][len("github:"):],
+                                              "branch": f"{out_cfg.get('branch_prefix', 'agent/')}{sid}",
+                                              "diff": diff, "title": title, "body": body})
+        pr = json.loads(resp.read())
+        evidence.write_sync("pr_opened", **who, pr_url=pr["pr_url"], branch=pr["branch"], commit=pr["commit"],
+                            paths=pr["paths"], token=pr.get("token"))
+        return pr
+    except RuntimeError as e:
+        evidence.write_sync("pr_refused", **who, error=str(e)[:500])
+        return {"error": str(e)[:300]}
+
+
 def diff(store: Store, sid: str, user: str) -> str:
     _owned(store, sid, user)
     path = os.path.join(RESULTS, f"{sid}.diff")
@@ -216,8 +279,26 @@ def _owned(store: Store, sid: str, user: str) -> dict:
     return s
 
 
-def _clone(repo: str, dest: str) -> str:
+def _credproxy(path: str, body: dict, timeout: int = 180):
+    req = urllib.request.Request(CREDPROXY + path, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "X-Sbx-CP": CP_KEY})
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"credproxy {path}: {e.code} {e.read().decode(errors='replace')[:300]}") from None
+
+
+def _clone(sid: str, repo: str, dest: str, who: dict) -> str:
+    """git-lab repos are cloned directly; GitHub repos only through credproxy, which mints and
+    revokes a repo-scoped read token and returns a tarball (the token never leaves credproxy)."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if repo.startswith("github:"):
+        resp = _credproxy("/github/clone", {"session_id": sid, "repo": repo[len("github:"):]})
+        meta = json.loads(resp.headers.get("X-Sbx-Token-Meta", "{}"))
+        with tarfile.open(fileobj=io.BytesIO(resp.read()), mode="r:gz") as tar:
+            tar.extractall(os.path.dirname(dest), filter="data")
+        evidence.write_sync("github_token_used", **who, operation="clone", **meta)
+        return meta.get("commit", "")
     env = {**os.environ, "HOME": "/tmp", "GIT_TERMINAL_PROMPT": "0"}
     subprocess.run(["git", "clone", "-q", "--depth", "1", f"{GIT_LAB}/{repo}.git", dest], env=env, check=True,
                    capture_output=True, timeout=60)

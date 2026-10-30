@@ -1,0 +1,38 @@
+apiVersion: sbx/v1
+kind: AgentSpec
+metadata:
+  name: testwriter-agent
+  version: 1
+  owners: [monalir]
+spec:
+  runtime:
+    image: sbx/sandbox-pyweb:dev          # per-repo image: FastAPI/httpx/pytest baked in, no PyPI egress
+    runtimeClass: gvisor
+    resources: { cpu: "2", memory: 4Gi }
+    ttl: 30m
+  model:
+    allow: [claude-sonnet-5-5, claude-haiku-5-5]
+    default: claude-sonnet-5-5
+    small: claude-haiku-5-5
+    maxTokens: 3000000
+  repo:
+    allow: ["github:bhadradiyaniravnl/items-api-sample"]
+    access: read                           # clone via credproxy (read token); sandbox never gets git creds
+    output:
+      type: pull_request                   # control plane opens it via credproxy (write token) after stop
+      base: main
+      draft: true
+      branchPrefix: agent/
+      protectedPaths: [".github/", ".git/", "requirements.txt"]
+  agentTools:
+    allow: [Read, Edit, Write, Glob, Grep, "Bash(python3 -m pytest:*)", "Bash(git diff:*)", "Bash(git status:*)"]
+  egress:
+    allow: []
+  secrets:
+    - ref: anthropic/default
+    - ref: github-app/bhadradiyaniravnl/items-api-sample
+  detection:
+    denyBurst: { count: 5, window: 60s }
+  parameters:
+    repo: { type: string, pattern: "^github:bhadradiyaniravnl/items-api-sample$" }
+    task: { type: string, maxLength: 4000 }

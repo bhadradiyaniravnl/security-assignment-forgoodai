@@ -36,9 +36,10 @@ class ControlPlane:
             self._http = aiohttp.ClientSession(headers=internal.headers(), timeout=aiohttp.ClientTimeout(total=5))
         return self._http
 
-    async def _cached(self, key: tuple, method: str, path: str, json_body: dict | None = None) -> tuple[int, dict]:
+    async def _cached(self, key: tuple, method: str, path: str, json_body: dict | None = None,
+                      fresh: bool = False) -> tuple[int, dict]:
         hit = self._cache.get(key)
-        if hit and time.monotonic() - hit[0] < self.ttl:
+        if hit and not fresh and time.monotonic() - hit[0] < self.ttl:
             return hit[1], hit[2]
         http = await self._get_http()
         async with http.request(method, internal.CONTROL_PLANE_URL + path, json=json_body) as r:
@@ -49,5 +50,6 @@ class ControlPlane:
     async def validate(self, token: str, ip: str) -> tuple[int, dict]:
         return await self._cached(("v", token, ip), "POST", "/internal/validate", {"token": token, "ip": ip})
 
-    async def policy(self, session_id: str) -> tuple[int, dict]:
-        return await self._cached(("p", session_id), "GET", f"/internal/policy/{session_id}")
+    async def policy(self, session_id: str, fresh: bool = False) -> tuple[int, dict]:
+        """fresh=True skips the cache: used for rare, high-impact operations (GitHub clone/publish)."""
+        return await self._cached(("p", session_id), "GET", f"/internal/policy/{session_id}", fresh=fresh)

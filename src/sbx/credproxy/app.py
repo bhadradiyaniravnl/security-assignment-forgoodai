@@ -20,6 +20,7 @@ from aiohttp import web
 
 from sbx.common import internal
 from sbx.common.policy import ControlPlane, host_allowed
+from sbx.credproxy import github
 
 ANTHROPIC_URL = os.environ.get("ANTHROPIC_UPSTREAM", "https://api.anthropic.com")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -86,6 +87,55 @@ async def egress(request: web.Request) -> web.StreamResponse:
         return await relay(request, up)
 
 
+CP_KEY = os.environ.get("SBX_CP_KEY", "")
+
+
+async def cp_session(request: web.Request, sid: str, states: tuple) -> dict:
+    """GitHub operations are reserved for the control plane (separate key: the gateway can't ask
+    credproxy to clone or push), and re-checked against the session's compiled policy."""
+    import hmac
+    if not CP_KEY or not hmac.compare_digest(request.headers.get("X-Sbx-CP", ""), CP_KEY):
+        raise web.HTTPUnauthorized(text="control-plane key required")
+    status, ctx = await cp.policy(sid, fresh=True)
+    if status != 200 or ctx.get("state") not in states:
+        raise web.HTTPForbidden(text=f"session {sid} not in {states}")
+    return ctx
+
+
+def _github_grant(ctx: dict, repo: str) -> None:
+    if f"github-app/{repo}" not in ctx["policy"].get("grants", []):
+        raise web.HTTPForbidden(text=f"spec grants no GitHub credential for {repo}")
+    if ctx["policy"].get("repo") != f"github:{repo}":
+        raise web.HTTPForbidden(text="repo does not match the session")
+
+
+async def github_clone(request: web.Request) -> web.Response:
+    body = await request.json()
+    ctx = await cp_session(request, body["session_id"], ("creating", "running"))
+    _github_grant(ctx, body["repo"])
+    try:
+        data, meta = await asyncio.to_thread(github.clone, body["repo"], body.get("ref", "main"))
+    except github.GitHubError as e:
+        raise web.HTTPBadGateway(text=str(e)) from None
+    return web.Response(body=data, content_type="application/gzip", headers={"X-Sbx-Token-Meta": json.dumps(meta)})
+
+
+async def github_publish(request: web.Request) -> web.Response:
+    body = await request.json()
+    ctx = await cp_session(request, body["session_id"], ("stopping",))
+    _github_grant(ctx, body["repo"])
+    out = ctx["policy"].get("output", {})
+    if out.get("type") != "pull_request":
+        raise web.HTTPForbidden(text="spec output is not pull_request")
+    try:
+        result = await asyncio.to_thread(
+            github.publish, body["repo"], out.get("base", "main"), body["branch"], body["diff"], body["title"],
+            body["body"], out.get("protected_paths", [".github/", ".git/"]), bool(out.get("draft", True)))
+    except github.GitHubError as e:
+        raise web.HTTPUnprocessableEntity(text=str(e)) from None
+    return web.json_response(result)
+
+
 async def tunnel(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
@@ -126,7 +176,9 @@ async def main() -> None:
     app["http"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600), auto_decompress=False)
     app.router.add_route("*", "/anthropic/{tail:.*}", anthropic)
     app.router.add_route("*", "/egress", egress)
-    app.router.add_get("/healthz", lambda r: web.json_response({"ok": True}))
+    app.router.add_get("/healthz", lambda r: web.json_response({"ok": True, "github": github.enabled()}))
+    app.router.add_post("/github/clone", github_clone)
+    app.router.add_post("/github/publish", github_publish)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", 9000).start()

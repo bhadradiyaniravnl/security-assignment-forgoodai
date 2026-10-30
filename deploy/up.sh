@@ -43,7 +43,10 @@ deploy/images.sh
 log "Manifests"
 kubectl apply -k deploy/k8s >/dev/null
 if ! kubectl -n sbx-system get secret sbx-internal >/dev/null 2>&1; then
-  kubectl -n sbx-system create secret generic sbx-internal --from-literal=key="$(openssl rand -hex 32)" >/dev/null
+  kubectl -n sbx-system create secret generic sbx-internal --from-literal=key="$(openssl rand -hex 32)" \
+    --from-literal=cp-key="$(openssl rand -hex 32)" >/dev/null
+elif [ -z "$(kubectl -n sbx-system get secret sbx-internal -o jsonpath='{.data.cp-key}')" ]; then
+  kubectl -n sbx-system patch secret sbx-internal -p "{\"stringData\":{\"cp-key\":\"$(openssl rand -hex 32)\"}}" >/dev/null
 fi
 if [ -f secrets/.env ]; then deploy/secrets.sh; else echo "secrets/.env missing: credproxy will not start (see secrets/.example.env)"; fi
 kubectl -n lab-ext rollout status deploy --timeout=180s >/dev/null

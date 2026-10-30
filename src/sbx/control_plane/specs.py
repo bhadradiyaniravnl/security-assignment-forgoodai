@@ -111,6 +111,11 @@ def compile_policy(spec: dict) -> dict:
         "max_tokens": int(s["model"]["maxTokens"]),
         "grants": [g["ref"] for g in s.get("secrets", [])],
         "agent_tools": list(s.get("agentTools", {}).get("allow", [])),
+        "output": {"type": s["repo"].get("output", {}).get("type", "branch"),
+                   "base": s["repo"].get("output", {}).get("base", "main"),
+                   "draft": bool(s["repo"].get("output", {}).get("draft", True)),
+                   "branch_prefix": s["repo"].get("output", {}).get("branchPrefix", "agent/"),
+                   "protected_paths": list(s["repo"].get("output", {}).get("protectedPaths", [".github/", ".git/"]))},
         "deny_burst": {"count": int(burst["count"]), "window_s": _seconds(burst["window"])},
         "runtime": {
             "image": s["runtime"]["image"],

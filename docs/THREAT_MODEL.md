@@ -53,11 +53,13 @@ D = demonstrated by the harness · Des = designed, not built · NA = not address
 | Spec registry: baseline, immutability, widening needs approval | D | B12, B14, `make specs` |
 | Admission backstop (API server) for session pods | D | B15 |
 | Detection D1/D2 + auto-containment, two-source verification | D | B9, B-D2, B11 |
+| GitHub: per-operation App tokens (repo-scoped, least privilege, revoked); sandbox has no GitHub route | D | `make github` |
+| Agent PRs: draft, App-authored, attributed; refused if they touch CI/protected paths or contain the canary | D | PR #1; refusals raise D1 |
 | Hash-chained evidence outside the sandbox; snapshot on containment | D | chains verify each run |
 | D3 tool_use inspection (model asked for exfil) | D (input) | parsed live; one false positive found and fixed (below) |
 | TLS inspection for allowlisted upload hosts | Des | closes B10 |
 | MicroVM isolation (Kata/Firecracker), mTLS/SPIFFE identity | Des | needs KVM (M3+ Mac or Linux) |
-| Package mirror, signed images/specs, scoped git tokens + PR hand-off | Des | DESIGN §7 |
+| Package mirror, signed images/specs | Des | DESIGN §7 |
 | Pod creation restricted to the controller identity | Des | would break direct-pod tests |
 | gVisor/host kernel escape; compromised control plane or node | NA | |
 
@@ -116,9 +118,10 @@ diff in a `--network none` container, not in the agent's pod.
   credproxy (B5, B6b/c), and tokens are IP-bound (B7). The control plane holds `pods/exec` in the
   sessions namespace, which is the highest-value target. In production: deliver workspaces via
   volumes instead of exec, use a separate identity, audit-log exec, and use OIDC instead of `X-User`.
-- **Insecure agent-written code reaching production:** the agent never holds push credentials. The
-  control plane hands off a diff, and production opens a draft PR via a GitHub App, with branch
-  rulesets, CODEOWNERS review and CI SAST/secret scanning on agent PRs, labelled for higher scrutiny.
+- **Insecure agent-written code reaching production:** demonstrated on a real repo. The agent never
+  holds push credentials. The control plane publishes a **draft, App-authored PR** that refuses CI-workflow
+  changes (an agent-added workflow could steal repo secrets on the first CI run) and canary content.
+  Production would add branch rulesets, CODEOWNERS review, and CI SAST/secret scanning gated on agent PRs.
 - **AI-assisted probing:** assume encodings and parser edge cases will be found quickly. Keep the
   boundary at L3/L4 + credential absence, not content matching. Fuzz the gateway parsers (proxy
   request lines, chunked bodies, SSE) and the canary decoder, and alert on denial bursts (D2 already

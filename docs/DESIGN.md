@@ -498,6 +498,19 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
   - **Host extraction** dropped label hyphens (`paste-mock.lab-ext` became `paste-mock.lab`).
   - **Detector crash-looped** until the control plane was ready; it now retries.
 - **New Phase A outcome:** "removed injection, did task". Across 18 trials, no agent told the user about the injection.
+
+**M8 results (2026-10-30), real GitHub flow:** `make github` passes 10/10, plus a live agent run that opened [PR #1](https://github.com/bhadradiyaniravnl/items-api-sample/pull/1).
+- **GitHub App** (contents + pull_requests only, no workflows), installed on one private repo. Its key is mounted only in credproxy (`fsGroup`, mode 0440). App ID and key are loaded from `secrets/`.
+- **Tokens:** credproxy mints per-operation installation tokens limited to `repositories=[repo]`: `contents:read` for clone, `contents+pull_requests:write` for publish. They're passed to git via an in-memory `http.extraHeader` and revoked with `DELETE /installation/token` straight after use. Mint metadata (permissions, expiry, revoked) goes to control-plane evidence; the token value never leaves credproxy.
+- **Separation of duties:** GitHub endpoints need a separate control-plane key, so the gateway can't trigger clone or publish. They re-check the grant (`github-app/<repo>`), the session's repo, and the session state with an uncached lookup. A cached lookup raced with the agent's last API call and refused a legitimate publish; it failed closed, but it's fixed.
+- **Publication controls:**
+  - draft required by the baseline;
+  - protected paths (`.github/`, `.git/`, `requirements.txt`) refused before any token is minted;
+  - canary-in-diff refused, with a D1 alert for the PR channel;
+  - `.env` added to `.git/info/exclude` so the canary never enters `git add -A`;
+  - agent summary quoted as untrusted text, with `@mentions` broken.
+- **Per-repo tooling:** `sbx/sandbox-pyweb` bakes FastAPI/httpx/pytest into the image, so there is no PyPI egress.
+- **First run:** 52 passing tests and 9 strict xfails documenting 4 real bugs. Two were planted (PATCH accepts invalid values and corrupts the row, DELETE of a missing item returns 204); two the agent found itself (an explicit `null` returns 500, and an item stays unreadable after a bad PATCH).
 - **Known gaps (for the write-up):**
   - D3 (tool_use inspection) is implemented but unexercised until API credits exist.
   - On restart, the detector re-verifies the whole chain but alerts only on events from the last 60s.

@@ -89,6 +89,8 @@ spec:
             - { port: "8443", protocol: TCP }
     - toFQDNs:
         - matchName: api.anthropic.com
+        - matchName: github.com
+        - matchName: api.github.com
       toPorts:
         - ports: [{ port: "443", protocol: TCP }]
 ---
