@@ -100,6 +100,15 @@ def session_logs(sid: str, follow: bool = False, tail: int | None = None, user: 
     return StreamingResponse(resp.stream(1024), media_type="text/plain")
 
 
+class MessageIn(BaseModel):
+    text: str
+
+
+@app.post("/sessions/{sid}/messages")
+def send_message(sid: str, m: MessageIn, user: str = Depends(require_user)) -> dict:
+    return _call(sessions.send_message, sid, user, m.text)
+
+
 @app.post("/sessions/{sid}/stop")
 def stop_session(sid: str, user: str = Depends(require_user)) -> dict:
     return _call(sessions.stop, sid, user)
@@ -195,7 +204,7 @@ def session_diff(sid: str, user: str = Depends(require_user)) -> str:
 
 def _public(s: dict) -> dict:
     return {k: s.get(k) for k in ("session_id", "user", "spec_name", "spec_digest", "params", "pod_name",
-                                  "pod_ip", "state", "detail", "created_at", "ended_at")}
+                                  "pod_ip", "state", "detail", "turns", "created_at", "ended_at")}
 
 
 class SessionIn(BaseModel):

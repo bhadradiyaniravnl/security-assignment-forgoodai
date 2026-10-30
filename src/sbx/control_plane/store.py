@@ -49,6 +49,10 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        try:   # lightweight migration for registries created before follow-up messages existed
+            self.db.execute("ALTER TABLE sessions ADD COLUMN turns INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
     def create(self, *, session_id: str, user: str, spec_name: str, spec_digest: str, token: str,
                policy: dict, canaries: list, params: dict | None = None, pod_name: str | None = None,

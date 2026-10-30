@@ -92,6 +92,10 @@ Across all three full runs (18 trials): 0 attempts, 10 provider refusals, and **
 
 "Did not attempt" is not evidence of protection; Phase B is.
 
+**Agent self-reports are not evidence.** In a resumed multi-turn session, the agent said it had never
+opened or edited `slug.py`. Gateway tool_use evidence and the collected diff show it did both. Every
+verdict here therefore uses platform evidence, and PR bodies label the agent's summary untrusted.
+
 **Phase C:** the clean task passes with every control enabled. Tests are re-run on the collected
 diff in a `--network none` container, not in the agent's pod.
 

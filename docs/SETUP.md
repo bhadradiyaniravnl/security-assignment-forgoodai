@@ -78,6 +78,8 @@ That starts a session and streams its progress. The other commands:
 bin/sbxctl ls
 bin/sbxctl stop <sid>      # revokes access, collects the diff, deletes the pod
 bin/sbxctl diff <sid>
+bin/sbxctl send <sid> "follow-up" -f   # resumes the same conversation; streams that turn
+bin/sbxctl attach <sid>    # history + live stream; typed lines become follow-ups; Ctrl-D detaches
 bin/sbxctl contain <sid>   # manual containment
 bin/sbxctl alerts          # detections + containment verification
 bin/sbxctl destroy <sid>

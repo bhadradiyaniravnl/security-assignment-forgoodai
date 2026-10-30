@@ -125,6 +125,28 @@ def stop(store: Store, sid: str, user: str) -> dict:
     return {"session_id": sid, "state": "stopped", "diff_bytes": len(diff), "pr": pr}
 
 
+MAX_MESSAGE = 4000
+
+
+def send_message(store: Store, sid: str, user: str, text: str) -> dict:
+    """Follow-up instruction from the session owner. The agent resumes the same conversation in the
+    same pod. Evidence records who sent what (hash + length), not the text itself."""
+    s = _owned(store, sid, user)
+    if s["state"] != "running":
+        raise SessionError(409, f"session is {s['state']}")
+    text = text.strip()
+    if not text or len(text) > MAX_MESSAGE:
+        raise SessionError(400, f"message must be 1..{MAX_MESSAGE} characters")
+    n = int(s.get("turns") or 0) + 1
+    b64 = base64.b64encode(json.dumps({"text": text}).encode()).decode()
+    _must(sid, ["sh", "-c", 'mkdir -p /workspace/.sbx/inbox && printf %s "$1" | base64 -d > /workspace/.sbx/inbox/.tmp '
+                            '&& mv /workspace/.sbx/inbox/.tmp "/workspace/.sbx/inbox/$2.json"', "_", b64, str(n)])
+    store.update(sid, turns=n)
+    evidence.write_sync("message_sent", session_id=sid, user=user, spec=s["spec_name"], turn=n, length=len(text),
+                        sha256=hashlib.sha256(text.encode()).hexdigest())
+    return {"session_id": sid, "turn": n}
+
+
 def contain(store: Store, sid: str, actor: str, alert_id: str | None = None, reason: str = "") -> dict:
     """Revoke -> network quarantine -> preserve evidence -> probe. The pod is kept (frozen off the
     network) for forensics until destroy. Order matters: the token dies before anything else."""

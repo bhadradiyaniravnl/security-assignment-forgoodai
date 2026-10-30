@@ -2,6 +2,7 @@
 
   sbxctl run bugfix-agent -p repo=demo/app -p task="Make the tests pass" [-f]
   sbxctl ls | status SID | logs SID [-f] [--raw] | stop SID | diff SID | destroy SID
+  sbxctl send SID "follow-up instruction" [-f] | attach SID
   sbxctl contain SID | alerts
   sbxctl spec register FILE | spec ls
 """
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import threading
 import json
 import os
 import sys
@@ -51,7 +53,8 @@ def pretty(line: str) -> str | None:
     except ValueError:
         return line.rstrip() or None
     if "sbx" in ev:
-        return f"[sbx] {ev['sbx']}" + (f" code={ev['code']}" if "code" in ev else "")
+        return (f"[sbx] {ev['sbx']}" + (f" turn={ev['turn']}" if "turn" in ev else "")
+                + (f" code={ev['code']}" if "code" in ev else ""))
     t = ev.get("type")
     if t == "system" and ev.get("subtype") == "init":
         return f"[init] model={ev.get('model')} tools={len(ev.get('tools', []))}"
@@ -74,15 +77,55 @@ def pretty(line: str) -> str | None:
     return None
 
 
-def follow_logs(sid: str, follow: bool, raw: bool) -> None:
-    resp = call("GET", f"/sessions/{sid}/logs?follow={'true' if follow else 'false'}", stream=True)
+def is_exit(text: str) -> bool:
+    return '"sbx":"agent_exit"' in text.replace(" ", "")
+
+
+def open_logs(sid: str, follow: bool, tail: int | None = None):
+    q = f"follow={'true' if follow else 'false'}" + (f"&tail={tail}" if tail is not None else "")
+    return call("GET", f"/sessions/{sid}/logs?{q}", stream=True)
+
+
+def print_logs(resp, raw: bool, stop_at_exit: bool) -> None:
     for line in resp:
         text = line.decode(errors="replace")
         out = text.rstrip() if raw else pretty(text)
         if out:
             print(out, flush=True)
-        if not raw and '"sbx": "agent_exit"' in text.replace('"sbx":"', '"sbx": "'):
+        if stop_at_exit and is_exit(text):
             break
+
+
+def follow_logs(sid: str, follow: bool, raw: bool) -> None:
+    print_logs(open_logs(sid, follow), raw, stop_at_exit=not raw)
+
+
+def send(sid: str, text: str, follow: bool) -> None:
+    """Opens the live stream first (tail=0: only new output), then posts, so nothing is missed."""
+    stream = open_logs(sid, True, tail=0) if follow else None
+    r = call("POST", f"/sessions/{sid}/messages", {"text": text})
+    print(f"sent turn {r['turn']} to {sid}", flush=True)
+    if stream:
+        print_logs(stream, False, stop_at_exit=True)
+
+
+def attach(sid: str) -> None:
+    """Replays recent history, then streams live while each line you type becomes a follow-up.
+    Ctrl-D detaches; the session keeps running (stop/destroy it explicitly)."""
+    s = call("GET", f"/sessions/{sid}")
+    print(f"attached to {sid} ({s['spec_name']}, {s['state']}, turns={s.get('turns') or 0}). "
+          "Type a follow-up and press Enter; Ctrl-D to detach.", flush=True)
+    print_logs(open_logs(sid, False, tail=40), False, stop_at_exit=False)
+    live = open_logs(sid, True, tail=0)
+    threading.Thread(target=print_logs, args=(live, False, False), daemon=True).start()
+    try:
+        while True:
+            line = input()
+            if line.strip():
+                r = call("POST", f"/sessions/{sid}/messages", {"text": line})
+                print(f"[you] turn {r['turn']}: {line}", flush=True)
+    except (EOFError, KeyboardInterrupt):
+        print(f"\ndetached; {sid} is still running (sbxctl stop {sid} when done)")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -94,6 +137,11 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("-f", "--follow", action="store_true", help="stream progress until the agent exits")
     sub.add_parser("ls", help="list your sessions")
     sub.add_parser("alerts", help="detections and containment verifications for your sessions")
+    sd = sub.add_parser("send", help="send a follow-up; the agent resumes the same conversation")
+    sd.add_argument("sid")
+    sd.add_argument("text")
+    sd.add_argument("-f", "--follow", action="store_true", help="stream that turn until the agent finishes it")
+    sub.add_parser("attach", help="stream live and type follow-ups interactively").add_argument("sid")
     sp = sub.add_parser("spec", help="register or list agent specs")
     sp.add_argument("action", choices=["register", "ls"])
     sp.add_argument("file", nargs="?")
@@ -123,6 +171,10 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(call("POST", f"/sessions/{a.sid}/stop")))
     elif a.cmd == "diff":
         print(call("GET", f"/sessions/{a.sid}/diff"), end="")
+    elif a.cmd == "send":
+        send(a.sid, a.text, a.follow)
+    elif a.cmd == "attach":
+        attach(a.sid)
     elif a.cmd == "contain":
         r = call("POST", f"/sessions/{a.sid}/contain")
         print(json.dumps({k: r.get(k) for k in ("session_id", "state", "probe", "probe_blocked", "elapsed_s", "snapshot")},

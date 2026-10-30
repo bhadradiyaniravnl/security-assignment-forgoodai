@@ -511,6 +511,19 @@ Ordered by grading value, so a working slice exists early. **Core ≈ 10.5h. Tha
   - agent summary quoted as untrusted text, with `@mentions` broken.
 - **Per-repo tooling:** `sbx/sandbox-pyweb` bakes FastAPI/httpx/pytest into the image, so there is no PyPI egress.
 - **First run:** 52 passing tests and 9 strict xfails documenting 4 real bugs. Two were planted (PATCH accepts invalid values and corrupts the row, DELETE of a missing item returns 204); two the agent found itself (an explicit `null` returns 500, and an item stays unreadable after a bad PATCH).
+
+**M9 results (2026-10-30), interaction and resume:**
+- **Commands:** `sbxctl send SID "…" [-f]` and `sbxctl attach SID` (history replay, live stream, typed follow-ups, Ctrl-D detaches without stopping).
+- **How a follow-up runs:** the control plane writes it atomically into the pod's inbox (owner-only, running sessions only, ≤4000 chars). The entrypoint runs `claude -p … --continue` in the same workspace, so the conversation resumes.
+- **Evidence:** a `message_sent` record per turn with user, turn, length and sha256, not the text.
+- **Tested:**
+  - a 3-turn session (diagnose → fix → recap);
+  - `attach` with piped input;
+  - another user's message is refused (403);
+  - a 4001-character message is refused (400);
+  - a message after `stop` is refused (409).
+- **Finding: agent self-reports are unreliable.** In turns 1–2 the agent said it had never opened, and then never edited, `slug.py`. The gateway's tool_use evidence shows `Read slug.py` in turn 0 and two `Edit`s in turn 1, and the collected diff contains the fix. Ground truth must come from platform evidence and the diff, never from the agent's account, which is why PR bodies label the summary untrusted.
+- **Designed, not built:** resume *after* `stop`. Snapshot the workspace and `~/.claude` at stop, then restore into a new gVisor pod with a new token and the same spec digest. Not required by the brief, and it widens the attack surface (persisted transcripts may hold injected content and secrets).
 - **Known gaps (for the write-up):**
   - D3 (tool_use inspection) is implemented but unexercised until API credits exist.
   - On restart, the detector re-verifies the whole chain but alerts only on events from the last 60s.

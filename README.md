@@ -35,6 +35,8 @@ brew install colima docker kind kubectl cilium-cli hubble
 cp secrets/.example.env secrets/.env          # add a workspace-scoped Anthropic API key
 make hooks up                                  # ~10-15 min the first time
 bin/sbxctl run bugfix-agent -p repo=demo/app -p task="Make the tests in tests/ pass" -f
+bin/sbxctl send <sid> "now add a test for X" -f # follow-up: resumes the same conversation in the same pod
+bin/sbxctl attach <sid>                        # live stream + type follow-ups; Ctrl-D detaches
 make security-test                             # phases B, A, C -> out/report.md
 make down
 ```
