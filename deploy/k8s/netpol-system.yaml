@@ -55,6 +55,10 @@ spec:
         - matchLabels: { app: control-plane }
       toPorts:
         - ports: [{ port: "8000", protocol: TCP }]
+    - toEndpoints:                                        # evidence-shipper sidecar -> sentinel
+        - matchLabels: { k8s:io.kubernetes.pod.namespace: sbx-security, app: sentinel }
+      toPorts:
+        - ports: [{ port: "9100", protocol: TCP }]
 ---
 # credproxy: ingress from gateway and control-plane; policy lookups to control-plane; the only pod with egress beyond the cluster.
 apiVersion: cilium.io/v2
@@ -94,7 +98,7 @@ spec:
       toPorts:
         - ports: [{ port: "443", protocol: TCP }]
 ---
-# control-plane: ingress from host (NodePort), gateway, detector; egress to kube-apiserver, credproxy, git-lab.
+# control-plane: ingress from host (NodePort), gateway, credproxy, sentinel; egress to kube-apiserver, credproxy, git-lab.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -110,7 +114,7 @@ spec:
     - fromEndpoints:
         - matchLabels: { app: gateway }
         - matchLabels: { app: credproxy }
-        - matchLabels: { app: detector }
+        - matchLabels: { k8s:io.kubernetes.pod.namespace: sbx-security, app: sentinel }
       toPorts:
         - ports: [{ port: "8000", protocol: TCP }]
   egress:
@@ -138,24 +142,3 @@ spec:
         - matchLabels: { app: control-plane }
       toPorts:
         - ports: [{ port: "8080", protocol: TCP }]
----
-# detector: egress to hubble-relay and control-plane only.
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: detector
-  namespace: sbx-system
-spec:
-  endpointSelector:
-    matchLabels: { app: detector }
-  egress:
-    - toEndpoints:
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: kube-system
-            k8s-app: hubble-relay
-      toPorts:
-        - ports: [{ port: "4245", protocol: TCP }]
-    - toEndpoints:
-        - matchLabels: { app: control-plane }
-      toPorts:
-        - ports: [{ port: "8000", protocol: TCP }]

@@ -1,0 +1,148 @@
+# Sentinel: continuous detection & response in its own trust zone.
+# - own namespace + node (sbx/pool=security), own service account, own volume
+# - can ONLY manage Cilium policies (and list pods) in sbx-sessions: no exec, no Secrets
+# - its quarantine/freeze policies can't be changed or removed by anyone else (admission policy)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sbx-security
+  labels: { pod-security.kubernetes.io/enforce: restricted }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: sentinel, namespace: sbx-security }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: sentinel-response, namespace: sbx-sessions }
+rules:
+  - apiGroups: [cilium.io]
+    resources: [ciliumnetworkpolicies]
+    verbs: [create, get, list, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: sentinel-response, namespace: sbx-sessions }
+subjects: [{ kind: ServiceAccount, name: sentinel, namespace: sbx-security }]
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: sentinel-response }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: sentinel-data, namespace: sbx-security }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: sentinel, namespace: sbx-security }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: sentinel } }
+  template:
+    metadata: { labels: { app: sentinel } }
+    spec:
+      serviceAccountName: sentinel
+      nodeSelector: { sbx/pool: security }                 # not the platform node, not the sandbox node
+      tolerations:
+        - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: sentinel
+          image: sbx/services:dev
+          imagePullPolicy: Never
+          command: ["python", "-m", "sbx.sentinel.main"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: HOME, value: /tmp }
+            - name: SBX_INTERNAL_KEY          # its own key: policy reads + alerts on the control plane
+              valueFrom: { secretKeyRef: { name: sentinel-keys, key: sentinel-key } }
+            - name: SENTINEL_INGEST_KEY
+              valueFrom: { secretKeyRef: { name: sentinel-keys, key: ingest-key } }
+          ports: [{ containerPort: 9100 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 9100 }, periodSeconds: 5 }
+          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { cpu: "1", memory: 512Mi } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: sentinel-data } }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: sentinel, namespace: sbx-security }
+spec:
+  selector: { app: sentinel }
+  ports: [{ name: ingest, port: 9100, targetPort: 9100 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: security-default-deny, namespace: sbx-security }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: { name: sentinel, namespace: sbx-security }
+spec:
+  endpointSelector: { matchLabels: { app: sentinel } }
+  ingress:                                                # only the evidence shipper (gateway pod) pushes in
+    - fromEndpoints:
+        - matchLabels: { k8s:io.kubernetes.pod.namespace: sbx-system, app: gateway }
+      toPorts: [{ ports: [{ port: "9100", protocol: TCP }] }]
+  egress:
+    - toEndpoints:
+        - matchLabels: { k8s:io.kubernetes.pod.namespace: kube-system, k8s-app: hubble-relay }
+      toPorts: [{ ports: [{ port: "4245", protocol: TCP }] }]
+    - toEntities: [kube-apiserver]
+    - toEndpoints:
+        - matchLabels: { k8s:io.kubernetes.pod.namespace: sbx-system, app: control-plane }
+      toPorts: [{ ports: [{ port: "8000", protocol: TCP }] }]
+    - toEndpoints:
+        - matchLabels: { k8s:io.kubernetes.pod.namespace: kube-system, k8s-app: kube-dns }
+      toPorts:
+        - ports: [{ port: "53", protocol: ANY }]
+          rules: { dns: [{ matchPattern: "*" }] }
+---
+# Self-protection: sentinel-managed deny policies can only be changed or removed by the sentinel's
+# own identity, so a compromised control plane (or a careless admin) can't lift a quarantine.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata: { name: sentinel-policies-protected }
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [cilium.io]
+        apiVersions: [v2]
+        operations: [UPDATE, DELETE]
+        resources: [ciliumnetworkpolicies]
+  validations:
+    - expression: >-
+        !(has(oldObject.metadata.labels) && 'app.kubernetes.io/managed-by' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'sentinel') ||
+        request.userInfo.username == 'system:serviceaccount:sbx-security:sentinel'
+      message: "sentinel-managed policies can only be changed or removed by the sentinel"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata: { name: sentinel-policies-protected }
+spec:
+  policyName: sentinel-policies-protected
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: sbx-sessions } }

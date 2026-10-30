@@ -11,3 +11,4 @@ resources:
   - lab.yaml
   - apps.yaml
   - admission.yaml
+  - sentinel.yaml

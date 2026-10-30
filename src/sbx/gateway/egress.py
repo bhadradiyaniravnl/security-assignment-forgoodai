@@ -22,6 +22,7 @@ MAX_HEADER = 64 * 1024
 MAX_BODY = 16 * 1024 * 1024
 MAX_RESPONSE = 32 * 1024 * 1024
 BODY_TIMEOUT_S = 30
+READ_METHODS = {"GET", "HEAD"}
 MAX_CONN_PER_IP = 16          # one sandbox must not be able to exhaust the shared gateway
 _active: dict[str, int] = {}
 DROP = {"proxy-authorization", "proxy-connection", "connection", "keep-alive", "host", "content-length",
@@ -78,11 +79,15 @@ async def _handle(reader, writer, http: aiohttp.ClientSession, peer: str) -> Non
     policy, canaries = pol["policy"], pol.get("canaries", [])
     base.update(session_fields(ctx))
     allowed = host_allowed(host, policy.get("egress_allow", []))
+    writable = host_allowed(host, policy.get("egress_write", []))
 
     if method == "CONNECT":
         if not allowed:
             await evidence.write("egress_deny", **base, decision="deny", reason="default_deny")
             return await reply(writer, 403, "destination not allowed by spec")
+        if not writable:    # a TLS tunnel's payload is opaque, so it counts as a write
+            await evidence.write("egress_deny", **base, decision="deny", reason="write_not_allowed")
+            return await reply(writer, 403, "destination is read-only for this spec (no CONNECT)")
         return await tunnel(reader, writer, base, ctx["session_id"], host, port)
 
     try:
@@ -98,6 +103,9 @@ async def _handle(reader, writer, http: aiohttp.ClientSession, peer: str) -> Non
     if not allowed:
         await evidence.write("egress_deny", **base, decision="deny", reason="default_deny")
         return await reply(writer, 403, "destination not allowed by spec")
+    if method not in READ_METHODS and not writable:
+        await evidence.write("egress_deny", **base, decision="deny", reason="write_not_allowed")
+        return await reply(writer, 403, "destination is read-only for this spec")
 
     fwd = {k: v for k, v in headers.items() if k not in DROP}
     fwd.update(internal.headers())

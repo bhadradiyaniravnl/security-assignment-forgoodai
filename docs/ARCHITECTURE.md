@@ -39,7 +39,7 @@ flowchart LR
     cp[control plane<br/>FastAPI + SQLite]
     gw[gateway<br/>AI :8080 · egress :3128]
     cred[credproxy<br/>:9000 HTTP · :9001 tunnel]
-    det[detector]
+    ship[evidence shipper]
     git[git-lab]
     ev[(evidence PVC)]
   end
@@ -66,9 +66,14 @@ flowchart LR
   cred --> paste
   gw --> ev
   cp --> ev
-  ev -->|read-only| det
-  hub -->|dropped flows| det
-  det -->|alerts, contain| cp
+  ev -->|read-only| ship
+  subgraph secns [namespace sbx-security · own node]
+    sen[sentinel<br/>detect · respond · verify]
+  end
+  ship -->|push, chain-verified| sen
+  hub -->|all flows: sessions + platform| sen
+  sen -->|own deny policies| pod
+  sen -.->|best effort: revoke, snapshot| cp
 ```
 
 The sandbox has exactly **one** reachable destination, the gateway Service. **credproxy is the only
@@ -79,12 +84,12 @@ pod with a route out of the cluster.** Everything else is reached through those 
 ```
 macOS (Apple M2 Pro)
 └── Colima VM "sbx" (Linux arm64, 6 CPU, 8 GB)          docker engine
-    └── kind cluster "sbx" (1 node, Kubernetes 1.37)
-        ├── Cilium 1.20 (CNI, kube-proxy replacement, Hubble relay, socketLB.hostNamespaceOnly)
-        ├── gVisor runsc (RuntimeClass "gvisor")
-        ├── ns sbx-system     control-plane · gateway · credproxy · detector · git-lab   (runc)
-        ├── ns sbx-sessions   sandbox-<sid> pods                                           (gvisor)
-        └── ns lab-ext        paste-mock · attacker-sink                                   (runc)
+    └── kind cluster "sbx" (Kubernetes 1.37)
+        ├── node sbx-control-plane   Kubernetes control plane; sbx/pool=security: sentinel (ns sbx-security) only
+        ├── node sbx-worker          sbx/pool=platform: control-plane · gateway (+ evidence shipper) · credproxy ·
+        │                            git-lab · lab-ext (runc), evidence and cp-data volumes
+        ├── node sbx-worker2         sbx/pool=sandbox, tainted: sandbox-<sid> pods only (gVisor installed only here)
+        └── Cilium 1.20 (CNI, kube-proxy replacement, Hubble relay, socketLB.hostNamespaceOnly) on all nodes
 ```
 
 | Workload | Image | Ports | Holds | Can reach |
@@ -92,7 +97,8 @@ macOS (Apple M2 Pro)
 | control-plane | `sbx/services` | 8000 (NodePort 30443 → `127.0.0.1:8443`) | SQLite (sessions, specs, approvals); controller SA; caller keys; `cp-key` | API server, credproxy, git-lab |
 | gateway | `sbx/services` | 8080, 3128 (ClusterIP `10.96.100.10`) | `gateway-key`; evidence (rw) | control plane, credproxy |
 | credproxy | `sbx/services` | 9000, 9001 | **Anthropic key, GitHub App key**; `credproxy-key`; `cp-key` | control plane, lab-ext, `api.anthropic.com`, `github.com`, `api.github.com` |
-| detector | `sbx/services` | — | `detector-key`; evidence (ro) | Hubble relay, control plane |
+| sentinel (ns `sbx-security`, security node) | `sbx/services` | 9100 (ingest), 127.0.0.1:9101 (admin) | `sentinel-key`, `ingest-key`; own volume; SA limited to Cilium policies + pod list in `sbx-sessions` | Hubble relay, API server, control plane |
+| gateway sidecar: evidence-shipper | `sbx/services` | — | `ingest-key`; evidence (ro) | sentinel |
 | git-lab | `sbx/services` | 8080 (`git://`) | demo repos | — (control plane only inbound) |
 | sandbox-&lt;sid&gt; | `sbx/sandbox` or `sbx/sandbox-pyweb` | — | repo copy, canary, placeholder token | gateway only |
 | paste-mock / attacker-sink | `sbx/services` | 8080, 8443 | receipt log (ground truth) | — (credproxy only inbound) |
@@ -146,10 +152,23 @@ ServiceAccount is limited to the `sbx-sessions` namespace: pods, logs, exec, and
 | Endpoint | Caller |
 |---|---|
 | `POST /internal/validate` | gateway |
-| `GET /internal/policy/{sid}` | gateway, credproxy, detector |
-| `POST/GET /internal/alerts`, `POST /internal/alerts/verification` | detector |
+| `GET /internal/policy/{sid}` | gateway, credproxy, sentinel |
+| `POST/GET /internal/alerts`, `POST /internal/alerts/verification` | sentinel |
 
 There is deliberately **no internal way to create a session**.
+
+**State is durable:** SQLite lives on the `cp-data` PVC. At startup, a sweep removes any session pod the registry doesn't know as live, failing closed. A `meta` table holds the fleet-freeze flag.
+
+**Fleet kill switch:** `POST /admin/freeze` (security admins only) moves every live session to `contained` with compare-and-set, applies one namespace-wide Cilium deny policy (`freeze-all-sessions`), and refuses new runs. `unfreeze` lifts the network policy, but frozen sessions stay contained until an admin releases them.
+
+**Untrusted-content scan** (`content_scan.py`): at clone time, repo text is scanned for instruction-like content aimed at agents (directives, override phrases, concealment cues, secret-sending commands, hidden Unicode). Findings go to evidence, a low `INJ` alert and the PR body, because agents rarely tell the user what they saw.
+
+**Idle and lifetime reaper:** resources are freed without waiting for the hard TTL.
+- **Activity** means gateway token validations (every model or egress call) plus follow-up messages. These are signals the agent can't fake from inside the pod.
+- **Idle:** a running session idle longer than `spec.runtime.idleTimeout` (default 10 min; the baseline allows 30 s to 1 h, never above the TTL) gets a normal `stop`: trusted diff, draft PR if configured, transcript saved, workdir and pod deleted. The reason is recorded, e.g. `idle 602s (limit 600s)`.
+- **Max lifetime:** sessions are stopped cleanly 60 s before the kubelet's hard TTL kill.
+- **Contained sessions:** released after `SBX_CONTAINED_RETENTION_HOURS` (default 2); the snapshot and transcript are taken at containment.
+- **Trade-off:** a tool run longer than the idle timeout with no model calls in between looks idle, so the timeout is per spec.
 
 **Session states:** `creating → running → stopping → stopped → destroyed`. Side exits are `failed`,
 `ended` (pod lost or TTL hit) and `contained`. Every change is a compare-and-set, so containment
@@ -204,8 +223,8 @@ One Python process (`src/sbx/gateway/`) with two listeners. Each request:
 - **Inspection:** streamed responses are parsed for `tool_use` blocks, so evidence shows what the model *asked to do*, independent of whether it happened (input to D3).
 
 **Egress gateway (`:3128`)**, a hand-written authenticated forward proxy:
-- **Plain HTTP:** the full request is visible. URL, headers and body are canary-scanned, the host is checked against `egress.allow`, and the request is forwarded via credproxy `/egress`.
-- **CONNECT:** only host and port are visible. Allowed hosts are tunnelled via credproxy `:9001`, and the payload is opaque (the documented B10 blind spot).
+- **Plain HTTP:** the full request is visible. URL, headers and body are canary-scanned, the host is checked against `egress.allow`, and the request is forwarded via credproxy `/egress`. **Write-capable destinations** (marked `accepts_writes` in the baseline catalogue) accept only GET/HEAD unless the spec lists them in `egress.writeAllowed`.
+- **CONNECT:** only host and port are visible, so a tunnel counts as a **write**. It is allowed only to write-allowed hosts and tunnelled via credproxy `:9001`; the payload is opaque (B10v).
 - **Limits per sandbox IP:** 16 concurrent connections; 16 MB body, size-checked before reading; 30 s body timeout; 32 MB response cap.
 
 ### 5.5 Credentials proxy
@@ -226,33 +245,75 @@ GitHub tokens are GitHub App installation tokens, minted per operation from the 
 and they are revoked with `DELETE /installation/token` straight after use. GitHub operations always
 use an **uncached** policy lookup.
 
-### 5.6 Detector
+### 5.6 Sentinel (continuous detection and response)
 
-`src/sbx/detector/` has no Kubernetes credentials. It reads evidence read-only and Hubble flows
-through the relay (pinned `hubble` CLI), and it acts only by calling the control plane.
+**What it can see**, and how far to trust each part:
+- **Kernel truth:** Hubble flows from session **and** platform pods, i.e. where every connection went and whether it was dropped. No pod can fake these.
+- **Platform claims:** shipped gateway and control-plane evidence (model calls, tool calls, egress decisions, lifecycle). It can't be edited or dropped after the fact without an EV alert, but it could be incomplete.
+- **Not seen yet:**
+  - processes and files inside gVisor;
+  - Kubernetes API actions (S-P3, audit webhook);
+  - platform-pod processes (S-P4, Tetragon);
+  - an independent L7 count to check the gateway's completeness (S-P2).
+
+`src/sbx/sentinel/` is a separate security plane in its own namespace (`sbx-security`) on its own
+node (`sbx/pool=security`). The platform has no permissions there and no network path in, except the
+evidence shipper's push.
+
+**Sources:**
+- **Shipped platform evidence.** A sidecar in the gateway pod (`shipper.py`) pushes every record of
+  `gateway.jsonl` and `control-plane.jsonl`. The sentinel checks **sequence continuity and the hash
+  chain on arrival** and keeps its own copy, so a gap or edit raises EV.
+- **Hubble, from session pods and from platform pods.** This comes from the kernel datapath, so no
+  platform pod can fake it.
+
+**Rules** (`rules.py`, pure functions):
 
 | Rule | Signal (source) | Action |
 |---|---|---|
-| **D1** | Canary (plain, base64 at any alignment, hex, URL-encoded) in egress (gateway) | High; **auto-contain** |
-| **D2** | Spec denial (gateway) or DROPPED flow from a session pod (Hubble); first one, then the spec's burst threshold | Medium, then high; **auto-contain** at the burst |
+| **D1** | Canary (plain, base64 at any alignment, hex, URL-encoded) in egress (shipped gateway evidence) | High; **auto-quarantine** |
+| **D2** | Spec denial (gateway) or DROPPED flow from a session pod (Hubble); first one, then the spec's burst threshold | Medium, then high; **auto-quarantine** at the burst |
 | **D3** | Model `tool_use` with the canary, or an *acting* tool (Bash, WebFetch, MCP) referencing `.env` or a non-allowed host | Medium alert |
-| **EV** | Gateway evidence hash chain broken | High alert |
+| **EV** | Shipped evidence: sequence gap or hash-chain break | High alert |
+| **S2** | **Platform pod** (gateway, credproxy, control plane…) has a policy-dropped connection, or reaches the outside world when it isn't credproxy, or credproxy reaches a name outside its allowlist | High alert (isolating platform pods needs approval) |
+| **S6** | Traffic still forwarded from a session after its containment took effect (e.g. a compromised control plane lifted its own quarantine) | High; **re-quarantine** |
 
-The control plane raises D1 itself when a canary appears in a PR diff or the agent's summary.
+The control plane still raises D1 itself for a canary in a PR diff or agent summary, and INJ for the
+content scan.
 
-**Verification:** after containment, the detector requires **two independent sources to agree**:
-Hubble DROPPED flows from the pod after quarantine, and no gateway `allow` for the session after
-revocation. The control plane's in-pod probe is recorded, but not trusted on its own.
+**Response is independent of the control plane:**
+1. The sentinel creates its **own** Cilium deny policy (`sentinel-q-<sid>`) with its own service
+   account. That account can only manage Cilium policies and list pods in `sbx-sessions`: no exec, no Secrets.
+2. Then, best effort, it asks the control plane to revoke the token, snapshot evidence and record the alert.
+
+If the control plane is down, step 1 still holds; this is tested with the control plane scaled to zero.
+**Self-protection:** a ValidatingAdmissionPolicy lets only the sentinel's identity change or delete
+`managed-by=sentinel` policies, so neither a compromised control plane nor a cluster admin using kubectl
+can lift a sentinel quarantine or freeze.
+
+**Verification** polls up to 60 s:
+- *verified* only if Hubble shows the pod's traffic **dropped after the quarantine** and **nothing forwarded** after a 3 s grace period;
+- with no traffic at all, the result is recorded as *inconclusive* rather than claimed.
+
+**Record:** its own hash-chained log (`/data/sentinel.jsonl`, on its own volume) of alerts, actions
+and verifications, plus the verified evidence copies.
+
+**Operator interface:** a localhost-only admin API, reached with
+`kubectl -n sbx-security exec deploy/sentinel -- python -m sbx.sentinel.ctl …`:
+`status`, `alerts`, `freeze`, `unfreeze`, `release`. Cluster access to `sbx-security` is the
+authorisation, and it shows up in the audit log.
 
 ### 5.7 Evidence store
 
-A PVC mounted read-write by the gateway and control plane, read-only by the detector, and **never** by a sandbox.
+A PVC mounted read-write by the gateway and control plane, read-only by the evidence shipper (which copies it to the sentinel), and **never** by a sandbox.
 - **Files:**
   - `gateway.jsonl`: every AI and egress decision, tool_use, canary match;
   - `control-plane.jsonl`: lifecycle, spec registrations and rejections, approvals, GitHub token use, PRs, messages (hash + length), containment;
   - `alerts.jsonl`: alert, containment and verification records linked by `alert_id`.
 - **Integrity:** each record carries `seq`, `prev_hash` and `hash = sha256(prev_hash + record)`. `verify_chain()` detects edits and truncation.
-- **On containment:** a snapshot goes to `sessions/<sid>/` (pod spec and status, session record, agent stdout, the session's gateway events).
+- **On containment:** a snapshot goes to `sessions/<sid>/` (pod spec and status, session record, agent stdout, the session's gateway events, **Claude transcript**).
+- **Reasoning chain:** the AI gateway stores every full prompt and response in `bodies/<sid>/<seq>.json.gz`, canary-redacted and linked to the hash-chained `ai_request` event. The Claude transcript is also saved at `stop`.
+- **Retention:** the control-plane workdir (repo copy + canary) is deleted at `stop`; diffs expire after `SBX_RESULTS_TTL_DAYS` (default 7).
 
 ### 5.8 Lab services
 
@@ -272,7 +333,7 @@ flowchart LR
   c --> pod[pod manifest: image, gVisor, limits, TTL]
   c --> g[gateway: models, budget, egress.allow]
   c --> cp2[credproxy: grants, repo, output]
-  c --> d[detector: D2 burst threshold]
+  c --> d[sentinel: D2 burst threshold]
   c --> cc[Claude Code allowedTools<br/>defence in depth]
 ```
 
@@ -310,7 +371,7 @@ flowchart LR
 | secrets | credproxy (grant re-check per request) |
 | repo, output | control plane (clone, trusted diff) + credproxy (scoped tokens, staged-path check) |
 | parameters | control plane (schema; unknown keys rejected) |
-| detection | detector |
+| detection | sentinel |
 | agentTools | Claude Code (defence in depth only) |
 
 ## 7. Identity and credentials
@@ -321,7 +382,7 @@ flowchart LR
 | Anthropic API key | credproxy Secret | credproxy (injected per request) | long-lived; workspace-scoped key with a spend limit |
 | GitHub App private key | credproxy Secret (mode 0440, fsGroup) | credproxy (JWT signing) | long-lived |
 | GitHub installation token | credproxy memory | one git or API operation | ≤ 1 h; one repo; read **or** write; revoked after use |
-| Component keys (`gateway`, `credproxy`, `detector`) | `sbx-internal` Secret, one per pod | that component, on its scoped endpoints | static (prototype; SPIFFE in production) |
+| Component keys (`gateway`, `credproxy`, `sentinel`), `ingest-key` | `sbx-internal` Secret, one per pod | that component, on its scoped endpoints | static (prototype; SPIFFE in production) |
 | `cp-key` | control plane + credproxy | GitHub clone/publish | static |
 | Controller ServiceAccount | control plane | pods, exec, logs, CNPs in `sbx-sessions` | Kubernetes-managed |
 | User identity | `X-User` header | control plane public API | prototype; OIDC in production |
@@ -339,7 +400,8 @@ hook (`make hooks`) blocks secret-shaped content from git.
 | `system-*` (CNPs) | One explicit path per platform component; DNS for platform pods only |
 | `credproxy` (CNP) | Egress to lab-ext and `toFQDNs` `api.anthropic.com`, `github.com`, `api.github.com` |
 | `lab-*` | Lab services accept only credproxy |
-| `sbx-session-pods` (ValidatingAdmissionPolicy) | Session pods must use gVisor, mount no SA token, carry `sbx/session`, and mount no hostPath, Secret or projected volumes |
+| `freeze-all-sessions` (CNP, created by `freeze`) | Namespace-wide deny for every session pod |
+| `sbx-session-pods` (ValidatingAdmissionPolicy) | Session pods must use gVisor, target the **sandbox node pool**, mount no SA token, carry `sbx/session`, and mount no hostPath, Secret or projected volumes |
 
 Two platform-level details matter:
 - **gVisor and Cilium socket load balancing.** gVisor's network stack never calls the host `connect()`, so Cilium's socket-level Service translation doesn't apply to it. Cilium runs with `socketLB.hostNamespaceOnly=true`, so pod traffic uses per-packet load balancing.
@@ -426,18 +488,17 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
   participant G as gateway / Hubble
-  participant D as detector
+  participant D as sentinel
   participant CP as control plane
   participant K as Cilium
   G->>D: evidence event / DROPPED flow
   D->>D: rules D1 / D2 / D3
-  D->>CP: POST /internal/alerts {contain: true} (detector key)
-  CP->>CP: record alert (user, session, spec digest, observed action)
-  CP->>CP: CAS → contained (token dead immediately)
-  CP->>K: create quarantine-<sid> deny policy (≤ 1 s)
-  CP->>CP: snapshot evidence, probe from inside the pod
-  D->>D: wait, then check Hubble drops after quarantine + no gateway allows after revoke
-  D->>CP: verification record
+  D->>K: create sentinel-q-<sid> deny policy with its OWN identity (≤ 1 s, no control plane needed)
+  D->>D: record alert + action in its own hash chain
+  D->>CP: best effort: POST /internal/alerts {contain: true} (sentinel key)
+  CP->>CP: CAS → contained (token dead), own quarantine, snapshot (evidence + transcript), probe
+  D->>D: poll Hubble: drops after quarantine, nothing forwarded after grace → verified
+  D->>CP: verification record (also in the sentinel's chain)
 ```
 
 ### 9.5 Follow-up messages
@@ -482,11 +543,11 @@ Harness rules:
 
 | Area | Built | Designed (production path) |
 |---|---|---|
-| Isolation | gVisor, restricted PSS, admission policy | Kata/Firecracker microVMs; pod creation restricted to the controller identity |
+| Isolation | gVisor on a dedicated tainted node; restricted PSS; admission policy | Kata/Firecracker microVMs on separate machines; pod creation restricted to the controller identity |
 | Identity | Per-component keys; `X-User` | SPIFFE/mTLS; OIDC |
 | Workspace delivery | exec (tarball chunks) | Prepared volumes, no `pods/exec` |
 | Egress | Explicit proxy, allowlist, plain-HTTP canary scan | TLS inspection + DLP for write-capable destinations; package mirror |
-| Evidence | Hash chain, read-only detector, snapshots | WORM storage + SIEM, external anchor |
+| Evidence | Hash chain; verified copy in the sentinel's own zone; snapshots, transcripts, prompt/response bodies | WORM storage + SIEM, external anchor |
 | GitHub | App tokens, draft PRs, protected paths | Branch rulesets, CODEOWNERS, SAST/secret scanning on agent PRs |
 | Supply chain | Pinned versions, checksums | Digest-pinned and signed images, SBOM, verified at admission |
 | Resume | Follow-ups resume the conversation in the same pod | Resume after `stop` (snapshot workspace + transcript) |
@@ -499,7 +560,7 @@ src/sbx/
   control_plane/             app, sessions, specs, baseline, k8s, store
   gateway/                   ai (AI gateway), egress (forward proxy), common, main
   credproxy/                 app (inference/egress/tunnel/GitHub routes), github (App tokens, clone, publish)
-  detector/                  rules (D1-D3, EV), main (evidence tail, Hubble, verification)
+  sentinel/                  rules (D1-D3, EV, S2, S6), main (ingest, Hubble, respond, verify), actions, shipper, ctl
   common/                    canary, evidence (hash chain), internal (component keys), policy
   lab/                       sink (paste-mock / attacker-sink), git_lab
 images/                      sandbox, sandbox-pyweb, services

@@ -84,6 +84,8 @@ def approval_reasons(spec: dict, prev: dict | None) -> list[str]:
     tools = spec["spec"].get("agentTools", {}).get("allow", [])
     if any(t in baseline.BASELINE["broad_tools"] for t in tools):
         reasons.append("unrestricted Bash")
+    if spec["spec"].get("egress", {}).get("writeAllowed"):
+        reasons.append("write access to write-capable destinations")
     return reasons
 
 
@@ -91,14 +93,14 @@ def widening(old: dict, new: dict) -> list[str]:
     """Everything the new version can do that the old one could not, over the whole compiled policy."""
     o, n = compile_policy(old), compile_policy(new)
     out = []
-    for k in ("egress_allow", "model_allow", "grants", "agent_tools"):
+    for k in ("egress_allow", "egress_write", "model_allow", "grants", "agent_tools"):
         added = sorted(set(n[k]) - set(o[k]))
         if added:
             out.append(f"new {k} {added}")
     for k in ("image", "runtime_class"):
         if n["runtime"][k] != o["runtime"][k]:
             out.append(f"runtime.{k} changed")
-    for k, conv in (("ttl_s", float), ("cpu", float), ("memory", baseline._mem_gi)):
+    for k, conv in (("ttl_s", float), ("idle_s", float), ("cpu", float), ("memory", baseline._mem_gi)):
         if (conv(n["runtime"][k]) or 0) > (conv(o["runtime"][k]) or 0):
             out.append(f"larger runtime.{k}")
     if n["max_tokens"] > o["max_tokens"]:
@@ -175,6 +177,11 @@ def compile_policy(spec: dict) -> dict:
     burst = s.get("detection", {}).get("denyBurst", {"count": 5, "window": "60s"})
     return {
         "egress_allow": list(s.get("egress", {}).get("allow", [])),
+        # Hosts that may receive writes and CONNECT: explicitly write-allowed ones, plus allowed hosts the
+        # catalogue says don't store what they receive. Everything else in egress_allow is GET/HEAD only.
+        "egress_write": sorted(set(s.get("egress", {}).get("writeAllowed", [])) | {
+            h for h in s.get("egress", {}).get("allow", [])
+            if not baseline.BASELINE["approved_destinations"].get(h, {}).get("accepts_writes", True)}),
         "model_allow": list(s["model"]["allow"]),
         "model_default": s["model"].get("default", s["model"]["allow"][0]),
         "model_small": s["model"].get("small", s["model"]["allow"][0]),
@@ -193,5 +200,6 @@ def compile_policy(spec: dict) -> dict:
             "cpu": str(s["runtime"]["resources"]["cpu"]),
             "memory": str(s["runtime"]["resources"]["memory"]),
             "ttl_s": _seconds(s["runtime"]["ttl"]),
+            "idle_s": _seconds(s["runtime"].get("idleTimeout", "10m")),
         },
     }

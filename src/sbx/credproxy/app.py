@@ -84,6 +84,8 @@ async def egress(request: web.Request) -> web.StreamResponse:
     parts = urlsplit(target)
     if parts.scheme != "http" or not parts.hostname or not host_allowed(parts.hostname, ctx["policy"].get("egress_allow", [])):
         raise web.HTTPForbidden(text="destination not allowed by spec")
+    if request.method not in ("GET", "HEAD") and not host_allowed(parts.hostname, ctx["policy"].get("egress_write", [])):
+        raise web.HTTPForbidden(text="destination is read-only for this spec")
     async with request.app["http"].request(request.method, target, headers=clean_headers(request.headers),
                                            data=await request.read(), allow_redirects=False) as up:
         return await relay(request, up)
@@ -147,8 +149,8 @@ async def tunnel(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
         if status != 200 or ctx.get("state") != "running":
             raise PermissionError("session not running")
         host, port = hello["host"], int(hello["port"])
-        if not host_allowed(host, ctx["policy"].get("egress_allow", [])):
-            raise PermissionError("destination not allowed by spec")
+        if not host_allowed(host, ctx["policy"].get("egress_write", [])):
+            raise PermissionError("destination not write-allowed by spec (CONNECT counts as a write)")
         up_r, up_w = await asyncio.wait_for(asyncio.open_connection(host, port), 5)
     except Exception as e:  # noqa: BLE001 - any failure closes the tunnel
         writer.write(f"ERR {type(e).__name__}: {e}\n".encode())

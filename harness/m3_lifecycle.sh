@@ -42,6 +42,20 @@ for _ in $(seq 1 20); do [ "$(state "$SID2")" = ended ] && break; sleep 1; done
 check "reconciler ends session when pod disappears" ended "$(state "$SID2")"
 $CTL destroy "$SID2" >/dev/null
 
+echo "--- idle sessions are reaped (resources freed, work kept)"
+IDN="idle-demo-$(openssl rand -hex 3)"; IDF=$(mktemp)
+sed -e "s/^  name: bugfix-agent$/  name: $IDN/" -e "s/^    ttl: 30m$/    ttl: 30m\n    idleTimeout: 30s/" specs/bugfix-agent.yaml > "$IDF"
+curl -s -o /dev/null -X POST http://127.0.0.1:8443/specs/approvals -H "X-User: secops" -H 'content-type: application/yaml' --data-binary @"$IDF"
+check "short-idle spec registered (approved)" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8443/specs -H "X-User: $(whoami)" -H 'content-type: application/yaml' --data-binary @"$IDF")"
+rm -f "$IDF"
+SID3=$($CTL run "$IDN" -p repo=demo/app -p task="Reply with the word ok. Do not use any tools." | sid_of)
+for _ in $(seq 1 90); do [ "$(state "$SID3")" = stopped ] && break; sleep 2; done
+check "idle session stopped automatically" stopped "$(state "$SID3")"
+check "reason recorded" idle "$($CTL status "$SID3" | python3 -c 'import json,sys; print(json.load(sys.stdin)["detail"].split()[0])')"
+check "pod deleted" gone "$(kubectl -n sbx-sessions get pod "sandbox-$SID3" >/dev/null 2>&1 && echo present || echo gone)"
+check "diff kept" 0 "$($CTL diff "$SID3" >/dev/null; echo $?)"
+$CTL destroy "$SID3" >/dev/null
+
 echo "--- evidence (control plane, outside the sandbox)"
 EV=$(kubectl -n sbx-system exec deploy/control-plane -- cat /evidence/control-plane.jsonl)
 cnt() { echo "$EV" | python3 -c "import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print(sum(1 for e in ev if $1))"; }

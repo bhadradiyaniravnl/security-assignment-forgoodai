@@ -3,10 +3,12 @@
 Public (sbxctl, via NodePort bound to 127.0.0.1): runs, sessions, logs, stop, destroy, diff.
   Prototype identity is the X-User header; production replaces it with OIDC.
 Internal (X-Sbx-Internal, per-component keys): token validation (gateway), compiled policy
-(gateway, credproxy, detector), alerts (detector). There is deliberately no internal way to create
+(gateway, credproxy, sentinel), alerts (sentinel). There is deliberately no internal way to create
 a session: every session goes through /runs, i.e. the spec registry and its baseline.
 """
 from __future__ import annotations
+
+import time
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
@@ -152,6 +154,20 @@ def contain_session(sid: str, user: str = Depends(require_user)) -> dict:
     return _call(sessions.contain, sid, f"user:{user}", None, "manual")
 
 
+class FreezeIn(BaseModel):
+    reason: str = "manual"
+
+
+@app.post("/admin/freeze")
+def freeze(f: FreezeIn, user: str = Depends(require_user)) -> dict:
+    return _call(sessions.freeze, user, f.reason)
+
+
+@app.post("/admin/unfreeze")
+def unfreeze(user: str = Depends(require_user)) -> dict:
+    return _call(sessions.unfreeze, user)
+
+
 @app.get("/alerts")
 def list_alerts(user: str = Depends(require_user)) -> list:
     """Alerts on the caller's sessions, with containment verifications attached."""
@@ -176,9 +192,9 @@ class AlertIn(BaseModel):
     contain: bool = False
 
 
-@app.post("/internal/alerts", dependencies=[Depends(scope("detector"))])
+@app.post("/internal/alerts", dependencies=[Depends(scope("sentinel"))])
 def raise_alert(a: AlertIn) -> dict:
-    """Alert sink for the detector. Joins user/spec from the registry so every alert links
+    """Alert sink for the sentinel. Joins user/spec from the registry so every alert links
     initiating user -> session -> observed action. The alert is recorded at detection time,
     then (if requested) the session is contained and a linked containment record is written."""
     s = store.get(a.session_id) if a.session_id else None
@@ -188,7 +204,7 @@ def raise_alert(a: AlertIn) -> dict:
     containment = None
     if a.contain and s and s["state"] in ("running", "creating", "stopping"):
         try:
-            containment = sessions.contain(store, a.session_id, "detector", a.alert_id, f"{a.rule}: {a.summary}")
+            containment = sessions.contain(store, a.session_id, "sentinel", a.alert_id, f"{a.rule}: {a.summary}")
         except sessions.SessionError as e:
             containment = {"error": str(e)}
         sessions.alerts.write_sync("containment", alert_id=a.alert_id, session_id=a.session_id, result=containment)
@@ -202,12 +218,12 @@ class VerificationIn(BaseModel):
     sources: dict
 
 
-@app.post("/internal/alerts/verification", dependencies=[Depends(scope("detector"))])
+@app.post("/internal/alerts/verification", dependencies=[Depends(scope("sentinel"))])
 def verify_alert(v: VerificationIn) -> dict:
     return sessions.alerts.write_sync("containment_verification", **v.model_dump())
 
 
-@app.get("/internal/alerts", dependencies=[Depends(scope("detector"))])
+@app.get("/internal/alerts", dependencies=[Depends(scope("sentinel"))])
 def internal_alerts() -> list:
     return _read_alerts()
 
@@ -229,7 +245,7 @@ def session_diff(sid: str, user: str = Depends(require_user)) -> str:
 
 def _public(s: dict) -> dict:
     return {k: s.get(k) for k in ("session_id", "user", "spec_name", "spec_digest", "params", "pod_name",
-                                  "pod_ip", "state", "detail", "turns", "created_at", "ended_at")}
+                                  "pod_ip", "state", "detail", "turns", "scan", "created_at", "last_activity", "state_changed_at", "ended_at")}
 
 
 class ValidateIn(BaseModel):
@@ -251,10 +267,13 @@ def validate(v: ValidateIn) -> dict:
         raise HTTPException(403, "token not bound to this source ip")
     if s["state"] != "running":
         raise HTTPException(403, f"session {s['state']}")
+    now = time.time()
+    if now - (s.get("last_activity") or 0) > 10:      # every model/egress call is activity (idle reaper)
+        store.update(s["session_id"], last_activity=now)
     return _context(s)
 
 
-@app.get("/internal/policy/{session_id}", dependencies=[Depends(scope("gateway", "credproxy", "detector"))])
+@app.get("/internal/policy/{session_id}", dependencies=[Depends(scope("gateway", "credproxy", "sentinel"))])
 def policy(session_id: str) -> dict:
     s = store.get(session_id)
     if s is None:

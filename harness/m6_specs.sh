@@ -24,6 +24,7 @@ want() { case "$1" in   # bash 3.2 (macOS) has no associative arrays
   bad-long-ttl) echo "<= 2h" ;;                     bad-policy-param) echo "policy keys" ;;
   bad-unbounded-param) echo "bounded" ;;            bad-repo-write) echo "read-only" ;;
   bad-broad-bash) echo "riskAcceptance" ;;          bad-unknown-field) echo "schema" ;;
+  bad-write-no-risk) echo "riskAcceptance" ;;
   *) echo "<no expectation>" ;; esac; }
 for f in specs/bad/*.yaml; do
   n=$(basename "$f" .yaml); code=$(reg "$f"); r=$(reason)
@@ -85,7 +86,7 @@ check "compliant pod admitted" admitted          "$(r=$(weak ok 'sbx/session: x'
 
 echo "--- evidence"
 EV=$(kubectl -n sbx-system exec deploy/control-plane -- cat /evidence/control-plane.jsonl)
-check "rejections recorded with reasons" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_rejected" and e.get("reasons"))>=14 else "no")')"
+check "rejections recorded with reasons" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_rejected" and e.get("reasons"))>=15 else "no")')"
 check "approvals recorded" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_approved" and e.get("approved_by")=="secops")>=2 else "no")')"
 check "registrations recorded" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if any(e["action"]=="spec_registered" and e.get("name","").startswith("widen-demo") and e.get("version")==2 for e in ev) else "no")')"
 rm -rf /tmp/claude-501-m6.json "$TMP"

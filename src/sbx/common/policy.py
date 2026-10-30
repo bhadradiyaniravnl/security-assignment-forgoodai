@@ -42,8 +42,11 @@ class ControlPlane:
         if hit and not fresh and time.monotonic() - hit[0] < self.ttl:
             return hit[1], hit[2]
         http = await self._get_http()
-        async with http.request(method, internal.CONTROL_PLANE_URL + path, json=json_body) as r:
-            status, body = r.status, await r.json()
+        try:
+            async with http.request(method, internal.CONTROL_PLANE_URL + path, json=json_body) as r:
+                status, body = r.status, await r.json()
+        except (aiohttp.ClientError, TimeoutError, ValueError):
+            return 503, {"detail": "control plane unavailable"}       # fail closed, never cached
         self._cache[key] = (time.monotonic(), status, body)
         return status, body
 

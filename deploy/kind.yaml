@@ -10,3 +10,18 @@ nodes:
   - containerPort: 30443       # control-plane NodePort -> localhost:8443
     hostPort: 8443
     listenAddress: 127.0.0.1
+# Platform node: control plane, gateway, credproxy (all secrets), evidence, lab.
+# (The kind control-plane node is labelled sbx/pool=security by up.sh and hosts only the sentinel.)
+- role: worker
+  labels: { sbx/pool: platform }
+# Sandbox node: the only node with gVisor; tainted so nothing else lands there, and untrusted
+# workloads never share a node with credproxy. (In kind both nodes still share the Colima VM's
+# kernel; on real infrastructure these are separate node pools / machines.)
+- role: worker
+  labels: { sbx/pool: sandbox }
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      taints:
+      - { key: sbx/sandbox, value: "true", effect: NoSchedule }

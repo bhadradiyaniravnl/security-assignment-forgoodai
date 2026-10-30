@@ -1,8 +1,19 @@
-# Evidence store: mounted rw by gateway/control-plane, ro by detector, never by sandboxes.
+# Evidence store: mounted rw by gateway/control-plane, ro by the evidence shipper, never by sandboxes.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: evidence
+  namespace: sbx-system
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 1Gi }
+---
+# Control-plane state (sessions, spec registry, approvals, freeze flag) survives restarts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cp-data
   namespace: sbx-system
 spec:
   accessModes: [ReadWriteOnce]

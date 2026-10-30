@@ -48,6 +48,8 @@ def sandbox_pod(sid: str, token: str, policy: dict) -> dict:
                      "labels": {"sbx/session": sid, "sbx/state": "running"}},
         "spec": {
             "runtimeClassName": rt["runtime_class"],
+            "nodeSelector": {"sbx/pool": "sandbox"},        # never on the node that holds credproxy
+            "tolerations": [{"key": "sbx/sandbox", "operator": "Equal", "value": "true", "effect": "NoSchedule"}],
             "automountServiceAccountToken": False,
             "enableServiceLinks": False,
             "restartPolicy": "Never",
@@ -146,6 +148,32 @@ def quarantine(sid: str) -> None:
             raise
 
 
+FREEZE = "freeze-all-sessions"
+
+
+def freeze_all() -> None:
+    """Fleet kill switch: one deny policy selecting every endpoint in sbx-sessions."""
+    core()
+    body = {"apiVersion": "cilium.io/v2", "kind": "CiliumNetworkPolicy",
+            "metadata": {"name": FREEZE, "namespace": NS},
+            "spec": {"endpointSelector": {}, "egressDeny": [{"toEntities": ["all"]}],
+                     "ingressDeny": [{"fromEntities": ["all"]}]}}
+    try:
+        client.CustomObjectsApi().create_namespaced_custom_object("cilium.io", "v2", NS, "ciliumnetworkpolicies", body)
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+
+def unfreeze_all() -> None:
+    core()
+    try:
+        client.CustomObjectsApi().delete_namespaced_custom_object("cilium.io", "v2", NS, "ciliumnetworkpolicies", FREEZE)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+
+
 def unquarantine(sid: str) -> None:
     core()
     try:
@@ -154,6 +182,12 @@ def unquarantine(sid: str) -> None:
     except ApiException as e:
         if e.status != 404:
             raise
+
+
+def session_pods() -> list[tuple[str, str]]:
+    """(session id, pod name) for every pod in sbx-sessions carrying a session label."""
+    pods = core().list_namespaced_pod(NS, label_selector="sbx/session").items
+    return [(p.metadata.labels["sbx/session"], p.metadata.name) for p in pods]
 
 
 def pod_snapshot(sid: str) -> dict:

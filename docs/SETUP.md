@@ -1,7 +1,8 @@
 # Setup
 
 Tested on macOS 26 / Apple M2 Pro (arm64), 16 GB RAM. Everything runs in a dedicated Colima VM
-(`sbx` profile: 6 CPU, 8 GB), so your other Docker contexts are left alone.
+(`sbx` profile: 6 CPU, 8 GB), so your other Docker contexts are left alone. The kind cluster has three
+nodes: control plane, a `platform` worker, and a tainted `sandbox` worker, which is the only one with gVisor.
 
 ## 1. Prerequisites
 
@@ -81,6 +82,9 @@ bin/sbxctl diff <sid>
 bin/sbxctl send <sid> "follow-up" -f   # resumes the same conversation; streams that turn
 bin/sbxctl attach <sid>    # history + live stream; typed lines become follow-ups; Ctrl-D detaches
 bin/sbxctl contain <sid>   # manual containment
+SBX_USER=secops bin/sbxctl freeze "reason"   # fleet kill switch: contain all, deny all, block new runs
+SBX_USER=secops bin/sbxctl unfreeze          # lift the network deny (frozen sessions stay contained)
+kubectl -n sbx-security exec deploy/sentinel -- python -m sbx.sentinel.ctl status   # sentinel: also alerts | freeze R | unfreeze | release SID
 bin/sbxctl alerts          # detections + containment verification
 bin/sbxctl destroy <sid>
 SBX_USER=secops bin/sbxctl spec approve specs/examples/widen-demo-v1.yaml   # a security approver approves the digest
@@ -92,10 +96,11 @@ bin/sbxctl spec register specs/examples/widen-demo-v1.yaml                  # th
 | Command | What it proves | Model calls / cost |
 |---|---|---|
 | `make smoke` | L3/L4 boundary, gVisor, lab ingress, quarantine (12 checks) | none |
-| `make e2e` | Gateways + credproxy + evidence, real `claude -p` (19) | ~$0.01 |
-| `make lifecycle` | `sbxctl` lifecycle, trigger rejections, reconciler (21) | ~$0.01 |
-| `make containment` | D1/D2 → auto-containment → two-source verification (16) | ~$0.01 |
-| `make specs` | Baseline, authors, immutability, widening approval, admission (28) | ~$0.01 |
+| `make e2e` | Gateways + credproxy + evidence, prompt/response retention, real `claude -p` (22) | ~$0.01 |
+| `make lifecycle` | `sbxctl` lifecycle, trigger rejections, reconciler, **idle reaping** (26) | ~$0.01 |
+| `make containment` | D1/D2 → auto-containment → verification, fleet freeze (25) | ~$0.01 |
+| `make specs` | Baseline, authors, two-person approval, immutability, admission (36) | ~$0.01 |
+| `make sentinel` | Sentinel: placement and least privilege, verified shipping, containment **with the control plane down**, self-protection, S2, S6, own freeze (24) | ~$0.01 |
 | `make github` | Scoped App tokens, clone via credproxy, workflow/canary PR refusals (10); `AGENT=1` opens a real PR | ~$0.01 / ~$0.40 |
 | **`make security-test`** | **Phase B (18 deterministic cases), Phase A (agent under injection), Phase C (utility); writes `out/report.{md,json}`** | **~$1, ~10 min** |
 

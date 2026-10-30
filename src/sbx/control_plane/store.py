@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS specs (
   registered_at REAL NOT NULL,
   PRIMARY KEY (name, version)
 );
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS approvals (
   digest      TEXT NOT NULL,
   name        TEXT NOT NULL,
@@ -59,10 +63,14 @@ class Store:
         self.lock = threading.RLock()          # FastAPI threadpool + reconciler share one connection
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        try:   # lightweight migration for registries created before follow-up messages existed
-            self.db.execute("ALTER TABLE sessions ADD COLUMN turns INTEGER NOT NULL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
+        for ddl in ("ALTER TABLE sessions ADD COLUMN turns INTEGER NOT NULL DEFAULT 0",   # lightweight migrations
+                    "ALTER TABLE sessions ADD COLUMN scan TEXT NOT NULL DEFAULT '[]'",
+                    "ALTER TABLE sessions ADD COLUMN last_activity REAL",
+                    "ALTER TABLE sessions ADD COLUMN state_changed_at REAL"):
+            try:
+                self.db.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
     def create(self, *, session_id: str, user: str, spec_name: str, spec_digest: str, token: str,
                policy: dict, canaries: list, params: dict | None = None, pod_name: str | None = None,
@@ -89,6 +97,7 @@ class Store:
             fields.pop("ended")
             fields["ended_at"] = time.time()
         fields["state"] = to_state
+        fields["state_changed_at"] = time.time()
         cols = ", ".join(f"{k}=?" for k in fields)
         marks = ",".join("?" * len(from_states))
         with self.lock:
@@ -109,6 +118,18 @@ class Store:
     def add_spec(self, name: str, version: int, digest: str, body: bytes, by: str, warnings: list) -> None:
         self.db.execute("INSERT INTO specs VALUES (?,?,?,?,?,?,?)",
                         (name, version, digest, body, by, json.dumps(warnings), time.time()))
+
+    def get_meta(self, key: str) -> str | None:
+        with self.lock:
+            row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str | None) -> None:
+        with self.lock:
+            if value is None:
+                self.db.execute("DELETE FROM meta WHERE key=?", (key,))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
 
     def add_approval(self, digest: str, name: str, version: int, approver: str) -> None:
         with self.lock:
@@ -137,7 +158,7 @@ def _row(row) -> dict | None:
     if row is None:
         return None
     d = dict(row)
-    for k in ("params", "policy", "canaries"):
+    for k in ("params", "policy", "canaries", "scan"):
         d[k] = json.loads(d[k])
     d.pop("token_hash", None)
     return d

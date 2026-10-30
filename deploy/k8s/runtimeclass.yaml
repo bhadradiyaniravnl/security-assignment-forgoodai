@@ -3,3 +3,7 @@ kind: RuntimeClass
 metadata:
   name: gvisor
 handler: runsc
+scheduling:                       # gVisor exists only on the sandbox pool
+  nodeSelector: { sbx/pool: sandbox }
+  tolerations:
+    - { key: sbx/sandbox, operator: Equal, value: "true", effect: NoSchedule }

@@ -8,11 +8,11 @@ COLIMA_PROFILE="${COLIMA_PROFILE:-sbx}"
 
 if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
   mkdir -p out/evidence
-  pod="$(kubectl -n sbx-system get pod -l app=detector -o name 2>/dev/null | head -1 || true)"
-  if [ -n "$pod" ]; then
-    kubectl -n sbx-system exec "$pod" -- tar -C /evidence -cf - . | tar -C out/evidence -xf - || true
-    echo "evidence exported to out/evidence"
-  fi
+  kubectl -n sbx-system exec deploy/gateway -c gateway -- tar -C /evidence -cf - . 2>/dev/null \
+    | tar -C out/evidence -xf - && echo "platform evidence exported to out/evidence"
+  mkdir -p out/sentinel
+  kubectl -n sbx-security exec deploy/sentinel -- tar -C /data -cf - . 2>/dev/null \
+    | tar -C out/sentinel -xf - && echo "sentinel store exported to out/sentinel"
   kind delete cluster --name "$CLUSTER"
 fi
 if [ "${STOP_VM:-0}" = 1 ]; then colima stop "$COLIMA_PROFILE"; fi

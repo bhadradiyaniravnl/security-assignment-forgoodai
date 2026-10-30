@@ -2,7 +2,7 @@
 
 Each component sends its OWN key (SBX_INTERNAL_KEY). Receivers know the keys of the callers they
 accept (SBX_KEY_<COMPONENT>) and authorise per endpoint, so a compromised gateway cannot use
-detector-only endpoints, and the detector cannot validate tokens or reach credproxy."""
+sentinel-only endpoints, and the sentinel cannot validate tokens or reach credproxy."""
 from __future__ import annotations
 
 import hmac
@@ -26,7 +26,7 @@ def headers() -> dict:
     return {HEADER: key()}
 
 
-COMPONENTS = ("gateway", "credproxy", "detector")
+COMPONENTS = ("gateway", "credproxy", "sentinel")
 
 
 def caller(value: str | None) -> str | None:

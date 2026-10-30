@@ -3,7 +3,7 @@
 A small internal platform that runs Claude Code in disposable, gVisor-isolated Kubernetes pods. The
 sandbox holds **no real credentials**: model calls, egress and credential use go through gateways
 and a credentials proxy outside it. Every capability comes from a reviewed, versioned **agent
-spec**. A detector watches gateway evidence and Cilium/Hubble flows, and it **automatically contains**
+spec**. A separate **sentinel** (own namespace and node) watches shipped evidence and Cilium/Hubble flows, and it **automatically contains**
 canary exfiltration and bypass attempts. A one-command harness then tries to break all of this.
 
 - **Architecture (how the whole system is built):** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
@@ -25,7 +25,7 @@ flowchart LR
   gw --> cred[credproxy<br/>real secrets · grant re-check]
   cred --> anth[(api.anthropic.com)]
   cred --> lab[(lab: paste-mock allowed<br/>attacker-sink not allowed)]
-  gw -->|hash-chained evidence| det[detector]
+  gw -->|hash-chained evidence| det[sentinel<br/>own ns + node]
   drop --> det
   det -->|alert + contain| cp
 ```
@@ -89,7 +89,7 @@ with no tests.
 | Egress forward proxy | Allowlist, canary scanning, CONNECT tunnelling via credproxy |
 | Credentials proxy | Per-session grant re-checks |
 | Control plane | Spec registry with org baseline, immutability and widening approval; session lifecycle; workspace delivery; reconciler; containment and evidence snapshots; alert sink |
-| Detector | D1/D2/D3 rules over gateway evidence + Hubble; two-source containment verification |
+| Sentinel | Continuous detection (D1–D3, EV, S2 platform egress, S6 leak after containment) and **independent response** (own protected deny policies, works with the control plane down); evidence shipper |
 | Supporting pieces | Hash-chained evidence log, multi-encoding canary matcher, `sbxctl` CLI |
 | Deployment | Kubernetes manifests (network policies, RBAC, admission) and bring-up/teardown scripts |
 | Test harness | Phases A/B/C, plus the injection fixtures and bad-spec fixtures |
@@ -103,7 +103,7 @@ incident).
 ## Repo map
 
 ```
-src/sbx/            gateway/  credproxy/  control_plane/  detector/  cli/  lab/  common/
+src/sbx/            gateway/  credproxy/  control_plane/  sentinel/  cli/  lab/  common/
 deploy/             up.sh  down.sh  images.sh  runsc-install.sh  secrets.sh  kind.yaml  k8s/
 images/             sandbox/ (Claude Code + toolchain)  services/ (all platform services)
 specs/              bugfix-agent(.yaml|-open.yaml)  bad/ (12 rejected fixtures)  examples/

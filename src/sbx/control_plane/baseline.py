@@ -17,6 +17,7 @@ BASELINE = {
     "dev_image_tags": ["dev"],
     "runtime_classes": ["gvisor"],
     "max_ttl_s": 2 * 3600,
+    "max_idle_s": 3600,
     "max_cpu": 4,
     "max_memory_gi": 8,
     "models": ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"],
@@ -27,7 +28,11 @@ BASELINE = {
     "github_repos": ["bhadradiyaniravnl/items-api-sample"],
     "output_types": ["branch", "pull_request"],
     "required_protected_paths": [".github/", ".git/"],
-    "approved_destinations": ["paste-mock.lab-ext"],    # destinations a spec may allowlist at all
+    # Destinations a spec may allowlist at all. `accepts_writes` marks hosts that store what they are
+    # sent (paste sites, artifact/upload services): those are read-only (GET/HEAD) unless a spec lists
+    # them in egress.writeAllowed, which needs a risk acceptance and a security approval. CONNECT
+    # (TLS) counts as a write, because the gateway cannot see the payload.
+    "approved_destinations": {"paste-mock.lab-ext": {"accepts_writes": True}},
     "repo_access": ["read"],
     "broad_tools": ["Bash", "Bash(*)", "Bash(*:*)"],     # need an explicit risk acceptance
     "policy_keys": ["egress", "secrets", "model", "runtime", "agentTools", "mcp", "detection"],   # repo is a parameter, bounded by spec.repo.allow
@@ -111,6 +116,10 @@ def check(spec: dict, previous: dict | None = None) -> tuple[list[str], list[str
     ttl = _ttl_s(s["runtime"]["ttl"])
     if ttl is None or ttl > B["max_ttl_s"]:
         errors.append(f"runtime.ttl {s['runtime']['ttl']}: must be <= {B['max_ttl_s'] // 3600}h")
+    idle = _ttl_s(s["runtime"].get("idleTimeout", "10m"))
+    if idle is None or not 30 <= idle <= min(B["max_idle_s"], ttl or B["max_idle_s"]):
+        errors.append(f"runtime.idleTimeout {s['runtime'].get('idleTimeout')}: must be 30s..{B['max_idle_s'] // 60}m "
+                      "and not longer than the ttl (idle sandboxes are stopped and their resources freed)")
     res = s["runtime"].get("resources", {})
     try:
         if float(res.get("cpu", 0)) > B["max_cpu"]:
@@ -145,6 +154,13 @@ def check(spec: dict, previous: dict | None = None) -> tuple[list[str], list[str
             pass
         if h not in B["approved_destinations"]:
             errors.append(f"egress.allow {h}: not in the approved destination catalogue")
+    write_allowed = s["egress"].get("writeAllowed", [])
+    for h in write_allowed:
+        if h not in s["egress"]["allow"]:
+            errors.append(f"egress.writeAllowed {h}: must also be in egress.allow")
+        elif B["approved_destinations"].get(h, {}).get("accepts_writes") and not ann.get("riskAcceptance"):
+            errors.append(f"egress.writeAllowed {h}: write access to a write-capable destination needs "
+                          "metadata.annotations.riskAcceptance (and a security approval)")
 
     # secrets and repo
     gh_allowed = {p[len("github:"):] for p in s["repo"]["allow"] if p.startswith("github:")}

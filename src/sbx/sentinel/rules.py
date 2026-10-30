@@ -1,13 +1,16 @@
-"""Detection rules over two independent telemetry sources.
+"""Sentinel detection rules (pure functions + small state; I/O lives in main.py).
 
-  gateway evidence (L7, written by the gateway, never by the sandbox)
-  Hubble flows     (L3/L4, produced by Cilium's eBPF datapath on the node)
+Sources: platform evidence shipped to the sentinel (claims, chain-verified on arrival) and Hubble
+flows (L3/L4, produced by Cilium's eBPF datapath, independent of every platform pod).
 
-  D1  canary (any supported encoding) in an outbound egress request    high    contain
-  D2  spec denial (gateway) or dropped flow (Hubble) from a session     medium  first per session
-      ... reaching the spec's denyBurst threshold within its window     high    contain
-  D3  model tool_use referencing the canary, .env, or a non-allowed host medium  alert only
-  EV  gateway evidence hash chain broken                                high    alert only
+  D1  canary (any supported encoding) in an outbound egress request        high    contain
+  D2  spec denial (gateway) or dropped flow (Hubble) from a session         medium  first per session
+      ... reaching the spec's denyBurst threshold within its window         high    contain
+  D3  model tool_use referencing the canary, or an acting tool referencing .env / a non-allowed host
+  EV  shipped evidence chain broken or a sequence gap                       high    alert only
+  S2  platform pod: policy-dropped connection, or world egress by anything other than credproxy, or
+      credproxy reaching a name outside its allowlist                       high    alert (isolation needs approval)
+  S6  traffic forwarded from a session after its quarantine took effect     high    re-quarantine
 """
 from __future__ import annotations
 
@@ -17,7 +20,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 DENY_REASONS = {"default_deny", "model_not_allowed", "budget", "credproxy_refused", "path_not_allowed",
-                "provider_side_capability", "provider_side_tool", "remote_content_source", "malformed_request"}
+                "provider_side_capability", "provider_side_tool", "remote_content_source", "malformed_request", "write_not_allowed"}
 ACTING_TOOLS = {"Bash", "WebFetch", "WebSearch", "BashOutput", "Task"}
 
 
@@ -118,3 +121,52 @@ def _ts(value) -> float:
         return 0.0
     v = re.sub(r"(\.\d{6})\d+", r"\1", str(value)).replace("Z", "+00:00")   # Hubble uses nanoseconds
     return datetime.fromisoformat(v).timestamp()
+
+
+# ---------------------------------------------------------------------------------------------- S2
+PLATFORM_WORLD_NAMES = {"credproxy": {"api.anthropic.com", "github.com", "api.github.com"}}
+
+
+def platform_flow_alert(f: dict) -> dict | None:
+    """S2: platform pods run trusted code, so a policy drop or unexpected world egress from one is a
+    strong compromise (or misconfiguration) signal. The platform can't hide it: Hubble is the kernel."""
+    src = f.get("source", {})
+    if src.get("namespace") != "sbx-system":
+        return None
+    app = next((l.split("=", 1)[1] for l in src.get("labels", []) if l.startswith("k8s:app=")), "?")
+    dst = f.get("destination", {})
+    l4 = f.get("l4", {})
+    proto = next(iter(l4), "?")
+    port = (l4.get(proto) or {}).get("destination_port")
+    names = f.get("destination_names") or []
+    world = "reserved:world" in dst.get("labels", [])
+    observed = {"action": "platform_flow", "app": app, "pod": src.get("pod_name"), "dest_ip": f.get("IP", {}).get("destination"),
+                "dest_port": port, "dest_names": names, "verdict": f.get("verdict"), "drop_reason": f.get("drop_reason_desc")}
+    if f.get("verdict") == "DROPPED" and f.get("drop_reason_desc") == "POLICY_DENIED" and f.get("traffic_direction") == "EGRESS":
+        return alert("S2", "high", None, f"platform pod {app} attempted a policy-denied connection to "
+                     f"{names[0] if names else observed['dest_ip']}:{port}", observed,
+                     [{"source": "hubble", "time": f.get("time")}], key=f"{app}|{observed['dest_ip']}|{port}")
+    if f.get("verdict") == "FORWARDED" and world and f.get("traffic_direction") == "EGRESS":
+        allowed = PLATFORM_WORLD_NAMES.get(app)
+        if allowed is None or (names and not set(names) & allowed):
+            return alert("S2", "high", None, f"platform pod {app} reached the outside world "
+                         f"({', '.join(names) or observed['dest_ip']}:{port})", observed,
+                         [{"source": "hubble", "time": f.get("time")}], key=f"{app}|{observed['dest_ip']}|{port}")
+    return None
+
+
+# ---------------------------------------------------------------------------------------------- S6
+def leak_after_containment(f: dict, contained_at: float, grace_s: float = 3.0) -> dict | None:
+    """S6: a contained session must be silent. Anything Cilium still forwards from its pod after the
+    grace period means the quarantine didn't take (or was removed)."""
+    if f.get("verdict") != "FORWARDED" or f.get("traffic_direction") != "EGRESS":
+        return None
+    sid = next((l.split("=", 1)[1] for l in f.get("source", {}).get("labels", []) if l.startswith("k8s:sbx/session=")), None)
+    ts = _ts(f.get("time"))
+    if not sid or ts < contained_at + grace_s:
+        return None
+    dst = f.get("destination", {})
+    return alert("S6", "high", sid, f"traffic forwarded after containment to "
+                 f"{dst.get('namespace', '')}/{dst.get('pod_name', '') or f.get('IP', {}).get('destination')}",
+                 {"action": "flow_forwarded_after_containment", "dest_ip": f.get("IP", {}).get("destination")},
+                 [{"source": "hubble", "time": f.get("time")}], contain=True, key=f"{int(ts) // 30}")

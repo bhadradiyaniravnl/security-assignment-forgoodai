@@ -20,6 +20,8 @@ spec:
       message: "session pods must not mount a service account token"
     - expression: "has(object.metadata.labels) && 'sbx/session' in object.metadata.labels"
       message: "session pods must carry an sbx/session label (attribution and quarantine selector)"
+    - expression: "has(object.spec.nodeSelector) && object.spec.nodeSelector['sbx/pool'] == 'sandbox'"
+      message: "session pods must be scheduled on the sandbox node pool (never next to credproxy)"
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath) && !has(v.secret) && !has(v.projected))"
       message: "session pods may not mount hostPath, Secret or projected volumes"
 ---

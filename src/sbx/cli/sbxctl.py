@@ -3,7 +3,7 @@
   sbxctl run bugfix-agent -p repo=demo/app -p task="Make the tests pass" [-f]
   sbxctl ls | status SID | logs SID [-f] [--raw] | stop SID | diff SID | destroy SID
   sbxctl send SID "follow-up instruction" [-f] | attach SID
-  sbxctl contain SID | alerts
+  sbxctl contain SID | alerts | freeze "reason" | unfreeze   (freeze/unfreeze: security admins)
   sbxctl spec approve FILE (security approver) | spec register FILE | spec ls
 """
 from __future__ import annotations
@@ -144,6 +144,9 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("-f", "--follow", action="store_true", help="stream progress until the agent exits")
     sub.add_parser("ls", help="list your sessions")
     sub.add_parser("alerts", help="detections and containment verifications for your sessions")
+    fz = sub.add_parser("freeze", help="fleet kill switch: contain every live session, block new runs")
+    fz.add_argument("reason", nargs="?", default="manual")
+    sub.add_parser("unfreeze", help="lift the fleet freeze (frozen sessions stay contained)")
     sd = sub.add_parser("send", help="send a follow-up; the agent resumes the same conversation")
     sd.add_argument("sid")
     sd.add_argument("text")
@@ -182,6 +185,10 @@ def main(argv: list[str] | None = None) -> None:
         send(a.sid, a.text, a.follow)
     elif a.cmd == "attach":
         attach(a.sid)
+    elif a.cmd == "freeze":
+        print(json.dumps(call("POST", "/admin/freeze", {"reason": a.reason}), indent=2))
+    elif a.cmd == "unfreeze":
+        print(json.dumps(call("POST", "/admin/unfreeze", {})))
     elif a.cmd == "contain":
         r = call("POST", f"/sessions/{a.sid}/contain")
         print(json.dumps({k: r.get(k) for k in ("session_id", "state", "probe", "probe_blocked", "elapsed_s", "snapshot")},

@@ -2,7 +2,7 @@
 
 A full-codebase review run against the implemented platform:
 - **Gateway, credproxy and common code:** reviewed inline and verified against the live cluster.
-- **Control plane, CLI, detector, manifests and images:** reviewed by an independent reviewer.
+- **Control plane, CLI, detector (since replaced by the sentinel), manifests and images:** reviewed by an independent reviewer.
 
 **Attacker models:**
 1. the agent inside the sandbox (prompt-injected or fully compromised);

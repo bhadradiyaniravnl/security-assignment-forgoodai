@@ -12,7 +12,9 @@
 """
 from __future__ import annotations
 
+import gzip
 import json
+import os
 
 import aiohttp
 from aiohttp import web
@@ -100,7 +102,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
         await evidence.write("ai_request", **base, decision="deny", reason="budget")
         return web.json_response({"type": "error", "error": {"type": "rate_limit_error",
                                   "message": "sbx: session token budget exhausted"}}, status=429)
-    await evidence.write("ai_request", **base, decision="allow", reason="spec_policy")
+    req_event = await evidence.write("ai_request", **base, decision="allow", reason="spec_policy")
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
     headers.update(internal.headers())
@@ -114,8 +116,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
         parser = ResponseInspector(ctx, policy, canaries, who)
         streaming = "text/event-stream" in up.headers.get("content-type", "")
         buf = b""
+        kept = bytearray()
         async for chunk in up.content.iter_any():
             await resp.write(chunk)
+            if len(kept) < MAX_BODY_KEEP:
+                kept += chunk[:MAX_BODY_KEEP - len(kept)]
             if streaming:
                 await parser.feed_sse(chunk)
             else:
@@ -123,7 +128,28 @@ async def handle(request: web.Request) -> web.StreamResponse:
         if not streaming and up.status == 200:
             await parser.feed_json(buf)
         await resp.write_eof()
+        store_bodies(ctx["session_id"], req_event["seq"], body, bytes(kept), canaries, up.status)
         return resp
+
+
+MAX_BODY_KEEP = 4 * 1024 * 1024
+BODY_DIR = os.path.join(os.environ.get("EVIDENCE_DIR", "/evidence"), "bodies")
+
+
+def store_bodies(sid: str, seq: int, request_body: bytes, response_body: bytes, canaries: list, status: int) -> None:
+    """Full prompt and response per model call, so investigators can audit the reasoning chain.
+    Canary values are redacted at rest; the evidence event already records that one was present.
+    Linked to the hash-chained `ai_request` event by seq and body_sha256."""
+    def redact(b: bytes) -> bytes:
+        for c in canaries:
+            b = b.replace(c["value"].encode(), f"[CANARY:{c['id']}]".encode())
+        return b
+    d = os.path.join(BODY_DIR, sid)
+    os.makedirs(d, exist_ok=True)
+    with gzip.open(os.path.join(d, f"{seq:08d}.json.gz"), "wt") as f:
+        json.dump({"seq": seq, "status": status, "request": redact(request_body).decode(errors="replace"),
+                   "response": redact(response_body).decode(errors="replace"),
+                   "response_truncated": len(response_body) >= MAX_BODY_KEEP}, f)
 
 
 class ResponseInspector:

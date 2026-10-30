@@ -14,6 +14,7 @@ spec:
     metadata:
       labels: { app: control-plane }
     spec:
+      nodeSelector: { sbx/pool: platform }
       serviceAccountName: sbx-controller
       securityContext:
         runAsNonRoot: true
@@ -38,8 +39,8 @@ spec:
               valueFrom: { secretKeyRef: { name: sbx-internal, key: gateway-key } }
             - name: SBX_KEY_CREDPROXY      # authenticates the credproxy on internal endpoints
               valueFrom: { secretKeyRef: { name: sbx-internal, key: credproxy-key } }
-            - name: SBX_KEY_DETECTOR      # authenticates the detector on internal endpoints
-              valueFrom: { secretKeyRef: { name: sbx-internal, key: detector-key } }
+            - name: SBX_KEY_SENTINEL      # authenticates the sentinel on internal endpoints
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: sentinel-key } }
           ports: [{ containerPort: 8000 }]
           readinessProbe: { httpGet: { path: /healthz, port: 8000 }, periodSeconds: 5 }
           securityContext:
@@ -52,7 +53,7 @@ spec:
             - { name: tmp, mountPath: /tmp }
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim: { claimName: cp-data }
         - name: tmp
           emptyDir: {}
         - name: evidence
@@ -71,7 +72,9 @@ spec:
   template:
     metadata:
       labels: { app: gateway }
+      annotations: { kubectl.kubernetes.io/default-container: gateway }
     spec:
+      nodeSelector: { sbx/pool: platform }
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -98,6 +101,21 @@ spec:
             capabilities: { drop: [ALL] }
           volumeMounts:
             - { name: evidence, mountPath: /evidence }
+        - name: evidence-shipper                          # pushes hash-chained evidence to the sentinel
+          image: sbx/services:dev
+          imagePullPolicy: Never
+          command: ["python", "-m", "sbx.sentinel.shipper"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - name: SENTINEL_INGEST_KEY
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: ingest-key } }
+          resources: { requests: { cpu: 20m, memory: 32Mi }, limits: { cpu: 200m, memory: 128Mi } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: evidence, mountPath: /evidence, readOnly: true }
       volumes:
         - name: evidence
           persistentVolumeClaim: { claimName: evidence }
@@ -115,6 +133,7 @@ spec:
     metadata:
       labels: { app: credproxy }
     spec:
+      nodeSelector: { sbx/pool: platform }
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -193,48 +212,3 @@ spec:
   ports:
     - { name: http, port: 9000, targetPort: 9000 }
     - { name: tunnel, port: 9001, targetPort: 9001 }
----
-# detector: reads evidence read-only and Hubble flows; acts only through the control plane.
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: detector
-  namespace: sbx-system
-spec:
-  replicas: 1
-  strategy: { type: Recreate }
-  selector:
-    matchLabels: { app: detector }
-  template:
-    metadata:
-      labels: { app: detector }
-    spec:
-      automountServiceAccountToken: false
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        fsGroup: 10001
-        seccompProfile: { type: RuntimeDefault }
-      containers:
-        - name: detector
-          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { cpu: "500m", memory: 512Mi } }
-          image: sbx/services:dev
-          imagePullPolicy: Never
-          command: ["python", "-m", "sbx.detector.main"]
-          env:
-            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
-            - { name: HOME, value: /tmp }
-            - name: SBX_INTERNAL_KEY      # its own key only
-              valueFrom: { secretKeyRef: { name: sbx-internal, key: detector-key } }
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities: { drop: [ALL] }
-          volumeMounts:
-            - { name: evidence, mountPath: /evidence, readOnly: true }
-            - { name: tmp, mountPath: /tmp }
-      volumes:
-        - name: evidence
-          persistentVolumeClaim: { claimName: evidence, readOnly: true }
-        - name: tmp
-          emptyDir: {}

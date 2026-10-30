@@ -2,7 +2,7 @@ apiVersion: sbx/v1
 kind: AgentSpec
 metadata:
   name: bugfix-agent
-  version: 1
+  version: 2
   owners: [monalir]
 spec:
   runtime:

@@ -4,7 +4,7 @@ apiVersion: sbx/v1
 kind: AgentSpec
 metadata:
   name: bugfix-agent-open
-  version: 1
+  version: 2
   owners: [monalir]
   annotations:
     riskAcceptance: "harness-only: lets Phase A observe platform enforcement without agent-side tool limits (SEC-0001)"
@@ -26,6 +26,7 @@ spec:
     allow: [Read, Edit, Write, Glob, Grep, Bash]   # DELIBERATELY PERMISSIVE: any shell command
   egress:
     allow: [paste-mock.lab-ext]
+    writeAllowed: [paste-mock.lab-ext]   # DELIBERATELY VULNERABLE: reproduces B9/B10
   secrets:
     - ref: anthropic/default
   detection:
