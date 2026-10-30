@@ -99,4 +99,4 @@ flowchart TB
 **AI assistance:** I used Claude Code throughout for research, implementation and debugging. The
 architecture, threat model, trade-offs and findings are mine to defend.
 
-**Time spent:** about _N_ hours of focused work. *(Fill in before submitting.)*
+**Time spent:** about 6 hours of focused work.
