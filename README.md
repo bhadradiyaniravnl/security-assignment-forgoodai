@@ -15,6 +15,7 @@ A small internal platform that runs Claude Code in disposable, gVisor-isolated K
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How it is built: components, policy model, credentials, network, flows, decisions |
 | [AGENTS.md](AGENTS.md) | How to run it on your machine, the tests, the repo map (Claude Code loads it via `CLAUDE.md`) |
 | [docs/results/](docs/results/security-test-2026-10-30.md) | The latest harness report |
+| [SLIDES.html](SLIDES.html) | The walkthrough deck (open locally; ← → to navigate, N for speaker notes) |
 | [docs/COVERAGE.md](docs/COVERAGE.md) | Controls and tests per component, and what is not covered |
 | [docs/SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md) · [docs/BUILD_LOG.md](docs/BUILD_LOG.md) | Review findings at a point in time (high and medium fixed) · what broke along the way |
 

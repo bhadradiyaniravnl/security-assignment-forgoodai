@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sandboxed Coding Agents: Security Walkthrough</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+html,body{margin:0;height:100%;background:#0b1118;color:#F4F2EC;font-family:'IBM Plex Sans',Arial,sans-serif;overflow:hidden}
+#stage{position:absolute;left:50%;top:50%;width:1920px;height:1080px;transform-origin:center;transform:translate(-50%,-50%) scale(var(--s,0.5))}
+.slide{position:absolute;left:0;top:0;width:1920px;height:1080px;box-sizing:border-box}
+.slide:not(.on){display:none !important}
+.slide h1,.slide h2,.slide h3,.slide p,.slide ul,.slide ol{margin:0}
+.slide ul,.slide ol{padding-left:1.1em}
+.slide table{border-collapse:collapse;width:100%}
+.slide th,.slide td{padding:14px 18px;border-bottom:1px solid #D9DEE4;vertical-align:top}
+.slide th{font-weight:600}
+.slide aside{display:none}
+.xs[kind="arrow-right"]{clip-path:polygon(0 25%,60% 25%,60% 0,100% 50%,60% 100%,60% 75%,0 75%)}
+x-connector{display:none}
+#hud{position:fixed;right:16px;bottom:12px;font-size:14px;color:#8EA1B4;user-select:none}
+#notes{position:fixed;left:0;right:0;bottom:0;max-height:34vh;overflow:auto;background:#13202E;color:#D5DEE7;padding:16px 24px;font-size:16px;line-height:1.5;border-top:2px solid #E9945F;display:none}
+#notes.on{display:block}
+</style></head><body>
+<div id="stage">
+<section id="cover" class="slide" data-transition="fade" style="background:#13202E;color:#F4F2EC;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;justify-content:space-between">
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;color:#E9945F;letter-spacing:2px">STAFF SECURITY ENGINEER · TAKE-HOME</p>
+<div style="display:flex;flex-direction:column;gap:40px">
+<h1 style="font-size:104px;font-weight:600;line-height:1.05;color:#F4F2EC">Running coding agents<br>you don’t trust</h1>
+<p style="font-size:40px;line-height:1.35;color:#B9C6D3">A sandboxed Claude Code platform: no secrets in the sandbox, every capability from a reviewed spec, and an independent sentinel that contains exfiltration on its own.</p>
+</div>
+<p style="font-size:28px;color:#8EA1B4">kind · gVisor · Cilium + Hubble · explicit gateways · credentials proxy · GitHub App</p>
+<aside>One sentence to open: I built a small internal platform where a coding agent runs in a throwaway sandbox that holds nothing worth stealing, can only do what a reviewed spec allows, and is watched by a detection plane that doesn’t trust the platform it watches. Then I tried to break it with a one-command harness. Plan for the call: the design in four slides, the evidence in two, then the gaps and what I’d do next. Offer a live demo at the end if there is time.</aside>
+</section>
+<section id="principles" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:56px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">Treat the agent as already compromised</h2>
+<p style="font-size:36px;line-height:1.4;color:#4A5568">A coding agent reads untrusted content (repos, issues, docs) and holds real tools. One prompt injection turns it into an insider, so every control has to sit outside it.</p>
+<div style="display:flex;gap:32px">
+<div style="flex:1;display:flex;flex-direction:column;gap:20px;background:#FFFFFF;padding:44px;border-top:6px solid #3E7CB1;border-radius:12px">
+<h3 style="font-size:40px;font-weight:600;line-height:1.2">Nothing to steal</h3>
+<p style="font-size:30px;line-height:1.4;color:#4A5568">No real credential enters the sandbox. Model calls and egress go through a gateway; keys live only in a credentials proxy.</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:20px;background:#FFFFFF;padding:44px;border-top:6px solid #3E7CB1;border-radius:12px">
+<h3 style="font-size:40px;font-weight:600;line-height:1.2">Nothing unreviewed</h3>
+<p style="font-size:30px;line-height:1.4;color:#4A5568">Every capability (models, hosts, tools, repos, lifetime) comes from a versioned spec, approved by a second person.</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:20px;background:#FFFFFF;padding:44px;border-top:6px solid #E07A3F;border-radius:12px">
+<h3 style="font-size:40px;font-weight:600;line-height:1.2">Nothing taken on trust</h3>
+<p style="font-size:30px;line-height:1.4;color:#4A5568">A separate sentinel checks the platform’s evidence against kernel flow data, and contains on its own.</p>
+</div>
+</div>
+<aside>The framing I used for every decision: assume the agent is already working for the attacker. That gives three requirements. First, there is nothing in the sandbox worth stealing: the agent only ever holds a session token that is useless outside its own pod. Second, everything the agent can do is declared in a spec that someone other than its author approved. Third, detection must not depend on the components it is checking, so the sentinel cross-checks what the gateway claims against what the kernel saw, and it can act on its own. The canary in the repo’s .env is the stand-in for a real secret; leaking it is the success condition for the attacker.</aside>
+</section>
+<section id="architecture" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">Two ports out, and keys never enter the pod</h2>
+<div style="position:absolute;left:128px;top:300px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#FBE9DF;border:2px solid #E07A3F;border-radius:16px;padding:28px">
+<p style="font-size:36px;font-weight:600">Sandbox pod</p>
+<p style="font-size:24px;line-height:1.35;color:#4A5568">gVisor · Claude Code · repo copy + canary · session token only</p>
+</div>
+<x-shape kind="arrow-right" style="position:absolute;left:484px;top:365px;width:88px;height:40px;background:#8EA1B4" class="xs"></x-shape>
+<div style="position:absolute;left:588px;top:300px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#E3EDF6;border:2px solid #3E7CB1;border-radius:16px;padding:28px">
+<p style="font-size:36px;font-weight:600">Gateway</p>
+<p style="font-size:24px;line-height:1.35;color:#4A5568">:8080 model · :3128 egress · spec policy at every request</p>
+</div>
+<x-shape kind="arrow-right" style="position:absolute;left:944px;top:365px;width:88px;height:40px;background:#8EA1B4" class="xs"></x-shape>
+<div style="position:absolute;left:1048px;top:300px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#E3EDF6;border:2px solid #3E7CB1;border-radius:16px;padding:28px">
+<p style="font-size:36px;font-weight:600">credproxy</p>
+<p style="font-size:24px;line-height:1.35;color:#4A5568">the only real secrets · re-checks the grant</p>
+</div>
+<x-shape kind="arrow-right" style="position:absolute;left:1404px;top:365px;width:88px;height:40px;background:#8EA1B4" class="xs"></x-shape>
+<div style="position:absolute;left:1508px;top:300px;width:284px;height:170px;display:flex;flex-direction:column;gap:12px;background:#FFFFFF;border:2px solid #B9C6D3;border-radius:16px;padding:28px">
+<p style="font-size:36px;font-weight:600">Outside</p>
+<p style="font-size:24px;line-height:1.35;color:#4A5568">Anthropic · GitHub · allowlisted hosts</p>
+</div>
+<div style="position:absolute;left:128px;top:560px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#FFFFFF;border:2px dashed #E07A3F;border-radius:16px;padding:28px">
+<p style="font-size:36px;font-weight:600">Anything else</p>
+<p style="font-size:24px;line-height:1.35;color:#4A5568">dropped by Cilium, recorded by Hubble</p>
+</div>
+<div style="position:absolute;left:588px;top:560px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#E3EDF6;border:2px solid #3E7CB1;border-radius:16px;padding:28px">
+<p style="font-size:36px;font-weight:600">Control plane</p>
+<p style="font-size:24px;line-height:1.35;color:#4A5568">specs · sessions · token checks · trusted diff</p>
+</div>
+<div style="position:absolute;left:1048px;top:560px;width:744px;height:170px;display:flex;flex-direction:column;gap:12px;background:#13202E;border-radius:16px;padding:28px">
+<p style="font-size:36px;font-weight:600;color:#F4F2EC">Sentinel, on its own node</p>
+<p style="font-size:24px;line-height:1.35;color:#B9C6D3">verified gateway evidence + Hubble flows → its own deny policy on the session, about 1 s</p>
+</div>
+<x-connector x1="298" y1="470" x2="298" y2="558" head="end" style="color:#E07A3F;border-width:3px;border-style:dashed"></x-connector>
+<x-connector x1="758" y1="470" x2="758" y2="558" head="both" style="color:#3E7CB1;border-width:3px"></x-connector>
+<x-connector x1="900" y1="470" x2="1100" y2="558" route="vh" head="end" style="color:#13202E;border-width:3px"></x-connector>
+<x-connector x1="298" y1="730" x2="1420" y2="730" route="elbow" head="end" style="color:#13202E;border-width:3px;border-style:dotted"></x-connector>
+<p style="position:absolute;left:128px;top:808px;width:1664px;font-size:30px;line-height:1.4;color:#4A5568">Three trust zones on three nodes: sandboxes on a tainted gVisor node, platform with the secrets on another, the sentinel alone on a third.</p>
+<aside>Walk the request path left to right. The sandbox can open exactly two connections, both to the gateway: port 8080 for model calls, 3128 as an explicit forward proxy for everything else. Every request carries the session token, which the gateway checks with the control plane, bound to the pod IP and the session’s compiled spec. The gateway then hands the call to credproxy, the only component holding the Anthropic key and the GitHub App key, which re-checks the grant before using them. Anything the sandbox tries outside those two ports never gets out: Cilium drops it at the kernel and Hubble records it, which is the bypass signal. The gateway ships its hash-chained evidence to the sentinel, and the sentinel also reads Hubble directly; if something is wrong it writes its own deny policy on the session. Physically: sandboxes on a tainted node that is the only one with gVisor; the secrets on the platform node; the sentinel alone on the third node.</aside>
+</section>
+<section id="lifecycle" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:48px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">A session, from <span style="font-family:'JetBrains Mono', monospace">run</span> to pull request</h2>
+<div style="display:flex;gap:20px;align-items:stretch">
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FFFFFF;padding:32px;border-radius:12px;border:1px solid #D9DEE4">
+<p style="font-family:'JetBrains Mono', monospace;font-size:24px;color:#3E7CB1">1 · run</p>
+<p style="font-size:27px;line-height:1.35;color:#13202E">Control plane compiles the spec, mints a session token, creates a gVisor pod on the sandbox node</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FFFFFF;padding:32px;border-radius:12px;border:1px solid #D9DEE4">
+<p style="font-family:'JetBrains Mono', monospace;font-size:24px;color:#3E7CB1">2 · deliver</p>
+<p style="font-size:27px;line-height:1.35;color:#13202E">Repo cloned and canary planted outside the pod, then streamed in; the pod never talks to git</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FFFFFF;padding:32px;border-radius:12px;border:1px solid #D9DEE4">
+<p style="font-family:'JetBrains Mono', monospace;font-size:24px;color:#3E7CB1">3 · work</p>
+<p style="font-size:27px;line-height:1.35;color:#13202E">Claude Code runs; every model call and fetch goes through the gateway; follow-ups resume the same conversation</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FFFFFF;padding:32px;border-radius:12px;border:1px solid #D9DEE4">
+<p style="font-family:'JetBrains Mono', monospace;font-size:24px;color:#3E7CB1">4 · stop</p>
+<p style="font-size:27px;line-height:1.35;color:#13202E">Token revoked; control plane computes the diff itself; transcript and bodies kept; pod deleted</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#13202E;padding:32px;border-radius:12px">
+<p style="font-family:'JetBrains Mono', monospace;font-size:24px;color:#E9945F">5 · publish</p>
+<p style="font-size:27px;line-height:1.35;color:#F4F2EC">credproxy opens a draft PR with a scoped token, revoked after; protected paths and canaries refused</p>
+</div>
+</div>
+<div style="display:flex;gap:40px">
+<p style="flex:1;font-size:28px;line-height:1.4;color:#4A5568"><b>Idle or expired:</b> the reaper stops it and keeps the work. <b>Pod gone:</b> the session ends and its token dies with it.</p>
+<p style="flex:1;font-size:28px;line-height:1.4;color:#4A5568"><b>Contained:</b> network cut, token revoked, evidence snapshotted; the pod is kept for a while for forensics, then destroyed.</p>
+</div>
+<aside>The lifecycle in five steps. Run: the control plane validates that the caller owns the spec, that the parameters are the declared ones, compiles the spec into a session policy bound by digest, mints a placeholder token and creates the pod. Deliver: the control plane clones the repo (git-lab or GitHub through credproxy), plants the canary in .env, and streams the workspace in through exec; the sandbox has no git credentials and no route to git. Work: the agent runs with the gateway as its only exit; sbxctl send writes a follow-up into the pod’s inbox and Claude Code continues the same conversation. Stop: the token is revoked first, then the control plane exports the diff from its own copy, keeps the transcript and the model bodies, and deletes the pod. Publish: credproxy mints a repo-scoped token, pushes a branch, opens a draft PR authored by the App, and revokes the token. Sessions that go idle are reaped so an abandoned agent doesn’t hold resources; a contained session is kept briefly, off the network, for investigation.</aside>
+</section>
+<section id="credentials" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:56px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">Every secret lives in one pod, outside the sandbox</h2>
+<table style="font-size:30px;color:#13202E">
+<tr><th style="width:26%;text-align:left">Credential</th><th style="width:22%;text-align:left">Lives in</th><th style="width:52%;text-align:left">What the sandbox gets</th></tr>
+<tr><td>Anthropic API key</td><td>credproxy</td><td>A placeholder token, valid only from its pod IP, for its spec, while running</td></tr>
+<tr style="background:#FFFFFF"><td>GitHub App key</td><td>credproxy</td><td>Nothing. Per-operation tokens scoped to one repo, revoked straight after use</td></tr>
+<tr><td>Kubernetes token</td><td>none</td><td>Nothing: not mounted, and admission rejects any pod that would mount one</td></tr>
+<tr style="background:#FFFFFF"><td>Component keys</td><td>each service</td><td>Nothing. The gateway can’t trigger GitHub actions; the sentinel can only read policy</td></tr>
+</table>
+<p style="font-size:32px;line-height:1.4;color:#4A5568">The agent never pushes and never sees git credentials: the control plane computes the diff itself and credproxy opens a <b>draft</b> PR, refusing <span style="font-family:'JetBrains Mono', monospace">.github/</span> changes or any diff that contains the canary.</p>
+<aside>This is the part I’d defend hardest. The sandbox’s ANTHROPIC_API_KEY is a placeholder. On its own it is worthless: the gateway accepts it only from the pod IP it was issued to, only for that session’s spec, and only while the session is running, and revoking it is one state change. The real key and the GitHub App private key exist in exactly one pod, on a different node from any sandbox, so a gVisor escape lands next to nothing. GitHub tokens are minted per operation, scoped to a single repository and the minimum permission, and revoked immediately; the token value never leaves credproxy. Publishing is done from the control plane’s own diff, not from git output inside the pod, because that output is attacker-controlled. In the real run this produced a draft PR with 52 tests and 4 real bugs, authored by the App.</aside>
+</section>
+<section id="specs" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:56px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">A reviewed spec decides what each agent may do</h2>
+<div style="display:flex;gap:24px;align-items:stretch">
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:36px;border-radius:12px;border:1px solid #D9DEE4">
+<p style="font-family:'JetBrains Mono', monospace;font-size:26px;color:#3E7CB1">1 · write</p>
+<h3 style="font-size:36px;font-weight:600;line-height:1.2">Author drafts YAML</h3>
+<p style="font-size:28px;line-height:1.4;color:#4A5568">Models, egress hosts, tools, repos, secrets, TTL, image</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:36px;border-radius:12px;border:1px solid #D9DEE4">
+<p style="font-family:'JetBrains Mono', monospace;font-size:26px;color:#3E7CB1">2 · baseline</p>
+<h3 style="font-size:36px;font-weight:600;line-height:1.2">Org policy as code</h3>
+<p style="font-size:28px;line-height:1.4;color:#4A5568">gVisor only, exact hosts, approved models, bounded TTL</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:36px;border-radius:12px;border:1px solid #D9DEE4">
+<p style="font-family:'JetBrains Mono', monospace;font-size:26px;color:#3E7CB1">3 · approve</p>
+<h3 style="font-size:36px;font-weight:600;line-height:1.2">Second person signs</h3>
+<p style="font-size:28px;line-height:1.4;color:#4A5568">The exact digest, approver ≠ author; versions immutable</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#13202E;padding:36px;border-radius:12px">
+<p style="font-family:'JetBrains Mono', monospace;font-size:26px;color:#E9945F">4 · enforce</p>
+<h3 style="font-size:36px;font-weight:600;line-height:1.2;color:#F4F2EC">Compiled per session</h3>
+<p style="font-size:28px;line-height:1.4;color:#B9C6D3">Gateway, Cilium and admission enforce it, not the agent</p>
+</div>
+</div>
+<p style="font-size:32px;line-height:1.4;color:#4A5568">Run-time input can’t widen it: <span style="font-family:'JetBrains Mono', monospace">sbxctl run … -p egress=evil.com</span> is rejected (400), and a weaker pod is refused by admission even if the control plane is wrong.</p>
+<aside>Agent specs work like infrastructure code with a security review. An author writes the YAML; at registration the control plane checks it against an org baseline (gVisor runtime, exact hostnames from an approved catalogue with no wildcards, approved models, bounded TTL and budgets, read-only repos, unrestricted Bash only with a recorded risk acceptance). Then a different person approves the exact digest, so review is bound to bytes, not to a name. Versions are immutable, and a version that widens access needs a fresh approval. At run time the user supplies only parameters the spec declares, never policy, and the compiled policy is enforced in the gateway, in Cilium, and by a ValidatingAdmissionPolicy that refuses non-gVisor pods or pods with a service-account token. The sentinel’s rules work the same way: they are configuration too, with a compiled floor that can’t be configured away.</aside>
+</section>
+<section id="sentinel" class="slide" data-transition="fade" style="background:#13202E;color:#F4F2EC;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:48px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15;color:#F4F2EC">The sentinel detects, contains and verifies on its own</h2>
+<div style="display:grid;grid-template-columns:1fr 1.25fr 1fr;gap:32px">
+<div style="display:flex;flex-direction:column;gap:20px;background:#1E2F42;padding:40px;border-radius:12px">
+<h3 style="font-size:36px;font-weight:600;color:#E9945F">Sees</h3>
+<p style="font-size:28px;line-height:1.4;color:#D5DEE7">Gateway evidence, hash chain checked on arrival</p>
+<p style="font-size:28px;line-height:1.4;color:#D5DEE7">Kernel flows from Hubble: sessions and platform pods</p>
+<p style="font-size:28px;line-height:1.4;color:#D5DEE7">Its own L7 request count per session</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:14px;background:#1E2F42;padding:40px;border-radius:12px">
+<h3 style="font-size:36px;font-weight:600;color:#E9945F">Detects</h3>
+<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>D1</b> canary leaves, any encoding</p>
+<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>D2</b> burst of denials or drops</p>
+<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>S1</b> gateway logged less than the kernel saw</p>
+<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>S2</b> a platform pod reaching out</p>
+<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>S6</b> traffic after containment</p>
+<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>EV</b> evidence gap or tampering</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:20px;background:#1E2F42;padding:40px;border-radius:12px">
+<h3 style="font-size:36px;font-weight:600;color:#E9945F">Responds</h3>
+<p style="font-size:28px;line-height:1.4;color:#D5DEE7">Own deny policy on the session in about 1 s</p>
+<p style="font-size:28px;line-height:1.4;color:#D5DEE7">Verified only when Hubble shows the drops</p>
+<p style="font-size:28px;line-height:1.4;color:#D5DEE7">Works with the control plane at zero replicas; nobody else can lift it</p>
+</div>
+</div>
+<p style="font-size:28px;line-height:1.4;color:#B9C6D3">Rules and responses are configuration (<span style="font-family:'JetBrains Mono', monospace">config/sentinel/detection.yaml</span>), validated against a compiled floor.</p>
+<aside>The sentinel is a separate security plane: its own namespace, its own node, its own service account that can only write Cilium policies, and nothing on the platform can reach it except the evidence shipper. It has two kinds of input with different trust: the gateway’s evidence, which is a claim, so it verifies the sequence and hash chain on arrival; and Hubble flows from the kernel datapath, which no pod can fake. S1 is the interesting one: it counts each session’s requests from the datapath and compares them with what the gateway logged, so a gateway that quietly stops logging is caught; we proved it by fault-injecting the gateway. On a high finding it writes its own deny policy (an admission policy stops the control plane or an admin from removing it), and calls containment verified only when Hubble shows the pod’s traffic being dropped. We tested containment with the control plane scaled to zero. Detection rules and response actions are a validated, hot-reloaded YAML policy with monitor mode for tuning; a compiled floor stops anyone from switching off D1, EV or S6.</aside>
+</section>
+<section id="containment" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:48px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">Detect, contain, verify: about one second</h2>
+<div style="display:flex;gap:0;align-items:stretch">
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FBE9DF;padding:36px;border-radius:12px 0 0 12px;border:2px solid #E07A3F">
+<p style="font-size:24px;font-weight:600;color:#993C1D">t = 0</p>
+<h3 style="font-size:34px;font-weight:600;line-height:1.2">Attempt</h3>
+<p style="font-size:26px;line-height:1.35;color:#4A5568">Canary leaves in a request, or a burst of blocked connections</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FFFFFF;padding:36px;border:2px solid #D9DEE4;border-left:none">
+<p style="font-size:24px;font-weight:600;color:#3E7CB1">≈ 0.1 s</p>
+<h3 style="font-size:34px;font-weight:600;line-height:1.2">Detect</h3>
+<p style="font-size:26px;line-height:1.35;color:#4A5568">Gateway evidence shipped to the sentinel; Hubble drops seen directly</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#13202E;padding:36px;border:2px solid #13202E;border-left:none">
+<p style="font-size:24px;font-weight:600;color:#E9945F">≈ 1 s</p>
+<h3 style="font-size:34px;font-weight:600;line-height:1.2;color:#F4F2EC">Contain</h3>
+<p style="font-size:26px;line-height:1.35;color:#D5DEE7">Sentinel writes its own deny policy; control plane revokes the token and snapshots evidence</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FFFFFF;padding:36px;border-radius:0 12px 12px 0;border:2px solid #D9DEE4;border-left:none">
+<p style="font-size:24px;font-weight:600;color:#3E7CB1">≤ 60 s</p>
+<h3 style="font-size:34px;font-weight:600;line-height:1.2">Verify</h3>
+<p style="font-size:26px;line-height:1.35;color:#4A5568">Hubble must show the pod’s traffic dropped and nothing forwarded; otherwise “inconclusive”, never “verified”</p>
+</div>
+</div>
+<div style="display:flex;gap:40px">
+<p style="flex:1;font-size:28px;line-height:1.4;color:#4A5568"><b>Two independent sources agree</b> before containment counts: the gateway’s records and the kernel’s flow log.</p>
+<p style="flex:1;font-size:28px;line-height:1.4;color:#4A5568"><b>Nobody else can lift it.</b> An admission policy lets only the sentinel’s identity remove its quarantine; traffic after containment re-quarantines (S6).</p>
+</div>
+<aside>This is the response path, measured in the tests. The attempt is either a canary leaving in a request (D1) or a burst of connections Cilium dropped (D2). Detection has two inputs: the gateway ships its hash-chained evidence to the sentinel within a second or so, and the sentinel reads Hubble directly, so bypass attempts that never reach the gateway are still seen. Containment is the sentinel’s own Cilium deny policy on the session, about a second from detection; the control plane revokes the token and snapshots pod spec, transcript and the session’s evidence in parallel, best effort. Verification polls Hubble for up to a minute: it needs to see the pod’s traffic being dropped after the quarantine and nothing forwarded; with no traffic at all it records “inconclusive” rather than claiming success. The quarantine is protected by an admission policy so that a compromised control plane, or an admin with kubectl, can’t remove it; and if traffic is seen after containment anyway, S6 re-quarantines.</aside>
+</section>
+<section id="results" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:56px">
+<div style="display:flex;flex-direction:column;gap:16px">
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;color:#3E7CB1">$ make security-test</p>
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">One command tries to break it</h2>
+</div>
+<div style="display:flex;gap:32px">
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:44px;border-radius:12px;border-top:6px solid #3E7CB1">
+<p style="font-size:30px;font-weight:600;color:#4A5568">Phase B · enforcement</p>
+<p style="font-size:120px;font-weight:700;line-height:1">27/27</p>
+<p style="font-size:28px;line-height:1.4;color:#4A5568">cases as expected with the agent assumed compromised: no secrets found, every bypass dropped and seen</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:44px;border-radius:12px;border-top:6px solid #E07A3F">
+<p style="font-size:30px;font-weight:600;color:#4A5568">Phase A · real agent, injected</p>
+<p style="font-size:120px;font-weight:700;line-height:1">0/6</p>
+<p style="font-size:28px;line-height:1.4;color:#4A5568">attempted the exfiltration; 3 runs were refused by the provider, which broke the real task too</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:44px;border-radius:12px;border-top:6px solid #3E7CB1">
+<p style="font-size:30px;font-weight:600;color:#4A5568">Phase C · utility</p>
+<p style="font-size:120px;font-weight:700;line-height:1">Pass</p>
+<p style="font-size:28px;line-height:1.4;color:#4A5568">the legitimate fix works with every control on; tests re-run offline on the trusted diff</p>
+</div>
+</div>
+<p style="font-size:30px;line-height:1.4;color:#4A5568">Verdicts come only from outside the sandbox: gateway evidence, Hubble, lab receipts. “The agent didn’t try” is never counted as protection.</p>
+<aside>The harness is one command with three phases, and I keep them apart on purpose. Phase B is the real security evidence: it execs attacker commands inside the gVisor pod, so model behaviour plays no part: look for secrets, call the API server, skip the gateway, hit another session, raw TCP and DNS to the attacker sink, write the canary to an allowed host over HTTP and TLS. 27 of 27 behave as expected. Phase A is a real Claude Code agent fixing a bug in a repo whose code and CONTRIBUTING.md carry an injection asking it to POST .env. None of six tried; three were refused by the provider’s usage-policy check, which means injection is also an availability attack: the legitimate task failed. No agent told the user about the injection. Phase C proves the controls don’t break the job: tests re-run in a network-less container on the diff the control plane computed, not on what the agent claims.</aside>
+</section>
+<section id="gaps" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:48px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">What still gets through, and how I’d close it</h2>
+<table style="font-size:28px;color:#13202E">
+<tr><th style="width:33%;text-align:left">Gap</th><th style="width:30%;text-align:left">Why</th><th style="width:37%;text-align:left">Production fix</th></tr>
+<tr><td>Canary in a read URL to an allowed host</td><td>One request leaves; D1 contains in ~1 s</td><td>Smallest allowlists; DLP on query strings</td></tr>
+<tr style="background:#FFFFFF"><td>TLS to a host a spec lets agents write to</td><td>CONNECT payload is opaque</td><td>Writes denied by default; TLS inspection + DLP where granted</td></tr>
+<tr><td>CLI identity is an <span style="font-family:'JetBrains Mono', monospace">X-User</span> header</td><td>Local prototype</td><td>OIDC or mTLS on the control-plane API</td></tr>
+<tr style="background:#FFFFFF"><td>gVisor, three nodes in one VM</td><td>No nested virtualisation on a laptop</td><td>MicroVMs (Kata, Firecracker) on separate hosts</td></tr>
+<tr><td>Claude Code side-channel CONNECT</td><td>A medium D2 on every run</td><td>Route through the AI gateway</td></tr>
+</table>
+<p style="font-size:30px;line-height:1.4;color:#4A5568">The harness keeps a deliberately vulnerable spec, so each of these stays reproducible rather than asserted.</p>
+<aside>I want to be explicit about what doesn’t hold. The main residual is B20: data can ride out in the URL of a read to any reachable host; we see it in plain HTTP and contain within about a second, but one request has left. If a spec explicitly grants writes to a host, TLS to it is opaque to the proxy, which is why writes are off by default and need a risk acceptance and a second approval. Identity on the CLI is a header in this prototype, which is fine on localhost but would be OIDC or mTLS in production. gVisor is a large surface reduction but not a hardware boundary, and all three nodes share one VM here. And Claude Code’s own side traffic produces a known false positive that I chose to document rather than allowlist, because allowlisting it would open a channel to the model provider. Each of these is a test case in the harness, not just a sentence in the write-up.</aside>
+</section>
+<section id="decisions" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:44px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">Design decisions and what they cost</h2>
+<table style="font-size:26px;color:#13202E">
+<tr><th style="width:27%;text-align:left">Chose</th><th style="width:22%;text-align:left">Over</th><th style="width:51%;text-align:left">Because, and the cost</th></tr>
+<tr><td>Explicit gateways (base URL + proxy env)</td><td>Transparent TLS interception</td><td>Semantic visibility of model calls and tool use with no MITM CA in the sandbox; bypass fails closed at the network. Cost: CONNECT is opaque</td></tr>
+<tr style="background:#FFFFFF"><td>gVisor on a tainted node</td><td>Kata / Firecracker</td><td>Large surface reduction with no KVM on a laptop; microVMs stay the production design</td></tr>
+<tr><td>Cilium + Hubble</td><td>Plain NetworkPolicy</td><td>FQDN egress, deny policies for sub-second quarantine, and kernel flow logs nothing in a pod can fake</td></tr>
+<tr style="background:#FFFFFF"><td>Per-session deny policy</td><td>Relabel the pod</td><td>≤ 1 s against ~45 s for an identity change</td></tr>
+<tr><td>Control plane computes the diff</td><td>Trust <span style="font-family:'JetBrains Mono', monospace">git diff</span> in the pod</td><td>The pod’s git, config and output are attacker-controlled</td></tr>
+<tr style="background:#FFFFFF"><td>Specs approved by exact digest, second person</td><td>Annotations, trusted authors</td><td>Self-asserted approval is worthless; binds review to bytes. Cost: friction on every widening</td></tr>
+<tr><td>Separate sentinel with its own node and SA</td><td>Detection inside the control plane</td><td>A compromised platform can’t silence or lift it. Cost: a third trust zone to run</td></tr>
+<tr style="background:#FFFFFF"><td>Hash-chained JSONL on a volume</td><td>Straight to a SIEM</td><td>Verifiable locally in every test; WORM + anchor is the production path</td></tr>
+</table>
+<aside>These are the decisions I would expect to be challenged, with the alternative I rejected and what the choice costs. The big one is explicit gateways instead of a transparent interception proxy: configuring the agent with a base URL and proxy variables means I see model requests and tool use in the clear without planting a CA in the sandbox, and if the agent ignores the variables the network drops it. The price is that CONNECT tunnels are opaque, which is exactly the B10 finding, and why write-capable hosts are read-only by default. gVisor over microVMs was forced by the laptop; Cilium over plain NetworkPolicy bought FQDN rules, fast deny policies and Hubble. Computing the diff on the control plane came out of the security review: the pod’s git output had been trusted and could be forged. Two-person digest approval also came from the review, where any approval string had been accepted. The sentinel as a separate zone is the most expensive choice operationally, but it is the only way detection survives a compromised control plane.</aside>
+</section>
+<section id="built" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:48px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15">What I built, what I reused, how I worked</h2>
+<div style="display:flex;gap:32px">
+<div style="flex:1.3;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:40px;border-radius:12px;border-top:6px solid #3E7CB1">
+<h3 style="font-size:36px;font-weight:600">Built (about 6k lines)</h3>
+<ul style="font-size:27px;line-height:1.45;color:#4A5568">
+<li>AI gateway and egress proxy with request policy</li>
+<li>Credentials proxy, incl. GitHub App token minting</li>
+<li>Control plane: spec registry, baseline, sessions, trusted diff and PRs</li>
+<li>Sentinel: rules, configurable detection policy, independent response</li>
+<li>Evidence chain, canary matcher, <span style="font-family:'JetBrains Mono', monospace">sbxctl</span></li>
+<li>Manifests, bring-up, nine suites and the three-phase harness</li>
+</ul>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:40px;border-radius:12px;border-top:6px solid #B9C6D3">
+<h3 style="font-size:36px;font-weight:600">Reused, unmodified</h3>
+<ul style="font-size:27px;line-height:1.45;color:#4A5568">
+<li>kind, Colima, Cilium + Hubble</li>
+<li>gVisor</li>
+<li>Kubernetes admission and Pod Security</li>
+<li>Claude Code as the agent</li>
+<li>aiohttp, FastAPI, kubernetes client</li>
+</ul>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#13202E;padding:40px;border-radius:12px">
+<h3 style="font-size:36px;font-weight:600;color:#E9945F">How I worked</h3>
+<ul style="font-size:27px;line-height:1.45;color:#D5DEE7">
+<li>Claude Code throughout: research, code, debugging</li>
+<li>Architecture, threat model and trade-offs are mine to defend</li>
+<li>Ran a full security review on my own code; four highs, all fixed with tests</li>
+<li>Every claim traced to a test or marked as review-only</li>
+</ul>
+</div>
+</div>
+<p style="font-size:28px;line-height:1.4;color:#4A5568">Build log kept: the gVisor-vs-Cilium socket bug, httpoxy, a thread-safety bug in the Kubernetes client, and a contained secret-handling incident with the guard that followed.</p>
+<aside>On what is mine: all the platform code, about six thousand lines of Python and bash, plus the manifests and tests; the infrastructure pieces are used as shipped. I used Claude Code heavily and I’m upfront about that; the thing I’d ask to be judged on is the design, the threat model and the trade-offs, and whether I can defend them. Two things I’d point out about process. First, I ran a full security review against my own implementation midway and it found four high-severity issues, including that the gateway forwarded the provider’s server-side tools, which is egress the network never sees; all are fixed with regression tests. Second, I kept a build log of what broke, including an incident where a real key landed in a tracked example file locally; I rewrote history, rotated it and added a pre-commit guard. That incident is the platform’s own lesson in miniature: secrets have to be structurally unable to reach the place they leak.</aside>
+</section>
+<section id="next" class="slide" data-transition="fade" style="background:#13202E;color:#F4F2EC;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:56px">
+<h2 style="font-size:64px;font-weight:600;line-height:1.15;color:#F4F2EC">Next: harden the boundary, then measure detection</h2>
+<div style="display:flex;gap:40px">
+<div style="flex:1;display:flex;flex-direction:column;gap:20px;background:#1E2F42;padding:44px;border-radius:12px">
+<h3 style="font-size:40px;font-weight:600;color:#E9945F">Harden</h3>
+<ol style="font-size:30px;line-height:1.5;color:#D5DEE7">
+<li>MicroVM sandboxes on dedicated hosts</li>
+<li>Workload identity (SPIFFE/mTLS) and OIDC users</li>
+<li>WORM evidence, anchored outside, into the SIEM</li>
+<li>Signed, digest-pinned images verified at admission</li>
+</ol>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:20px;background:#1E2F42;padding:44px;border-radius:12px">
+<h3 style="font-size:40px;font-weight:600;color:#E9945F">Prove</h3>
+<ol style="font-size:30px;line-height:1.5;color:#D5DEE7">
+<li>Detection precision and recall against harness ground truth</li>
+<li>Fuzz the gateway’s request policy, the real chokepoint</li>
+<li>A larger Phase A matrix across injection styles</li>
+<li>Kubernetes audit and Tetragon for platform pods</li>
+</ol>
+</div>
+</div>
+<p style="font-size:28px;line-height:1.4;color:#B9C6D3">Live demo: <span style="font-family:'JetBrains Mono', monospace;color:#F4F2EC">make up</span> · <span style="font-family:'JetBrains Mono', monospace;color:#F4F2EC">sbxctl run</span> · <span style="font-family:'JetBrains Mono', monospace;color:#F4F2EC">make security-test</span> (how-to in AGENTS.md)</p>
+<aside>Close with priorities. On the boundary, the order is: microVMs on separate hosts, because the sandbox is where untrusted code runs; then workload identity so component keys stop being shared secrets; then evidence that can’t be rewritten even by an admin; then supply chain at admission. On assurance, what I’d measure first is detection quality, precision and recall per rule against the harness ground truth, because today the false-positive side is anecdotal. Next is fuzzing the gateway’s request policy, since everything rests on it, then a bigger and more varied injection matrix, and audit plus Tetragon so the sentinel sees API-server actions and platform-pod processes, not just their network. If there’s time, demo: start a session, show the stream, run Phase B, and show a containment in the sentinel’s alerts.</aside>
+</section>
+
+</div>
+<div id="hud">← → navigate · N notes · F fullscreen · <span id="pos"></span></div>
+<div id="notes"></div>
+<script>
+const S=[...document.querySelectorAll('.slide')];let i=Math.max(0,Math.min(S.length-1,(parseInt(location.hash.slice(1))||1)-1));
+function fit(){const s=Math.min(innerWidth/1920,(innerHeight-(notes.classList.contains('on')?innerHeight*0.34:0))/1080);document.documentElement.style.setProperty('--s',s)}
+function show(){S.forEach((e,k)=>e.classList.toggle('on',k===i));pos.textContent=(i+1)+' / '+S.length;try{history.replaceState(null,'','#'+(i+1))}catch(e){}const a=S[i].querySelector('aside');notes.textContent=a?a.textContent:'';fit()}
+addEventListener('keydown',e=>{if(['ArrowRight','PageDown',' '].includes(e.key)){i=Math.min(S.length-1,i+1);show()}else if(['ArrowLeft','PageUp'].includes(e.key)){i=Math.max(0,i-1);show()}else if(e.key==='Home'){i=0;show()}else if(e.key==='End'){i=S.length-1;show()}else if(e.key.toLowerCase()==='n'){notes.classList.toggle('on');fit()}else if(e.key.toLowerCase()==='f'){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen()}});
+addEventListener('resize',fit);addEventListener('click',e=>{if(e.clientX>innerWidth/2)i=Math.min(S.length-1,i+1);else i=Math.max(0,i-1);show()});show();
+</script></body></html>

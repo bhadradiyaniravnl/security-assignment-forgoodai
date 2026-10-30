@@ -196,4 +196,5 @@ tests/
 samples/                  target repos: slugkit (bug-fix task), items-api (GitHub flow)
 docs/                     THREAT_MODEL, COVERAGE, ARCHITECTURE, SECURITY_REVIEW, BUILD_LOG, results/
 bin/sbxctl                runs the CLI from the repo without installing anything
+SLIDES.html               the walkthrough deck, self-contained
 ```
