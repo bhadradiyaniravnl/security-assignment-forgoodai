@@ -21,6 +21,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: sink
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: "500m", memory: 256Mi } }
           image: sbx/services:dev
           imagePullPolicy: Never
           command: ["python", "-m", "sbx.lab.sink"]
@@ -59,6 +60,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: sink
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: "500m", memory: 256Mi } }
           image: sbx/services:dev
           imagePullPolicy: Never
           command: ["python", "-m", "sbx.lab.sink"]
@@ -120,6 +122,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: git-lab
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: "500m", memory: 256Mi } }
           image: sbx/services:dev
           imagePullPolicy: Never
           command: ["python", "-m", "sbx.lab.git_lab"]

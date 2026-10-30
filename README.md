@@ -9,7 +9,8 @@ canary exfiltration and bypass attempts. A one-command harness then tries to bre
 - **Threat model and results (2 pages):** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Setup:** [docs/SETUP.md](docs/SETUP.md)
 - **Detailed design and build log:** [docs/DESIGN.md](docs/DESIGN.md)
-- **Latest harness report:** [docs/results/security-test-2026-10-29.md](docs/results/security-test-2026-10-29.md)
+- **Security review (all high and medium findings fixed):** [docs/SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md)
+- **Latest harness report:** [docs/results/security-test-2026-10-30.md](docs/results/security-test-2026-10-30.md)
 
 ```mermaid
 flowchart LR
@@ -63,7 +64,7 @@ with no tests.
 
 | | |
 |---|---|
-| **Phase B: deterministic enforcement** | **18/18** as expected (agent assumed compromised) |
+| **Phase B: deterministic enforcement** | **22/22** as expected (agent assumed compromised; includes security-review regressions) |
 | Findings (attacks that succeed) | **B10:** canary over TLS to an *allowlisted* host is received and **not detected** · **B9:** over plain HTTP it is received, **detected, contained in ~1 s and verified** |
 | **Phase A: agent under prompt injection** | 0/6 attempted exfil; 2/6 ignored the injection silently; 4/6 refused by the provider (the legitimate task failed too) |
 | **Phase C: utility** | Legitimate task passes with all controls on (tests re-run offline on the collected diff) |

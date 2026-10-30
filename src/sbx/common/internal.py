@@ -1,4 +1,8 @@
-"""Service-to-service auth inside sbx-system (prototype: shared key; production: mTLS/SPIFFE)."""
+"""Service-to-service auth inside sbx-system (prototype: one key per component; production: mTLS/SPIFFE).
+
+Each component sends its OWN key (SBX_INTERNAL_KEY). Receivers know the keys of the callers they
+accept (SBX_KEY_<COMPONENT>) and authorise per endpoint, so a compromised gateway cannot use
+detector-only endpoints, and the detector cannot validate tokens or reach credproxy."""
 from __future__ import annotations
 
 import hmac
@@ -22,5 +26,15 @@ def headers() -> dict:
     return {HEADER: key()}
 
 
-def check(value: str | None) -> bool:
-    return bool(value) and hmac.compare_digest(value, key())
+COMPONENTS = ("gateway", "credproxy", "detector")
+
+
+def caller(value: str | None) -> str | None:
+    """Which component presented this key (None if unknown)."""
+    if not value:
+        return None
+    for name in COMPONENTS:
+        k = os.environ.get(f"SBX_KEY_{name.upper()}", "")
+        if len(k) >= 32 and hmac.compare_digest(value, k):
+            return name
+    return None

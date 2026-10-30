@@ -64,7 +64,8 @@ check "manual contain probe blocked" true "$($CTL contain "$SID3" | python3 -c '
 echo "=== evidence integrity"
 check "alerts chain verifies" True "$(kubectl -n sbx-system exec deploy/control-plane -- python -c 'from sbx.common.evidence import verify_chain; print(verify_chain("/evidence/alerts.jsonl")[0])')"
 
-for s in "$SID" "$SID2" "$SID3"; do $CTL destroy "$s" >/dev/null; done
+check "owner cannot destroy a contained session" "error 403" "$($CTL destroy "$SID" 2>&1 | grep -o 'error 403')"
+for s in "$SID" "$SID2" "$SID3"; do SBX_USER=secops $CTL destroy "$s" >/dev/null; done
 check "quarantine policies removed on destroy" 0 "$(kubectl -n sbx-sessions get cnp -o name | grep -c -E "quarantine-($SID|$SID2|$SID3)")"
 
 echo; echo "passed=$pass failed=$fail"

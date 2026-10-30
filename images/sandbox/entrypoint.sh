@@ -14,7 +14,10 @@ mapfile -t tools < <(jq -r '.allowed_tools[]?' "$TASK")
 cd /workspace/repo
 
 turn() { # prompt, continue-flag
+  # --setting-sources user + --strict-mcp-config: a repo's .claude/settings.json or .mcp.json cannot
+  # widen tools, add hooks or attach MCP servers beyond what the spec grants.
   claude -p "$1" ${2:+--continue} --output-format stream-json --verbose --permission-mode acceptEdits \
+    --setting-sources user --strict-mcp-config \
     ${tools[@]:+--allowedTools "${tools[@]}"}
 }
 

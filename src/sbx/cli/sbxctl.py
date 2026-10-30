@@ -4,7 +4,7 @@
   sbxctl ls | status SID | logs SID [-f] [--raw] | stop SID | diff SID | destroy SID
   sbxctl send SID "follow-up instruction" [-f] | attach SID
   sbxctl contain SID | alerts
-  sbxctl spec register FILE | spec ls
+  sbxctl spec approve FILE (security approver) | spec register FILE | spec ls
 """
 from __future__ import annotations
 
@@ -18,6 +18,13 @@ import urllib.error
 import urllib.request
 
 API = os.environ.get("SBX_API", "http://127.0.0.1:8443")
+# Agent output and diffs are attacker-controlled: never let them reach the terminal as control
+# sequences (OSC 52 clipboard writes, cursor moves that hide lines, title changes, ...).
+_CTRL = {c: f"\\x{c:02x}" for c in list(range(0x00, 0x20)) + list(range(0x7f, 0xa0)) if c not in (0x0a, 0x09)}
+
+
+def safe(text: str) -> str:
+    return text.translate(_CTRL)
 USER = os.environ.get("SBX_USER", getpass.getuser())
 
 
@@ -91,7 +98,7 @@ def print_logs(resp, raw: bool, stop_at_exit: bool) -> None:
         text = line.decode(errors="replace")
         out = text.rstrip() if raw else pretty(text)
         if out:
-            print(out, flush=True)
+            print(safe(out), flush=True)
         if stop_at_exit and is_exit(text):
             break
 
@@ -143,7 +150,7 @@ def main(argv: list[str] | None = None) -> None:
     sd.add_argument("-f", "--follow", action="store_true", help="stream that turn until the agent finishes it")
     sub.add_parser("attach", help="stream live and type follow-ups interactively").add_argument("sid")
     sp = sub.add_parser("spec", help="register or list agent specs")
-    sp.add_argument("action", choices=["register", "ls"])
+    sp.add_argument("action", choices=["register", "approve", "ls"])
     sp.add_argument("file", nargs="?")
     for name in ("status", "stop", "diff", "destroy", "contain"):
         sub.add_parser(name).add_argument("sid")
@@ -164,13 +171,13 @@ def main(argv: list[str] | None = None) -> None:
             print(f"{s['session_id']:<11} {s['state']:<10} {s['spec_name']:<18} {s['params'].get('repo', ''):<12} "
                   f"{s.get('detail') or ''}")
     elif a.cmd == "status":
-        print(json.dumps(call("GET", f"/sessions/{a.sid}"), indent=2))
+        print(safe(json.dumps(call("GET", f"/sessions/{a.sid}"), indent=2)))
     elif a.cmd == "logs":
         follow_logs(a.sid, a.follow, a.raw)
     elif a.cmd == "stop":
         print(json.dumps(call("POST", f"/sessions/{a.sid}/stop")))
     elif a.cmd == "diff":
-        print(call("GET", f"/sessions/{a.sid}/diff"), end="")
+        print(safe(call("GET", f"/sessions/{a.sid}/diff")), end="")
     elif a.cmd == "send":
         send(a.sid, a.text, a.follow)
     elif a.cmd == "attach":
@@ -182,8 +189,8 @@ def main(argv: list[str] | None = None) -> None:
     elif a.cmd == "alerts":
         for e in call("GET", "/alerts"):
             c = e.get("containment") or {}
-            print(f"{e['seq']:>4} {e['rule']:<3} {e['severity']:<6} {e.get('session_id') or '-':<10} "
-                  f"user={e.get('user')} spec={e.get('spec')}\n     {e['summary']}"
+            print(safe(f"{e['seq']:>4} {e['rule']:<3} {e['severity']:<6} {e.get('session_id') or '-':<10} "
+                       f"user={e.get('user')} spec={e.get('spec')}") + f"\n     {safe(e['summary'])}"
                   + (f"\n     contained in {c.get('elapsed_s')}s probe_blocked={c.get('probe_blocked')}" if c.get('quarantined_at') else ""))
     elif a.cmd == "spec" and a.action == "register":
         if not a.file:
@@ -192,6 +199,11 @@ def main(argv: list[str] | None = None) -> None:
         print(f"registered {r['name']} v{r['version']} {r['digest'][:19]}…" + (" (unchanged)" if r.get("unchanged") else ""))
         for w in r.get("warnings", []):
             print(f"  warning: {w}")
+    elif a.cmd == "spec" and a.action == "approve":
+        if not a.file:
+            sys.exit("spec approve needs a FILE")
+        r = call("POST", "/specs/approvals", open(a.file, "rb").read())
+        print(f"approved {r['name']} v{r['version']} {r['digest'][:19]}… by {r['approved_by']}")
     elif a.cmd == "spec":
         for r in call("GET", "/specs"):
             print(f"{r['name']:<20} v{r['version']:<3} {r['digest'][:19]}…  by {r['registered_by']:<17} "

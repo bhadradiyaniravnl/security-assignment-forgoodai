@@ -22,6 +22,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: control-plane
+          resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
           image: sbx/services:dev
           imagePullPolicy: Never
           command: ["python", "-m", "uvicorn", "sbx.control_plane.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
@@ -29,10 +30,16 @@ spec:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: CP_DB, value: /data/cp.db }
             - { name: SBX_SPEC_AUTHORS, value: monalir }      # who may register specs (prototype; prod: CODEOWNERS + CI)
+            - { name: SBX_SECURITY_APPROVERS, value: secops } # two-person rule: approves spec digests
+            - { name: SBX_SECURITY_ADMINS, value: secops }    # may release (destroy) contained sessions
             - name: SBX_CP_KEY
               valueFrom: { secretKeyRef: { name: sbx-internal, key: cp-key } }
-            - name: SBX_INTERNAL_KEY
-              valueFrom: { secretKeyRef: { name: sbx-internal, key: key } }
+            - name: SBX_KEY_GATEWAY      # authenticates the gateway on internal endpoints
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: gateway-key } }
+            - name: SBX_KEY_CREDPROXY      # authenticates the credproxy on internal endpoints
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: credproxy-key } }
+            - name: SBX_KEY_DETECTOR      # authenticates the detector on internal endpoints
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: detector-key } }
           ports: [{ containerPort: 8000 }]
           readinessProbe: { httpGet: { path: /healthz, port: 8000 }, periodSeconds: 5 }
           securityContext:
@@ -73,13 +80,14 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: gateway
+          resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { cpu: "2", memory: 1Gi } }
           image: sbx/services:dev
           imagePullPolicy: Never
           command: ["python", "-m", "sbx.gateway.main"]
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
-            - name: SBX_INTERNAL_KEY
-              valueFrom: { secretKeyRef: { name: sbx-internal, key: key } }
+            - name: SBX_INTERNAL_KEY      # its own key only
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: gateway-key } }
           ports:
             - { containerPort: 8080 }
             - { containerPort: 3128 }
@@ -115,13 +123,16 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: credproxy
+          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { cpu: "1", memory: 512Mi } }
           image: sbx/services:dev
           imagePullPolicy: Never
           command: ["python", "-m", "sbx.credproxy.app"]
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
-            - name: SBX_INTERNAL_KEY
-              valueFrom: { secretKeyRef: { name: sbx-internal, key: key } }
+            - name: SBX_INTERNAL_KEY      # its own key (policy lookups)
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: credproxy-key } }
+            - name: SBX_KEY_GATEWAY       # the only caller allowed to use inference/egress
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: gateway-key } }
             - name: ANTHROPIC_API_KEY
               valueFrom: { secretKeyRef: { name: credproxy-secrets, key: ANTHROPIC_API_KEY } }
             - name: ANTHROPIC_WORKSPACE_ID
@@ -206,14 +217,15 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: detector
+          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { cpu: "500m", memory: 512Mi } }
           image: sbx/services:dev
           imagePullPolicy: Never
           command: ["python", "-m", "sbx.detector.main"]
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: HOME, value: /tmp }
-            - name: SBX_INTERNAL_KEY
-              valueFrom: { secretKeyRef: { name: sbx-internal, key: key } }
+            - name: SBX_INTERNAL_KEY      # its own key only
+              valueFrom: { secretKeyRef: { name: sbx-internal, key: detector-key } }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

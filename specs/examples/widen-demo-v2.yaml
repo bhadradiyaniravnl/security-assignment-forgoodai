@@ -1,4 +1,4 @@
-# EXPECTED REJECTION: widens access (new tool) without securityApproval
+# Widening v2 (adds WebFetch): needs a security approval of this exact digest before registration.
 apiVersion: sbx/v1
 kind: AgentSpec
 metadata:

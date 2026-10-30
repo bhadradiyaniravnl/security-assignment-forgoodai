@@ -35,8 +35,8 @@ cp = ControlPlane()
 
 
 async def session_policy(request: web.Request) -> dict:
-    if not internal.check(request.headers.get(internal.HEADER)):
-        raise web.HTTPUnauthorized(text="internal auth required")
+    if internal.caller(request.headers.get(internal.HEADER)) != "gateway":
+        raise web.HTTPUnauthorized(text="gateway key required")
     sid = request.headers.get("X-Sbx-Session", "")
     status, body = await cp.policy(sid)
     if status != 200 or body.get("state") != "running":
@@ -65,6 +65,8 @@ async def anthropic(request: web.Request) -> web.StreamResponse:
     ctx = await session_policy(request)
     if GRANT_ANTHROPIC not in ctx["policy"].get("grants", []):
         raise web.HTTPForbidden(text="credential not granted by spec")
+    if request.method != "POST" or request.match_info["tail"] not in ("v1/messages", "v1/messages/count_tokens"):
+        raise web.HTTPForbidden(text="endpoint not allowed")       # second layer behind the gateway
     headers = clean_headers(request.headers)
     headers["x-api-key"] = ANTHROPIC_KEY
     headers.pop("anthropic-workspace-id", None)
@@ -139,8 +141,8 @@ async def github_publish(request: web.Request) -> web.Response:
 async def tunnel(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
-        if not internal.check(hello.get("key")):
-            raise PermissionError("internal auth")
+        if internal.caller(hello.get("key")) != "gateway":
+            raise PermissionError("gateway key required")
         status, ctx = await cp.policy(hello.get("session_id", ""))
         if status != 200 or ctx.get("state") != "running":
             raise PermissionError("session not running")

@@ -15,6 +15,7 @@ from sbx.control_plane import baseline
 
 SPECS_DIR = os.environ.get("SPECS_DIR", "/app/specs")
 SPEC_AUTHORS = set(filter(None, os.environ.get("SBX_SPEC_AUTHORS", "").split(",")))
+SECURITY_APPROVERS = set(filter(None, os.environ.get("SBX_SECURITY_APPROVERS", "secops").split(",")))
 NAME_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 
 
@@ -47,8 +48,77 @@ def register(store, raw: bytes, by: str) -> dict:
     errors, warnings = baseline.check(spec, prev)
     if errors:
         raise SpecError("rejected by org baseline", errors)
+    reasons = approval_reasons(spec, prev)
+    if reasons and not by.startswith("system:"):
+        # Two-person rule: an approver other than the author must have approved these exact bytes.
+        approvers = [a for a in store.approvers_of(digest) if a in SECURITY_APPROVERS and a != by]
+        if not approvers:
+            raise SpecError("security approval required", [f"needs approval of digest {digest} by a security "
+                                                           f"approver other than {by}: " + "; ".join(reasons)])
+        warnings = warnings + [f"approved by {', '.join(approvers)}: " + "; ".join(reasons)]
     store.add_spec(name, spec["metadata"]["version"], digest, raw, by, warnings)
     return {"name": name, "version": spec["metadata"]["version"], "digest": digest, "warnings": warnings}
+
+
+def approve(store, raw: bytes, by: str) -> dict:
+    """A security approver approves the exact spec bytes (digest) ahead of registration."""
+    if by not in SECURITY_APPROVERS:
+        raise PermissionError(f"{by} is not a security approver")
+    spec = yaml.safe_load(raw)
+    if not isinstance(spec, dict):
+        raise SpecError("spec must be a mapping")
+    errors, _ = baseline.check(spec, None)
+    if errors:
+        raise SpecError("will not approve a spec that fails the org baseline", errors)
+    name, version, digest = spec["metadata"]["name"], spec["metadata"]["version"], digest_of(raw)
+    store.add_approval(digest, name, version, by)
+    return {"name": name, "version": version, "digest": digest, "approved_by": by}
+
+
+def approval_reasons(spec: dict, prev: dict | None) -> list[str]:
+    reasons = []
+    if prev is None:
+        reasons.append("new spec")
+    else:
+        reasons += widening(prev, spec)
+    tools = spec["spec"].get("agentTools", {}).get("allow", [])
+    if any(t in baseline.BASELINE["broad_tools"] for t in tools):
+        reasons.append("unrestricted Bash")
+    return reasons
+
+
+def widening(old: dict, new: dict) -> list[str]:
+    """Everything the new version can do that the old one could not, over the whole compiled policy."""
+    o, n = compile_policy(old), compile_policy(new)
+    out = []
+    for k in ("egress_allow", "model_allow", "grants", "agent_tools"):
+        added = sorted(set(n[k]) - set(o[k]))
+        if added:
+            out.append(f"new {k} {added}")
+    for k in ("image", "runtime_class"):
+        if n["runtime"][k] != o["runtime"][k]:
+            out.append(f"runtime.{k} changed")
+    for k, conv in (("ttl_s", float), ("cpu", float), ("memory", baseline._mem_gi)):
+        if (conv(n["runtime"][k]) or 0) > (conv(o["runtime"][k]) or 0):
+            out.append(f"larger runtime.{k}")
+    if n["max_tokens"] > o["max_tokens"]:
+        out.append("larger token budget")
+    if (n["deny_burst"]["count"] > o["deny_burst"]["count"]
+            or n["deny_burst"]["window_s"] < o["deny_burst"]["window_s"]):
+        out.append("weaker D2 burst threshold")
+    if n["output"]["type"] != o["output"]["type"] or (o["output"]["draft"] and not n["output"]["draft"]):
+        out.append("output type/draft changed")
+    removed = sorted(set(o["output"]["protected_paths"]) - set(n["output"]["protected_paths"]))
+    if removed:
+        out.append(f"protected paths removed {removed}")
+    if set(new["metadata"].get("owners", [])) - set(old["metadata"].get("owners", [])):
+        out.append("new owners")
+    if new["spec"].get("mcp") != old["spec"].get("mcp"):
+        out.append("mcp changed")
+    if not all(any(fnmatch.fnmatchcase(p, q) for q in old["spec"]["repo"]["allow"])
+               for p in new["spec"]["repo"]["allow"]):
+        out.append("broader repo.allow")
+    return out
 
 
 def bootstrap(store) -> list[dict]:

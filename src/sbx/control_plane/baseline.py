@@ -69,6 +69,9 @@ SCHEMA = {
 }
 
 
+REPO_PATTERN = re.compile(r"^(github:)?[a-z0-9-]+/(\*|[a-z0-9][a-z0-9._-]*)$")
+
+
 def _ttl_s(v) -> int | None:
     m = re.fullmatch(r"(\d+)([smh])", str(v))
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)] if m else None
@@ -167,8 +170,8 @@ def check(spec: dict, previous: dict | None = None) -> tuple[list[str], list[str
     if s["repo"]["access"] not in B["repo_access"]:
         errors.append(f"repo.access {s['repo']['access']}: sandboxes get read-only copies; writes are the control plane's")
     for p in s["repo"]["allow"]:
-        if p.strip() in ("*", "*/*", "**"):
-            errors.append(f"repo.allow {p}: too broad; name an org/prefix")
+        if not REPO_PATTERN.match(p):
+            errors.append(f"repo.allow {p}: must be an exact repo or 'org/*' (optionally github:-prefixed)")
 
     # tools: broad shell needs an explicit, attributable risk acceptance
     tools = s.get("agentTools", {}).get("allow", [])
@@ -192,11 +195,6 @@ def check(spec: dict, previous: dict | None = None) -> tuple[list[str], list[str
 
     if previous:
         errors += _versioning(spec, previous)
-        widened = widening(previous, spec)
-        if widened and not ann.get("securityApproval"):
-            errors.append("widens access (" + "; ".join(widened) + "): requires metadata.annotations.securityApproval")
-        elif widened:
-            warnings.append(f"widens access, approved: {ann['securityApproval']}")
     return errors, warnings
 
 
@@ -205,25 +203,3 @@ def _versioning(spec: dict, previous: dict) -> list[str]:
     if v <= pv:
         return [f"metadata.version {v}: must be greater than the registered version {pv} (specs are immutable)"]
     return []
-
-
-def widening(old: dict, new: dict) -> list[str]:
-    """What the new version can do that the old one could not."""
-    o, n, out = old["spec"], new["spec"], []
-    added = set(n["egress"]["allow"]) - set(o["egress"]["allow"])
-    if added:
-        out.append(f"new egress {sorted(added)}")
-    added = {g["ref"] for g in n["secrets"]} - {g["ref"] for g in o["secrets"]}
-    if added:
-        out.append(f"new secrets {sorted(added)}")
-    added = set(n.get("agentTools", {}).get("allow", [])) - set(o.get("agentTools", {}).get("allow", []))
-    if added:
-        out.append(f"new tools {sorted(added)}")
-    added = set(n["model"]["allow"]) - set(o["model"]["allow"])
-    if added:
-        out.append(f"new models {sorted(added)}")
-    if not all(any(fnmatch.fnmatchcase(p, q) for q in o["repo"]["allow"]) for p in n["repo"]["allow"]):
-        out.append("broader repo.allow")
-    if (_ttl_s(n["runtime"]["ttl"]) or 0) > (_ttl_s(o["runtime"]["ttl"]) or 0):
-        out.append(f"longer ttl {n['runtime']['ttl']}")
-    return out

@@ -16,7 +16,8 @@ import re
 from collections import defaultdict, deque
 from datetime import datetime
 
-DENY_REASONS = {"default_deny", "model_not_allowed", "budget", "credproxy_refused"}
+DENY_REASONS = {"default_deny", "model_not_allowed", "budget", "credproxy_refused", "path_not_allowed",
+                "provider_side_capability", "provider_side_tool", "remote_content_source", "malformed_request"}
 ACTING_TOOLS = {"Bash", "WebFetch", "WebSearch", "BashOutput", "Task"}
 
 

@@ -20,12 +20,27 @@ from sbx.gateway.common import cp, evidence, session_fields, sha256
 
 MAX_HEADER = 64 * 1024
 MAX_BODY = 16 * 1024 * 1024
+MAX_RESPONSE = 32 * 1024 * 1024
+BODY_TIMEOUT_S = 30
+MAX_CONN_PER_IP = 16          # one sandbox must not be able to exhaust the shared gateway
+_active: dict[str, int] = {}
 DROP = {"proxy-authorization", "proxy-connection", "connection", "keep-alive", "host", "content-length",
         "transfer-encoding"}
 
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, http: aiohttp.ClientSession) -> None:
     peer = (writer.get_extra_info("peername") or ("", 0))[0]
+    if _active.get(peer, 0) >= MAX_CONN_PER_IP:
+        await evidence.write("egress_deny", pod_ip=peer, decision="deny", reason="connection_limit")
+        return await reply(writer, 429, "too many concurrent connections")
+    _active[peer] = _active.get(peer, 0) + 1
+    try:
+        await _handle(reader, writer, http, peer)
+    finally:
+        _active[peer] -= 1
+
+
+async def _handle(reader, writer, http: aiohttp.ClientSession, peer: str) -> None:
     try:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
     except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
@@ -70,7 +85,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, htt
             return await reply(writer, 403, "destination not allowed by spec")
         return await tunnel(reader, writer, base, ctx["session_id"], host, port)
 
-    body = await _read_body(reader, headers)
+    try:
+        body = await asyncio.wait_for(_read_body(reader, headers), BODY_TIMEOUT_S)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
+        body = None
     if body is None:
         return await reply(writer, 413, "body too large or malformed")
     visible = target.encode() + b"\n" + "\n".join(f"{k}: {v}" for k, v in headers.items()
@@ -86,7 +104,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, htt
     fwd.update({"X-Sbx-Session": ctx["session_id"], "X-Sbx-Target": target})
     try:
         async with http.request(method, f"{internal.CREDPROXY_URL}/egress", headers=fwd, data=body) as up:
-            data = await up.read()
+            data = await up.content.read(MAX_RESPONSE + 1)
+            if len(data) > MAX_RESPONSE:
+                await evidence.write("egress_http", **base, decision="deny", reason="response_too_large")
+                return await reply(writer, 502, "upstream response too large")
             await evidence.write("egress_http", **base, decision="allow", reason="spec_allowlist",
                                  status=up.status, bytes_in=len(data))
             ctype = up.headers.get("content-type", "application/octet-stream")
@@ -148,10 +169,10 @@ async def _read_body(reader: asyncio.StreamReader, headers: dict) -> bytes | Non
             if size == 0:
                 await reader.readline()
                 return out
+            if size < 0 or len(out) + size > MAX_BODY:     # check BEFORE buffering the chunk
+                return None
             out += await reader.readexactly(size)
             await reader.readline()
-            if len(out) > MAX_BODY:
-                return None
     n = int(headers.get("content-length", "0") or 0)
     if n > MAX_BODY:
         return None

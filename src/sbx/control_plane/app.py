@@ -2,7 +2,9 @@
 
 Public (sbxctl, via NodePort bound to 127.0.0.1): runs, sessions, logs, stop, destroy, diff.
   Prototype identity is the X-User header; production replaces it with OIDC.
-Internal (X-Sbx-Internal): token validation, compiled policy, revocation, registration.
+Internal (X-Sbx-Internal, per-component keys): token validation (gateway), compiled policy
+(gateway, credproxy, detector), alerts (detector). There is deliberately no internal way to create
+a session: every session goes through /runs, i.e. the spec registry and its baseline.
 """
 from __future__ import annotations
 
@@ -26,14 +28,23 @@ def _startup() -> None:
     sessions.reconcile_forever(store)
 
 
-def require_internal(x_sbx_internal: str | None = Header(default=None)) -> None:
-    if not internal.check(x_sbx_internal):
-        raise HTTPException(401, "internal auth required")
+def scope(*allowed: str):
+    """Dependency: internal endpoint callable only by the listed components."""
+    def dep(x_sbx_internal: str | None = Header(default=None)) -> str:
+        who = internal.caller(x_sbx_internal)
+        if who is None:
+            raise HTTPException(401, "internal auth required")
+        if who not in allowed:
+            raise HTTPException(403, f"{who} may not call this endpoint")
+        return who
+    return dep
 
 
 def require_user(x_user: str | None = Header(default=None)) -> str:
     if not x_user:
         raise HTTPException(401, "X-User required")
+    if x_user.startswith("system:"):                      # reserved for in-process callers (bootstrap)
+        raise HTTPException(400, "reserved identity")
     return x_user
 
 
@@ -58,6 +69,20 @@ async def register_spec(request: Request, user: str = Depends(require_user)) -> 
         raise HTTPException(422, {"error": str(e), "reasons": e.details or [str(e)]}) from None
     if not r.get("unchanged"):
         sessions.evidence.write_sync("spec_registered", by=user, **r)
+    return r
+
+
+@app.post("/specs/approvals")
+async def approve_spec(request: Request, user: str = Depends(require_user)) -> dict:
+    """Security approvers approve exact spec bytes; authors then register them (two-person rule)."""
+    raw = await request.body()
+    try:
+        r = specs.approve(store, raw, user)
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from None
+    except specs.SpecError as e:
+        raise HTTPException(422, {"error": str(e), "reasons": e.details or [str(e)]}) from None
+    sessions.evidence.write_sync("spec_approved", **r)
     return r
 
 
@@ -151,7 +176,7 @@ class AlertIn(BaseModel):
     contain: bool = False
 
 
-@app.post("/internal/alerts", dependencies=[Depends(require_internal)])
+@app.post("/internal/alerts", dependencies=[Depends(scope("detector"))])
 def raise_alert(a: AlertIn) -> dict:
     """Alert sink for the detector. Joins user/spec from the registry so every alert links
     initiating user -> session -> observed action. The alert is recorded at detection time,
@@ -177,12 +202,12 @@ class VerificationIn(BaseModel):
     sources: dict
 
 
-@app.post("/internal/alerts/verification", dependencies=[Depends(require_internal)])
+@app.post("/internal/alerts/verification", dependencies=[Depends(scope("detector"))])
 def verify_alert(v: VerificationIn) -> dict:
     return sessions.alerts.write_sync("containment_verification", **v.model_dump())
 
 
-@app.get("/internal/alerts", dependencies=[Depends(require_internal)])
+@app.get("/internal/alerts", dependencies=[Depends(scope("detector"))])
 def internal_alerts() -> list:
     return _read_alerts()
 
@@ -207,19 +232,6 @@ def _public(s: dict) -> dict:
                                   "pod_ip", "state", "detail", "turns", "created_at", "ended_at")}
 
 
-class SessionIn(BaseModel):
-    session_id: str
-    user: str
-    spec_name: str
-    spec_digest: str
-    token: str
-    pod_ip: str
-    pod_name: str | None = None
-    policy: dict
-    canaries: list = []
-    params: dict = {}
-
-
 class ValidateIn(BaseModel):
     token: str
     ip: str
@@ -230,13 +242,7 @@ def healthz() -> dict:
     return {"ok": True}
 
 
-@app.post("/internal/sessions", dependencies=[Depends(require_internal)])
-def register(s: SessionIn) -> dict:
-    store.create(**s.model_dump(exclude={"pod_ip", "pod_name"}), pod_ip=s.pod_ip, pod_name=s.pod_name, state="running")
-    return {"session_id": s.session_id}
-
-
-@app.post("/internal/validate", dependencies=[Depends(require_internal)])
+@app.post("/internal/validate", dependencies=[Depends(scope("gateway"))])
 def validate(v: ValidateIn) -> dict:
     s = store.by_token(v.token)
     if s is None:
@@ -248,20 +254,12 @@ def validate(v: ValidateIn) -> dict:
     return _context(s)
 
 
-@app.get("/internal/policy/{session_id}", dependencies=[Depends(require_internal)])
+@app.get("/internal/policy/{session_id}", dependencies=[Depends(scope("gateway", "credproxy", "detector"))])
 def policy(session_id: str) -> dict:
     s = store.get(session_id)
     if s is None:
         raise HTTPException(404, "no such session")
     return {**_context(s), "policy": s["policy"], "canaries": s["canaries"]}
-
-
-@app.post("/internal/revoke/{session_id}", dependencies=[Depends(require_internal)])
-def revoke(session_id: str) -> dict:
-    if store.get(session_id) is None:
-        raise HTTPException(404, "no such session")
-    store.update(session_id, state="revoked")
-    return {"session_id": session_id, "state": "revoked"}
 
 
 def _context(s: dict) -> dict:

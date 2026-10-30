@@ -83,7 +83,8 @@ bin/sbxctl attach <sid>    # history + live stream; typed lines become follow-up
 bin/sbxctl contain <sid>   # manual containment
 bin/sbxctl alerts          # detections + containment verification
 bin/sbxctl destroy <sid>
-bin/sbxctl spec register specs/examples/widen-demo-v1.yaml
+SBX_USER=secops bin/sbxctl spec approve specs/examples/widen-demo-v1.yaml   # a security approver approves the digest
+bin/sbxctl spec register specs/examples/widen-demo-v1.yaml                  # then the author registers it
 ```
 
 ## 5. Tests

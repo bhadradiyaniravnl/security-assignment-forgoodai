@@ -1,7 +1,11 @@
 """AI gateway (:8080): Anthropic API reverse proxy that enforces the spec and records evidence.
 
 - Authenticates the session placeholder (x-api-key / bearer) bound to the pod IP.
-- Enforces model allowlist and cumulative token budget.
+- Allows only POST /v1/messages and /v1/messages/count_tokens, with a top-level model from the spec.
+- Rejects provider-side capabilities that would move data out through Anthropic's infrastructure,
+  outside our egress controls: server tools (web_fetch, web_search, code execution, ...), MCP
+  connectors (mcp_servers), containers, and URL- or file-sourced content the provider would fetch.
+- Enforces the cumulative token budget.
 - Drops every client-supplied credential; credproxy injects the real one.
 - Parses streamed responses for tool_use blocks: an "agent attempted" signal that does not
   depend on whether the later network action succeeds (detection D3).
@@ -18,9 +22,48 @@ from sbx.common.canary import scan
 from sbx.common.policy import host_allowed
 from sbx.gateway.common import cp, evidence, referenced_hosts, session_fields, sha256, usage
 
+ALLOWED_PATHS = {"/v1/messages", "/v1/messages/count_tokens"}
+ALLOWED_SOURCE_TYPES = {"base64", "text", "content"}
+FORBIDDEN_FIELDS = {"mcp_servers", "container"}
+
 HOP = {"connection", "keep-alive", "transfer-encoding", "host", "content-length", "authorization", "x-api-key",
        "accept-encoding"}
 MAX_TOOL_INPUT = 4096
+
+
+def request_policy(method: str, path: str, body: bytes, model_allow: list[str]) -> tuple[str | None, str | None]:
+    """Returns (model, deny_reason). Pure function: the whole request-shape policy lives here."""
+    if method != "POST" or path not in ALLOWED_PATHS:
+        return None, "path_not_allowed"
+    try:
+        req = json.loads(body)
+    except ValueError:
+        return None, "malformed_request"
+    if not isinstance(req, dict):
+        return None, "malformed_request"
+    model = req.get("model")
+    if not isinstance(model, str) or model not in model_allow:
+        return model if isinstance(model, str) else None, "model_not_allowed"
+    if FORBIDDEN_FIELDS & set(req):
+        return model, "provider_side_capability"
+    for tool in req.get("tools") or []:
+        if not isinstance(tool, dict) or tool.get("type", "custom") != "custom":
+            return model, "provider_side_tool"
+    if _has_remote_source(req.get("messages")) or _has_remote_source(req.get("system")):
+        return model, "remote_content_source"
+    return model, None
+
+
+def _has_remote_source(node) -> bool:
+    """True if any content block asks the provider to fetch something (URL) or read stored files."""
+    if isinstance(node, dict):
+        src = node.get("source")
+        if isinstance(src, dict) and src.get("type") not in ALLOWED_SOURCE_TYPES:
+            return True
+        return any(_has_remote_source(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_remote_source(v) for v in node)
+    return False
 
 
 def _token(request: web.Request) -> str:
@@ -44,25 +87,20 @@ async def handle(request: web.Request) -> web.StreamResponse:
     policy, canaries, who = pol["policy"], pol.get("canaries", []), session_fields(ctx)
 
     body = await request.read()
-    model = None
-    if path.startswith("/v1/messages") and body:
-        try:
-            model = json.loads(body).get("model")
-        except ValueError:
-            pass
+    model, deny = request_policy(request.method, path, body, policy.get("model_allow", []))
     match = scan(body, canaries)
-    base = dict(**who, path=path, model=model, bytes_out=len(body), body_sha256=sha256(body),
-                dest_host="api.anthropic.com", canary_match=match)
+    base = dict(**who, path=path, method=request.method, model=model, bytes_out=len(body),
+                body_sha256=sha256(body), dest_host="api.anthropic.com", canary_match=match)
 
-    if model and model not in policy.get("model_allow", []):
-        await evidence.write("ai_request", **base, decision="deny", reason="model_not_allowed")
+    if deny:
+        await evidence.write("ai_request", **base, decision="deny", reason=deny)
         return web.json_response({"type": "error", "error": {"type": "permission_error",
-                                  "message": f"sbx: model {model} not allowed by spec"}}, status=403)
+                                  "message": f"sbx: request denied by spec ({deny})"}}, status=403)
     if usage.get(ctx["session_id"], 0) >= policy.get("max_tokens", 0):
         await evidence.write("ai_request", **base, decision="deny", reason="budget")
         return web.json_response({"type": "error", "error": {"type": "rate_limit_error",
                                   "message": "sbx: session token budget exhausted"}}, status=429)
-    await evidence.write("ai_request", **base, decision="allow", reason="spec_allowlist")
+    await evidence.write("ai_request", **base, decision="allow", reason="spec_policy")
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
     headers.update(internal.headers())
@@ -144,8 +182,25 @@ class ResponseInspector:
                              refs_env_file=".env" in raw_input, refs_disallowed_hosts=hosts)
 
 
+MAX_INFLIGHT_PER_IP = 8
+_inflight: dict[str, int] = {}
+
+
+@web.middleware
+async def per_ip_limit(request: web.Request, handler):
+    ip = request.remote or ""
+    if _inflight.get(ip, 0) >= MAX_INFLIGHT_PER_IP:
+        return web.json_response({"type": "error", "error": {"type": "rate_limit_error",
+                                  "message": "sbx: too many concurrent requests"}}, status=429)
+    _inflight[ip] = _inflight.get(ip, 0) + 1
+    try:
+        return await handler(request)
+    finally:
+        _inflight[ip] -= 1
+
+
 def build_app() -> web.Application:
-    app = web.Application(client_max_size=32 * 1024 * 1024)
+    app = web.Application(client_max_size=32 * 1024 * 1024, middlewares=[per_ip_limit])
 
     async def startup(a):
         a["http"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600), auto_decompress=False)

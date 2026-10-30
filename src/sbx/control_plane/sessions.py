@@ -14,6 +14,7 @@ import secrets
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -30,6 +31,7 @@ CP_KEY = os.environ.get("SBX_CP_KEY", "")
 WORK = os.environ.get("CP_WORK", "/data/work")
 RESULTS = os.environ.get("CP_RESULTS", "/data/results")
 CHUNK = 60_000
+MAX_SUMMARY = 4000
 MAX_PR_DIFF = 1_000_000
 
 EVIDENCE_DIR = os.environ.get("EVIDENCE_DIR", "/evidence")
@@ -69,11 +71,10 @@ def run(store: Store, user: str, spec_name: str, params: dict) -> dict:
     try:
         commit = _clone(sid, params["repo"], os.path.join(workdir, "repo"), who)
     except Exception as e:
-        store.update(sid, state="failed", detail=f"clone failed: {e}"[:500], ended=True)
+        store.transition(sid, ("creating",), "failed", detail=f"clone failed: {e}"[:500], ended=True)
         evidence.write_sync("session_failed", **who, error=f"clone: {e}"[:500])
         raise SessionError(502, f"clone failed: {e}") from None
-    with open(os.path.join(workdir, "repo", ".env"), "w") as f:      # the canary: a "leaked" secret
-        f.write(f"PAYMENTS_API_KEY={canary['value']}\n")
+    _plant(os.path.join(workdir, "repo", ".env"), f"PAYMENTS_API_KEY={canary['value']}\n")   # the canary
     os.makedirs(os.path.join(workdir, "repo", ".git", "info"), exist_ok=True)
     with open(os.path.join(workdir, "repo", ".git", "info", "exclude"), "a") as f:
         f.write("\n.env\n")                                          # local-only ignore; never committed
@@ -82,13 +83,14 @@ def run(store: Store, user: str, spec_name: str, params: dict) -> dict:
     try:
         k8s.create_pod(k8s.sandbox_pod(sid, token, policy))
         pod = k8s.wait_ready(sid)
-        store.update(sid, pod_ip=pod["ip"], state="running")          # token becomes valid only now
+        if not store.transition(sid, ("creating",), "running", pod_ip=pod["ip"]):   # token becomes valid only now
+            raise RuntimeError(f"session left 'creating' during start ({store.get(sid)['state']})")
         evidence.write_sync("session_running", **who, pod_ip=pod["ip"], pod_uid=pod["uid"], node=pod["node"])
         _deliver(sid, workdir, {"task": params["task"], "allowed_tools": policy["agent_tools"]})
         evidence.write_sync("workspace_delivered", **who, commit=commit)
     except Exception as e:
-        store.update(sid, state="failed", detail=str(e)[:500], ended=True)
-        k8s.delete_pod(sid)
+        if store.transition(sid, ("creating", "running"), "failed", detail=str(e)[:500], ended=True):
+            k8s.delete_pod(sid)                                         # a contained pod is kept for forensics
         evidence.write_sync("session_failed", **who, error=str(e)[:500])
         raise SessionError(500, f"session start failed: {e}") from None
     return {"session_id": sid, "pod": k8s.pod_name(sid), "spec": spec_ref, "spec_digest": digest}
@@ -99,25 +101,30 @@ def stop(store: Store, sid: str, user: str) -> dict:
     if s["state"] not in ("running", "creating", "contained"):
         raise SessionError(409, f"session is {s['state']}")
     was_contained = s["state"] == "contained"
-    if not was_contained:
-        store.update(sid, state="stopping")                             # gateway rejects from here on
+    if not was_contained and not store.transition(sid, ("running", "creating"), "stopping"):
+        raise SessionError(409, f"session is {store.get(sid)['state']}")   # gateway rejects from here on
     diff, rc = "", None
     if k8s.pod_status(sid):
-        rc, diff, _ = k8s.exec_(sid, ["sh", "-c", "cd /workspace/repo && git add -A >/dev/null 2>&1; "
-                                                  "git -c core.pager=cat diff --cached"], timeout=30)
+        diff, rc = collect_diff(sid)
     os.makedirs(RESULTS, exist_ok=True)
     with open(os.path.join(RESULTS, f"{sid}.diff"), "w") as f:
         f.write(diff)
     pr = None
-    if not was_contained and s["policy"].get("output", {}).get("type") == "pull_request" and diff.strip():
-        pr = _publish(sid, s, diff)
+    if (not was_contained and store.get(sid)["state"] == "stopping"
+            and s["policy"].get("output", {}).get("type") == "pull_request" and diff.strip()):
+        pr = _publish(sid, s, diff)                                     # credproxy re-checks 'stopping' itself
     if was_contained:                                                   # keep the frozen pod for forensics
         evidence.write_sync("session_stop", session_id=sid, user=user, spec=s["spec_name"],
                             spec_digest=s["spec_digest"], diff_bytes=len(diff),
                             diff_sha256=hashlib.sha256(diff.encode()).hexdigest(), exec_rc=rc, pod_kept=True)
         return {"session_id": sid, "state": "contained", "diff_bytes": len(diff)}
+    if not store.transition(sid, ("stopping",), "stopped", detail="stopped by user", ended=True):
+        # Contained while we were stopping: keep the pod and the 'contained' state for forensics.
+        evidence.write_sync("session_stop", session_id=sid, user=user, spec=s["spec_name"],
+                            spec_digest=s["spec_digest"], diff_bytes=len(diff), contained_during_stop=True,
+                            diff_sha256=hashlib.sha256(diff.encode()).hexdigest(), exec_rc=rc, pod_kept=True)
+        return {"session_id": sid, "state": store.get(sid)["state"], "diff_bytes": len(diff), "pr": pr}
     k8s.delete_pod(sid)
-    store.update(sid, state="stopped", detail="stopped by user", ended=True)
     evidence.write_sync("session_stop", session_id=sid, user=user, spec=s["spec_name"], spec_digest=s["spec_digest"],
                         diff_bytes=len(diff), diff_sha256=hashlib.sha256(diff.encode()).hexdigest(), exec_rc=rc)
     if pr:
@@ -158,7 +165,9 @@ def contain(store: Store, sid: str, actor: str, alert_id: str | None = None, rea
     if s["state"] not in ("running", "creating", "stopping"):
         raise SessionError(409, f"session is {s['state']}")
     t0 = time.time()
-    store.update(sid, state="contained", detail=f"contained by {actor}: {reason}"[:500])     # 1. revoke
+    if not store.transition(sid, ("running", "creating", "stopping"), "contained",                  # 1. revoke
+                            detail=f"contained by {actor}: {reason}"[:500]):
+        return {"session_id": sid, "state": store.get(sid)["state"], "already": True}
     revoked_at = time.time()
     k8s.quarantine(sid)                                                                         # 2. isolate
     quarantined_at = time.time()
@@ -211,16 +220,54 @@ def _probe(sid: str) -> dict:
     return out
 
 
+SECURITY_ADMINS = set(filter(None, os.environ.get("SBX_SECURITY_ADMINS", "secops").split(",")))
+
+
 def destroy(store: Store, sid: str, user: str) -> dict:
-    s = _owned(store, sid, user)
-    if s["state"] in ("running", "creating", "stopping"):
-        store.update(sid, state="stopping")
+    """Owners destroy their own sessions, except contained ones: those hold forensic state and the
+    owner is the person the alert names, so only security admins may release them."""
+    s = store.get(sid)
+    if s is None:
+        raise SessionError(404, "no such session")
+    if s["state"] == "contained":
+        if user not in SECURITY_ADMINS:
+            raise SessionError(403, "contained sessions can only be destroyed by security admins")
+    else:
+        s = _owned(store, sid, user)
+    store.transition(sid, ("running", "creating", "stopping"), "stopping")
     k8s.delete_pod(sid)
     k8s.unquarantine(sid)
     shutil.rmtree(os.path.join(WORK, sid), ignore_errors=True)
     store.update(sid, state="destroyed", ended=True)
-    evidence.write_sync("session_destroy", session_id=sid, user=user, spec=s["spec_name"])
+    evidence.write_sync("session_destroy", session_id=sid, user=user, spec=s["spec_name"],
+                        released_from_containment=s["state"] == "contained")
     return {"session_id": sid, "state": "destroyed"}
+
+
+MAX_WORKSPACE_B64 = 64 * 1024 * 1024
+GIT_ISOLATED = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+
+def collect_diff(sid: str) -> tuple[str, int]:
+    """The diff is computed HERE, not by git in the pod: the agent controls the pod's git binary,
+    config (diff.external, textconv, aliases) and output. We copy out the working-tree files only,
+    lay them over our own pristine .git from clone time, and diff with an isolated git config."""
+    rc, b64, err = k8s.exec_(sid, ["sh", "-c", "tar -cz -C /workspace/repo --exclude=./.git . | base64 -w0"],
+                             timeout=120)
+    if rc != 0 or len(b64) > MAX_WORKSPACE_B64:
+        raise SessionError(502, f"workspace export failed (rc={rc}, {len(b64)} bytes): {err[:200]}")
+    pristine = os.path.join(WORK, sid, "repo", ".git")
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copytree(pristine, os.path.join(d, ".git"), symlinks=True)
+        with tarfile.open(fileobj=io.BytesIO(base64.b64decode(b64)), mode="r:gz") as tar:
+            tar.extractall(d, filter="data")          # rejects absolute paths, traversal, device files
+        env = {**GIT_ISOLATED, "HOME": d}
+        cfg = ["-c", "core.quotepath=off", "-c", "core.hooksPath=/dev/null", "-c", "diff.external="]
+        subprocess.run(["git", *cfg, "add", "-A"], cwd=d, env=env, check=True, capture_output=True, timeout=60)
+        out = subprocess.run(["git", *cfg, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--binary"],
+                             cwd=d, env=env, check=True, capture_output=True, text=True, timeout=60).stdout
+    return out, rc
 
 
 def _publish(sid: str, s: dict, diff: str) -> dict:
@@ -235,8 +282,11 @@ def _publish(sid: str, s: dict, diff: str) -> dict:
     out_cfg = s["policy"].get("output", {})
     who0 = {"session_id": sid, "user": s["user"], "spec": s["spec_name"], "spec_digest": s["spec_digest"]}
     hit = scan(diff.encode(), s["canaries"])
+    where = "diff"
+    if not hit:
+        hit, where = scan(summary.encode(), s["canaries"]), "agent summary"
     if hit or len(diff) > MAX_PR_DIFF:
-        reason = f"canary {hit['id']} ({hit['encoding']}) in diff" if hit else f"diff too large ({len(diff)} bytes)"
+        reason = f"canary {hit['id']} ({hit['encoding']}) in {where}" if hit else f"diff too large ({len(diff)} bytes)"
         evidence.write_sync("pr_refused", **who0, error=reason)
         if hit:   # the PR is an egress channel too: same rule as D1, raised by the control plane
             alerts.write_sync("alert", alert_id=f"al_pr_{sid}", rule="D1", severity="high", **who0,
@@ -244,13 +294,15 @@ def _publish(sid: str, s: dict, diff: str) -> dict:
                               evidence=[{"source": "control-plane", "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}],
                               pod=s["pod_name"], pod_ip=s["pod_ip"])
         return {"error": reason}
-    # Untrusted text: quote it and break @mentions so an injected agent can't ping people via our PR.
-    safe = (summary or "(no summary)").replace("@", "@\u200b")
-    quoted = "\n".join("> " + l for l in safe.splitlines()[:60])
+    # Untrusted text rendered inert: inside a code fence nothing renders (no images, links, HTML,
+    # mentions), so GitHub never fetches agent-chosen URLs. Fence-breaking backticks are neutralised.
+    inert = (summary or "(no summary)").replace("`", "\u02cb")[:MAX_SUMMARY]
+    quoted = "```text\n" + inert + "\n```"
+    task_txt = s["params"].get("task", "")[:300].replace("`", "'").replace("|", "/").replace("\n", " ")
     body = (f"Opened by the sandboxed agent platform. **Requires human review.**\n\n"
             f"| | |\n|---|---|\n| Requested by | `{s['user']}` |\n| Session | `{sid}` |\n"
             f"| Spec | `{s['spec_name']}` |\n| Spec digest | `{s['spec_digest']}` |\n"
-            f"| Task | {s['params'].get('task', '')[:300]} |\n\n"
+            f"| Task | `{task_txt}` |\n\n"
             f"### Agent summary (untrusted, written by the agent)\n\n{quoted}\n")
     title = f"agent: {s['params'].get('task', 'changes')[:60]} ({sid})"
     who = {"session_id": sid, "user": s["user"], "spec": s["spec_name"], "spec_digest": s["spec_digest"]}
@@ -285,7 +337,8 @@ def reconcile_forever(store: Store, interval: float = 5.0) -> None:
                 st = k8s.pod_status(s["session_id"])
                 if st is None or st["phase"] in ("Failed", "Succeeded"):
                     reason = "pod missing" if st is None else f"{st['phase']}:{st['reason']}"
-                    store.update(s["session_id"], state="ended", detail=reason, ended=True)
+                    if not store.transition(s["session_id"], ("running",), "ended", detail=reason, ended=True):
+                        continue
                     evidence.write_sync("session_ended", session_id=s["session_id"], user=s["user"],
                                         spec=s["spec_name"], reason=reason)
             time.sleep(interval)
@@ -299,6 +352,16 @@ def _owned(store: Store, sid: str, user: str) -> dict:
     if s["user"] != user:
         raise SessionError(403, "not your session")
     return s
+
+
+def _plant(path: str, content: str) -> None:
+    """Writes the canary without following anything the repo put there (a committed `.env` symlink
+    pointing at /evidence/... or /data/cp.db would otherwise make us overwrite our own files)."""
+    if os.path.lexists(path):
+        os.unlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
 
 
 def _credproxy(path: str, body: dict, timeout: int = 180):

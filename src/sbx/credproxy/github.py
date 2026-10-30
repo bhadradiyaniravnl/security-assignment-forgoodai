@@ -23,7 +23,7 @@ API = "https://api.github.com"
 APP_ID = os.environ.get("GITHUB_APP_ID", "")
 KEY_PATH = os.environ.get("GITHUB_APP_KEY", "/secrets/github/app.pem")
 REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
-GIT_ENV = {"HOME": "/tmp", "GIT_TERMINAL_PROMPT": "0", "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+GIT_ENV = {"HOME": "/tmp", "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
            "GIT_AUTHOR_NAME": "sbx-agent-platform", "GIT_AUTHOR_EMAIL": "sbx-agent-platform@users.noreply.github.com",
            "GIT_COMMITTER_NAME": "sbx-agent-platform", "GIT_COMMITTER_EMAIL": "sbx-agent-platform@users.noreply.github.com"}
 
@@ -116,6 +116,29 @@ def changed_paths(diff: str) -> list[str]:
     return sorted(paths)
 
 
+def _check_staged(dest: str, protected: list[str]) -> list[str]:
+    raw = _git(["-c", "core.quotepath=off", "diff", "--cached", "--raw", "-z", "--no-renames"], cwd=dest)
+    fields = raw.split("\0")
+    paths, bad = [], []
+    i = 0
+    while i < len(fields) - 1:
+        meta, path = fields[i], fields[i + 1]
+        i += 2
+        if not meta.startswith(":"):
+            continue
+        old_mode, new_mode = meta[1:].split()[:2]
+        paths.append(path)
+        if any(path == pp.rstrip("/") or path.startswith(pp) for pp in protected):
+            bad.append(f"{path} (protected)")
+        if new_mode in ("120000", "160000") or old_mode in ("120000", "160000"):
+            bad.append(f"{path} (symlink/submodule)")
+    if bad:
+        raise GitHubError(f"diff touches protected paths: {bad}")
+    if not paths:
+        raise GitHubError("empty diff")
+    return sorted(paths)
+
+
 def publish(repo: str, base: str, branch: str, diff: str, title: str, body: str,
             protected: list[str], draft: bool = True) -> dict:
     """Applies the agent's diff to a fresh clone of `base`, pushes `branch`, opens a draft PR."""
@@ -131,6 +154,9 @@ def publish(repo: str, base: str, branch: str, diff: str, title: str, body: str,
         _git(["checkout", "-q", "-b", branch], cwd=dest)
         _git(["apply", "--whitespace=nowarn", "-"], cwd=dest, stdin=diff)
         _git(["add", "-A"], cwd=dest)
+        # Authoritative check on what git actually staged (paths and modes), not on the diff text:
+        # the text can hide paths (quoting, header-less hunks) that `git apply` still writes.
+        paths = _check_staged(dest, protected)
         _git(["commit", "-q", "-m", title], cwd=dest)
         commit = _git(["rev-parse", "HEAD"], cwd=dest).strip()
         _git(["push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=dest, token=tok)

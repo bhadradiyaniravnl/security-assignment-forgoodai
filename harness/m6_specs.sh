@@ -31,18 +31,26 @@ for f in specs/bad/*.yaml; do
   check "$n" rejected "$ok"
 done
 
-echo "--- authorization, immutability, widening (unique spec name per run, so the test is repeatable)"
+echo "--- two-person rule: authors register, security approvers approve exact digests"
 TMP=$(mktemp -d); WD="widen-demo-$(openssl rand -hex 3)"
 for f in specs/examples/widen-demo-*.yaml; do sed "s/name: widen-demo$/name: $WD/" "$f" > "$TMP/$(basename "$f")"; done
+appr() { curl -s -o /tmp/claude-501-m6.json -w '%{http_code}' -X POST "$API/specs/approvals" -H "X-User: $2" \
+           -H 'content-type: application/yaml' --data-binary @"$1"; }
 check "non-author cannot register" 403 "$(reg $TMP/widen-demo-v1.yaml mallory)"
-code=$(reg $TMP/widen-demo-v1.yaml); check "author registers $WD v1" 200 "$code"
+check "reserved identity system:* rejected" 400 "$(reg $TMP/widen-demo-v1.yaml system:evil)"
+check "new spec without approval rejected" "422 approval" "$(reg $TMP/widen-demo-v1.yaml) $(reason | grep -q 'security approver' && echo approval)"
+check "author cannot approve (not an approver)" 403 "$(appr $TMP/widen-demo-v1.yaml "$(whoami)")"
+check "approver approves v1 digest" 200 "$(appr $TMP/widen-demo-v1.yaml secops)"
+check "approver cannot register (not an author)" 403 "$(reg $TMP/widen-demo-v1.yaml secops)"
+check "author registers approved v1" 200 "$(reg $TMP/widen-demo-v1.yaml)"
 code=$(reg $TMP/widen-demo-v1-mutated.yaml)
 check "same version, new content rejected" "422 immutable" "$code $(reason | grep -q 'immutable' && echo immutable)"
 code=$(reg $TMP/widen-demo-v2.yaml)
-check "widening v2 without approval rejected" "422 approval" "$code $(reason | grep -q 'securityApproval' && echo approval)"
-code=$(reg $TMP/widen-demo-v2-approved.yaml)
-check "widening v2 with securityApproval accepted" 200 "$code"
-check "approval recorded as a warning" yes "$(python3 -c 'import json; print("yes" if any("approved" in w for w in json.load(open("/tmp/claude-501-m6.json")).get("warnings",[])) else "no")')"
+check "widening v2 without approval rejected" "422 widen" "$code $(reason | grep -q 'new agent_tools' && echo widen)"
+check "approver approves v2 digest" 200 "$(appr $TMP/widen-demo-v2.yaml secops)"
+code=$(reg $TMP/widen-demo-v2.yaml)
+check "widening v2 registers after approval" 200 "$code"
+check "approval recorded on registration" yes "$(python3 -c 'import json; print("yes" if any("approved by secops" in w for w in json.load(open("/tmp/claude-501-m6.json")).get("warnings",[])) else "no")')"
 V2DIGEST=$(python3 -c 'import json; print(json.load(open("/tmp/claude-501-m6.json")).get("digest",""))')
 
 echo "--- runs bind to the latest registered version"
@@ -78,6 +86,7 @@ check "compliant pod admitted" admitted          "$(r=$(weak ok 'sbx/session: x'
 echo "--- evidence"
 EV=$(kubectl -n sbx-system exec deploy/control-plane -- cat /evidence/control-plane.jsonl)
 check "rejections recorded with reasons" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_rejected" and e.get("reasons"))>=14 else "no")')"
+check "approvals recorded" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_approved" and e.get("approved_by")=="secops")>=2 else "no")')"
 check "registrations recorded" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if any(e["action"]=="spec_registered" and e.get("name","").startswith("widen-demo") and e.get("version")==2 for e in ev) else "no")')"
 rm -rf /tmp/claude-501-m6.json "$TMP"
 echo; echo "passed=$pass failed=$fail"
