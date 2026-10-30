@@ -6,6 +6,7 @@ and a credentials proxy outside it. Every capability comes from a reviewed, vers
 spec**. A detector watches gateway evidence and Cilium/Hubble flows, and it **automatically contains**
 canary exfiltration and bypass attempts. A one-command harness then tries to break all of this.
 
+- **Architecture (how the whole system is built):** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - **Threat model and results (2 pages):** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Setup:** [docs/SETUP.md](docs/SETUP.md)
 - **Detailed design and build log:** [docs/DESIGN.md](docs/DESIGN.md)
