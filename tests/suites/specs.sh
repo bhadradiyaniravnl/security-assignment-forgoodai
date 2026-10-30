@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.." && source tests/lib.sh
 LAST=$(mktemp)                 # body of the last API response
 API=http://127.0.0.1:8443
-reg() { curl -s -o "$LAST" -w '%{http_code}' -X POST "$API/specs" -H "X-User: ${2:-$(whoami)}" \
+reg() { curl -s -o "$LAST" -w '%{http_code}' -X POST "$API/specs" -H "X-User: ${2:-${SBX_USER:-dev}}" \
           -H 'content-type: application/yaml' --data-binary @"$1"; }
 reason() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])).get("detail",{}); print(" | ".join(d.get("reasons",[])) if isinstance(d,dict) else d)' "$LAST" 2>/dev/null; }
 
@@ -38,7 +38,7 @@ appr() { curl -s -o "$LAST" -w '%{http_code}' -X POST "$API/specs/approvals" -H 
 check "non-author cannot register" 403 "$(reg $TMP/widen-demo-v1.yaml mallory)"
 check "reserved identity system:* rejected" 400 "$(reg $TMP/widen-demo-v1.yaml system:evil)"
 check "new spec without approval rejected" "422 approval" "$(reg $TMP/widen-demo-v1.yaml) $(reason | contains 'security approver' && echo approval)"
-check "author cannot approve (not an approver)" 403 "$(appr $TMP/widen-demo-v1.yaml "$(whoami)")"
+check "author cannot approve (not an approver)" 403 "$(appr $TMP/widen-demo-v1.yaml "${SBX_USER:-dev}")"
 check "approver approves v1 digest" 200 "$(appr $TMP/widen-demo-v1.yaml secops)"
 check "approver cannot register (not an author)" 403 "$(reg $TMP/widen-demo-v1.yaml secops)"
 check "author registers approved v1" 200 "$(reg $TMP/widen-demo-v1.yaml)"

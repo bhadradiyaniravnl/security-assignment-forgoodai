@@ -28,8 +28,8 @@ What happened while building it, kept because the lessons are part of the result
 - **Agent self-reports are unreliable.** In a multi-turn session the agent said it had never opened, and later
   never edited, `slug.py`. The gateway's tool_use evidence and the trusted diff showed both. Ground truth comes
   from platform evidence, never from the agent, which is why PR bodies quote its summary as untrusted text.
-- **Injection hurts availability, not just confidentiality.** The provider's usage-policy check refused about half
-  of the injected runs, which also broke the legitimate task. No agent warned the user about the injected
+- **Injection hurts availability, not just confidentiality.** The provider's usage-policy check refused 3 of the 6
+  injected runs in the shipped report, which also broke the legitimate task. No agent warned the user about the injected
   instructions; one quietly deleted them.
 - **D3 false positive.** An `Edit` that quoted the injected block in order to delete it fired D3. D3 now counts
   host and `.env` references only in tools that act (Bash, WebFetch, MCP); a canary in any tool input still fires.
@@ -53,5 +53,5 @@ where they leak, not merely discouraged.
   traffic forwarded.
 - **Clean-room rebuild:** `make down && make up` about 5 min with cached images; first build 10–15 min.
 - **A real agent fix of `slugkit`:** about 18 s, 7 turns, $0.09; the diff touches only `slug.py`.
-- **Real GitHub run:** 52 passing tests plus 9 strict xfails documenting 4 real bugs
-  ([PR #1](https://github.com/bhadradiyaniravnl/items-api-sample/pull/1)).
+- **Real GitHub run:** 52 passing tests plus 9 strict xfails documenting 4 real bugs, as a draft PR on the
+  author's private repository.

@@ -5,7 +5,7 @@ kind: AgentSpec
 metadata:
   name: bugfix-agent-open
   version: 2
-  owners: [monalir]
+  owners: [dev]
   annotations:
     riskAcceptance: "harness-only: lets Phase A observe platform enforcement without agent-side tool limits (SEC-0001)"
 spec:

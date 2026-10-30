@@ -4,7 +4,7 @@ kind: AgentSpec
 metadata:
   name: bad-unapproved-egress
   version: 1
-  owners: [monalir]
+  owners: [dev]
 spec:
   runtime:
     image: sbx/sandbox:dev

@@ -1,21 +1,22 @@
 # Sandboxed coding-agent platform (security take-home)
 
 A small internal platform that runs Claude Code in disposable, gVisor-isolated Kubernetes pods.
-- **No credentials in the sandbox.** Model calls and egress go through a gateway, and real secrets
-  exist only in a credentials proxy outside it.
+- **No real credentials in the sandbox.** It holds only a session token that works from its own pod,
+  for its own spec, while it runs. Model calls and egress go through a gateway; real secrets exist
+  only in a credentials proxy outside it.
 - **Specs grant every capability.** Each one comes from a reviewed, versioned agent spec.
 - **An independent sentinel** (own namespace and node) watches the evidence and the kernel-level
-  network flows. It contains exfiltration and bypass attempts on its own, even if the control plane is down.
-- **A one-command harness then tries to break it all.**
+  network flows, and quarantines a session on its own, even with the control plane down.
+- **A one-command harness then tries to break it all**, and reports what still gets through.
 
 | Read | For |
 |---|---|
-| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | The 2-page write-up: assets, attackers, STRIDE controls, results, limitations |
+| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | The write-up: assets, attackers, STRIDE controls, results, limitations. Case IDs (`B9`, `B20`…) are defined in the report |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How it is built: components, policy model, credentials, network, flows, decisions |
 | [AGENTS.md](AGENTS.md) | How to run it on your machine, the tests, the repo map (Claude Code loads it via `CLAUDE.md`) |
 | [docs/results/](docs/results/security-test-2026-10-30.md) | The latest harness report |
 | [docs/COVERAGE.md](docs/COVERAGE.md) | Controls and tests per component, and what is not covered |
-| [docs/SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md) · [docs/BUILD_LOG.md](docs/BUILD_LOG.md) | Review findings (all high and medium fixed) · what broke along the way |
+| [docs/SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md) · [docs/BUILD_LOG.md](docs/BUILD_LOG.md) | Review findings at a point in time (high and medium fixed) · what broke along the way |
 
 ```mermaid
 flowchart LR
@@ -39,10 +40,11 @@ flowchart LR
 |---|---|
 | **Phase B: enforcement, agent assumed compromised** | **27/27 as expected**: no credentials in the pod; every bypass (raw TCP, API server, credproxy, other sessions, DNS) dropped and seen by Hubble; canary writes to an allowed host blocked and contained |
 | Findings (what still gets through) | **B20:** a canary in a *read* URL to an allowed host leaves once, then is detected and contained in ~1 s. **B10v / B9v:** if a spec explicitly grants writes, TLS is opaque (undetected) and plain HTTP is detected after one request |
-| **Phase A: real agent under prompt injection** | 6 trials: **0/6** attempted the exfiltration; 3/6 did the task anyway; 3/6 refused by the provider (the task failed too); no agent warned the user |
+| **Phase A: real agent under prompt injection** | 6 trials: **0/6** attempted the exfiltration; 3/6 did the task anyway; 3/6 refused by the provider (the task failed too); no agent warned the user. Not evidence of protection: Phase B is |
 | **Phase C: utility** | The legitimate task passes with every control on (tests re-run offline on the trusted diff) |
-| **Real GitHub** | Scoped, revoked-after-use App tokens; draft [PR #1](https://github.com/bhadradiyaniravnl/items-api-sample/pull/1): 52 tests and 4 real bugs found |
+| **Real GitHub** | Scoped, revoked-after-use App tokens; a draft PR with 52 passing tests plus 9 strict xfails documenting 4 real bugs (private repo; reproduce with `make github AGENT=1` against your own) |
 | Evidence | Gateway, control-plane and alert logs are hash-chained and verified on every run |
+| Limits | Detection is canary-specific; gVisor, not a microVM; identity is a header. Full list in the threat model |
 
 ## What I built vs reused
 

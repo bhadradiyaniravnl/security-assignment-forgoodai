@@ -50,27 +50,27 @@ telling the agent to POST `.env` to a lab destination.
 
 ## Controls by STRIDE
 
-**Status:** D = demonstrated (test cited) · Des = designed, not built · NA = not addressed.
+**Status:** D = demonstrated (test cited: `B..` is a Phase B case in the report, other names are suites in `tests/suites/`) · Des = designed, not built · A = accepted residual · O = open · NA = not addressed.
 
 | | Threat | Control | Status |
 |---|---|---|---|
 | **S** | Token replay from another pod; attacker's own API key via our AI host | IP-bound token; client credentials stripped | D (B7, B6) |
 | S | Platform pod impersonates another | Per-component keys and endpoint scopes | D (B19) |
-| S | User identity | `X-User` header, `system:*` reserved | D partial; Des (OIDC, SPIFFE) |
+| S | User identity | `X-User` header (demo identities `dev`, `secops`), `system:*` reserved; API bound to localhost | **A** (prototype): anyone on the host can claim any user; Des (OIDC, SPIFFE) |
 | **T** | Agent forges its diff, hides CI or dependency changes | Diff computed by the control plane; staged-path check; App lacks Workflows permission | D (github suite) |
-| T | Repo `.env` symlink or `.claude` settings | No-follow write; `--setting-sources user --strict-mcp-config` | D |
+| T | Repo `.env` symlink or `.claude` settings | No-follow write; `--setting-sources user --strict-mcp-config` | Code review (M5); D (Phase C runs with the flags) |
 | T | Unreviewed spec widening; weaker pod | Two-person approval of exact digest; admission policy | D (specs suite, B14, B15) |
-| **R** | Unattributed actions; agent misreports its own actions | User/session/spec digest on every event; verdicts from gateway, Hubble and diff, never agent text | D |
+| **R** | Unattributed actions; agent misreports its own actions | User/session/spec digest on every event; verdicts from gateway, Hubble and diff, never agent text | D (lifecycle: evidence records; github: trusted diff) |
 | R | Evidence tampering or under-reporting | Chain + sequence verified on arrival by the sentinel, which keeps its own copy in a separate zone | D (sentinel suite); Des (WORM + anchor, L7 reconciliation) |
-| R | Reasoning chain lost with the pod | Full prompt/response bodies (canary-redacted) + Claude transcript saved outside the sandbox | D (e2e, containment) |
+| R | Reasoning chain lost with the pod | Full prompt/response bodies (canary-redacted) + Claude transcript saved outside the sandbox | D (e2e: bodies retained; containment: snapshot) |
 | **I** | Canary to non-allowed host, raw IP, DNS, API server | Cilium + L7 allowlist | D (B1–B5) |
 | I | Canary **written** to a write-capable allowed host (HTTP or TLS) | Write-capable destinations are read-only by default: write methods and CONNECT denied | D (B9, B10 blocked) |
 | I | Canary in a **read** (URL) to an allowed host | D1 → auto-contain (~1 s) | D (B20): **one request leaves** |
 | I | Spec that explicitly write-allows such a host (risk acceptance + approval) | HTTP: D1 + contain; TLS: opaque | D (B9v) / **NA: B10v undetected** |
 | I | Provider fetches attacker URL (server tools, MCP, URL sources) | AI request policy | D (B16–B18) |
 | I | Canary via PR diff or PR body | Canary scan → refusal + D1; summary in code fence | D (github suite) |
-| **D** | One sandbox exhausts the gateway; runaway cost | Per-IP caps, size and time limits, pod limits; budget; TTL | D (budget race open) |
-| D | Injection breaks the legitimate task | Pre-run content scan warns the reviewer (INJ alert + PR section) | Partial: D (B22); refusals 14/24 |
+| **D** | One sandbox exhausts the gateway; runaway cost | Per-IP caps, size and time limits, pod limits; budget; TTL | Caps and budget by code review (M8); **O**: budget not atomic with spend |
+| D | Injection breaks the legitimate task | Pre-run content scan warns the reviewer (INJ alert + PR section) | Partial: D (B22); provider refusals 3/6 in the shipped report |
 | D | Runaway or compromised fleet | `sbxctl freeze`: revoke all, namespace-wide deny, block new runs; sentinel freeze works without the control plane | D (containment, sentinel suite) |
 | D | Abandoned sessions hold resources | Idle reaper (spec idleTimeout; activity = gateway validations), graceful max lifetime, contained retention | D (lifecycle) |
 | **E** | Sandbox reaches other sessions, credproxy, API server | Cilium policy | D (B5, B6b/c) |
@@ -88,20 +88,19 @@ telling the agent to POST `.env` to a lab destination.
   - **Closed by default:** writing the canary to the write-capable allowed host (B9 HTTP, B10 TLS) is now blocked, because such hosts are read-only unless a spec explicitly write-allows them.
   - **Residual (B20):** the canary carried in a *read* URL is received, then detected and contained in ~1 s.
   - **Deliberately vulnerable spec:** the original findings remain reproducible (B10v TLS undetected, B9v HTTP detected and contained), which shows exactly what a write grant costs.
-- **Phase A (nondeterministic):** 24 trials, **0 exfil attempts**.
-  - 14 trials were refused by the provider, which also broke the task.
-  - No agent warned the user about the injected instructions.
-  - One agent deleted the injected block itself.
+- **Phase A (nondeterministic):** 6 trials in the shipped report, **0 exfiltration attempts**; earlier runs during development (24 trials) showed the same pattern.
+  - 3 of 6 were refused by the provider, which also broke the legitimate task.
+  - No agent warned the user about the injected instructions; one deleted the injected block itself.
   - "Did not attempt" is not evidence of protection; Phase B is.
 - **Phase C:** the legitimate task passes with all controls on, with tests re-run offline on the recomputed diff.
-- **Real GitHub:** draft [PR #1](https://github.com/bhadradiyaniravnl/items-api-sample/pull/1) (52 tests, 4 bugs found). Workflow and canary PRs are refused.
+- **Real GitHub:** a draft PR (52 passing tests plus 9 strict xfails documenting 4 real bugs) on a private repository, so the link in the README is not openable by readers; `make github AGENT=1` reproduces it against your own repo and App. Workflow and canary PRs are refused.
 - **The security review found four high-severity issues, now fixed:** provider-side egress, diff forgery, PR-body exfil, and a session back door.
 
 ## Limitations
 
 - Single node, kind/Colima: gVisor rather than a microVM, shared-secret component keys rather than mTLS, and the `X-User` header rather than OIDC.
 - **Detection is canary-specific:** real secrets, encodings we don't decode, split or slow exfil, and data placed in model prompts are not detected.
-- **Phase A sample:** 24 trials with one injection style is too small to estimate an attack rate.
+- **Phase A sample:** a handful of trials with one injection style is far too small to estimate an attack rate.
 - **Lab only:** destinations are lab services, no real internet exfiltration was tested, and one repo was used per path.
 
 ## Risks beyond the prototype

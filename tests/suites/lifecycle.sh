@@ -42,7 +42,7 @@ echo "--- idle sessions are reaped (resources freed, work kept)"
 IDN="idle-demo-$(openssl rand -hex 3)"; IDF=$(mktemp)
 sed -e "s/^  name: bugfix-agent$/  name: $IDN/" -e "s/^    ttl: 30m$/    ttl: 30m\n    idleTimeout: 30s/" config/agent-specs/bugfix-agent.yaml > "$IDF"
 curl -s -o /dev/null -X POST http://127.0.0.1:8443/specs/approvals -H "X-User: secops" -H 'content-type: application/yaml' --data-binary @"$IDF"
-check "short-idle spec registered (approved)" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8443/specs -H "X-User: $(whoami)" -H 'content-type: application/yaml' --data-binary @"$IDF")"
+check "short-idle spec registered (approved)" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8443/specs -H "X-User: ${SBX_USER:-dev}" -H 'content-type: application/yaml' --data-binary @"$IDF")"
 rm -f "$IDF"
 SID3=$($CTL run "$IDN" -p repo=demo/app -p task="Reply with the word ok. Do not use any tools." | sid_of)
 for _ in $(seq 1 90); do [ "$(state "$SID3")" = stopped ] && break; sleep 2; done

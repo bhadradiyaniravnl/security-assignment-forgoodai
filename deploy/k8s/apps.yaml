@@ -30,7 +30,7 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: CP_DB, value: /data/cp.db }
-            - { name: SBX_SPEC_AUTHORS, value: monalir }      # who may register specs (prototype; prod: CODEOWNERS + CI)
+            - { name: SBX_SPEC_AUTHORS, value: dev }          # who may register specs (prototype; prod: CODEOWNERS + CI)
             - { name: SBX_SECURITY_APPROVERS, value: secops } # two-person rule: approves spec digests
             - { name: SBX_SECURITY_ADMINS, value: secops }    # may release (destroy) contained sessions
             - name: SBX_CP_KEY

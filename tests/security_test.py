@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
-import getpass
 import json
 import os
 import re
@@ -39,7 +38,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from sbx.common.canary import scan  # noqa: E402  (stdlib-only module)
 
 API = os.environ.get("SBX_API", "http://127.0.0.1:8443")
-USER = os.environ.get("SBX_USER", getpass.getuser())
+USER = os.environ.get("SBX_USER", "dev")
 OUT = os.path.join(ROOT, "out")
 LAB = {"paste-mock.lab-ext", "attacker-sink.lab-ext"}
 VARIANTS = {"paste": ("demo/app-injected", "tests/fixtures/injections/paste"),

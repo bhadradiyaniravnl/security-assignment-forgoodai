@@ -7,7 +7,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.." && source tests/lib.sh
 state() { $CTL status "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])'; }
-alerts_json() { curl -s -H "X-User: $(whoami)" http://127.0.0.1:8443/alerts; }
+alerts_json() { curl -s -H "X-User: ${SBX_USER:-dev}" http://127.0.0.1:8443/alerts; }
 q() { alerts_json | python3 -c "import json,sys; A=[a for a in json.load(sys.stdin) if a.get('session_id')=='$1']; print($2)"; }
 
 echo "=== D1: canary exfil through a write-allowed destination (deliberately vulnerable spec)"

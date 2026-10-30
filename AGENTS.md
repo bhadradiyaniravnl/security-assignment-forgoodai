@@ -33,18 +33,19 @@ on Linux/x86, set `HUBBLE_ARCH=amd64` in `images/services/Dockerfile` and replac
 ### 1. Prerequisites
 
 ```bash
-brew install colima docker kind kubectl cilium-cli hubble
+brew install colima docker kind kubectl cilium-cli hubble gh   # gh only for the optional GitHub flow
 ```
 
-You also need `git` and Python 3 (the system one is fine; the CLI and the harness use only the
-standard library). The scripts pin and checksum-verify the cluster components: kind node v1.37,
-Cilium 1.20.1, gVisor release-20261019, Hubble CLI v1.20.2 and Claude Code 2.1.1.
+You also need `git`, Python 3 (the system one is fine; the CLI and the harness use only the standard
+library) and the macOS built-ins `curl`, `openssl` and `shasum`. The shell snippets below are zsh/macOS
+(`read -s`, `sed -i ''`). Versions are pinned in the scripts: Kubernetes 1.37 (kind v0.33), Cilium 1.20.1,
+gVisor release-20261019 and Hubble CLI v1.20.2 (those two checksum-verified), Claude Code 2.1.1.
 
 ### 2. Credentials
 
 | You have | What works |
 |---|---|
-| Nothing | `make up`, `make smoke`, and reading everything |
+| Nothing | `make up`, `make smoke` (it uses stand-in pods), and reading everything |
 | An Anthropic API key | Everything except the real GitHub flow |
 | + a GitHub App (optional) | `make github` too (clone a private repo, open a draft PR) |
 
@@ -60,6 +61,9 @@ The key exists only on your host (in a gitignored file) and inside the credproxy
 4. `make hooks` enables the pre-commit secret guard (only needed if you will commit).
 
 <details><summary>Optional: the real GitHub flow (<code>testwriter-agent</code>)</summary>
+
+The shipped configuration points at the author's private repository, so the PR linked in the README is
+not openable by others. To reproduce it you create your own repo and App:
 
 1. Create a private repo from `samples/items-api` (from a `git init`-ed copy):
    `gh repo create <you>/items-api-sample --private --source . --push`.
@@ -92,13 +96,17 @@ bin/sbxctl spec ls
 
 ### 4. Use it
 
+Identity is a header in this prototype (OIDC is the production design). `sbxctl` sends `SBX_USER`,
+default `dev`, who owns the shipped specs; `secops` is the security approver and admin; any other
+name is a plain user with no specs (useful for seeing the 403s).
+
 ```bash
 bin/sbxctl run bugfix-agent -p repo=demo/app -p task="Make the tests in tests/ pass" -f
 bin/sbxctl send <sid> "now add a test for X" -f   # follow-up: resumes the same conversation
 bin/sbxctl attach <sid>                          # history + live stream; typed lines are follow-ups; Ctrl-D detaches
 bin/sbxctl stop <sid>                            # revoke, collect the trusted diff, delete the pod
 bin/sbxctl diff <sid>
-bin/sbxctl ls | status <sid> | alerts | destroy <sid>
+bin/sbxctl ls | status <sid> | logs <sid> [-f] | alerts | destroy <sid>
 bin/sbxctl contain <sid>                         # manual containment
 SBX_USER=secops bin/sbxctl freeze "reason"       # fleet kill switch (unfreeze to lift)
 ```
@@ -161,8 +169,8 @@ colima delete sbx      # removes the VM entirely
   (`sentinel/detection_policy.py`).
 - **Suites** are plain bash in `tests/suites/` that share `tests/lib.sh`. Keep verdicts external, use
   `contains` rather than `grep -q` in pipelines (pipefail-safe), and clean up the sessions you start.
-- **Packaging for review:** `make dist` writes `out/sandboxed-agents.zip` from the last commit
-  (`git archive`), so `secrets/` and `out/` are never included.
+- **Packaging for review:** `make dist` writes `out/sandboxed-agents.zip` from the last **commit**
+  (`git archive`): uncommitted changes are left out, and `secrets/` and `out/` are never included.
 
 ## Repo map
 

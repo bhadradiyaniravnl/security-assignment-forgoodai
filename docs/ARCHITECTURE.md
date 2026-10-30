@@ -26,7 +26,7 @@ a reviewed **agent spec**, enforced by components outside the sandbox. Exfiltrat
 3. **The boundary is structural first and content-aware second.** The network decides *where* traffic can go (Cilium); the gateways decide *what* is allowed (L7 policy). Content scanning (canaries) is detection, not prevention.
 4. **Anything the agent produces is attacker-controlled.** That includes its stdout, its summary, its diff, its workspace config and its account of its own actions. We recompute from trusted state, render it inert, or refuse to load it.
 5. **Evidence comes from outside the sandbox.** The gateway, control plane and Cilium/Hubble write it; the agent never does. Records are hash-chained and attributable to user, session and spec digest.
-6. **Every claim has a test.** Enforcement is proven by deterministic tests that assume a compromised agent, not by the model choosing to behave.
+6. **Enforcement claims have tests.** The boundary is proven by deterministic tests that assume a compromised agent, not by the model choosing to behave. Where a control is covered only by code review, [COVERAGE.md](COVERAGE.md) says so.
 
 ## 3. System overview
 
@@ -259,9 +259,9 @@ use an **uncached** policy lookup.
   proxy is a SYN. The sentinel counts both per session and reconciles them with the shipped gateway
   evidence, so a gateway that silently stops logging is caught (S1).
   It checks counts, not content: a gateway that logs one benign-looking record per request is not
-  caught. The test drives it with a **lab-only** switch (`SBX_FAULT_INJECTION=1` in `apps.yaml`; the
-  gateway then drops evidence for session IDs listed in `/tmp/sbx-fault/drop-sessions`), which must
-  be removed outside the lab.
+  caught. The test stands in for a compromised gateway with a fault-injection switch (`SBX_FAULT_INJECTION=1`,
+  `gateway/shared.py`: drop evidence for the sessions listed in `/tmp/sbx-fault/drop-sessions`) that the
+  suite sets on the gateway for its run and removes on exit; the shipped manifests never enable it.
 
 `src/sbx/sentinel/` is a separate security plane in its own namespace (`sbx-security`) on its own
 node (`sbx/pool=security`). The platform has no permissions there and no network path in, except the
@@ -323,8 +323,8 @@ rather than run on a hidden default.
   if no valid policy is available at all it exits (CrashLoopBackOff) rather than run blind. Every load and every rejection is in its hash-chained log, with the digest and the rules disabled
   or in monitor mode.
 - **Who can change it:** the sentinel's service account can only *read* that one ConfigMap. Writing it needs cluster access to
-  `sbx-security`, which the platform's identities don't have. There is no second-person review yet; that was a deliberate
-  scope choice.
+  `sbx-security`, which the platform's identities don't have. **Risk:** one person with that access can change detection
+  without review (within the floor). Two-person approval of policy digests, as for agent specs, is the designed fix.
 
 **Response is independent of the control plane:**
 For a `contain` response (the steps the policy lists):
@@ -556,7 +556,7 @@ and SHA-256, not the text. `attach` replays history and streams live.
 
 ## 10. Testing architecture
 
-The one-command harness (`make security-test`: phases A, B, C) and nine feature suites (`make test`) are listed,
+The one-command harness (`make security-test`: phases A, B, C) and nine feature suites (`make test` runs eight; `github` needs the optional App) are listed,
 with what each proves and costs, in [AGENTS.md](../AGENTS.md#5-test-it). Harness rules:
 - Verdicts come only from outside the sandbox.
 - Nondeterministic agent outcomes are kept separate from enforcement results.

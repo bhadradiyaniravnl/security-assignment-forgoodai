@@ -13,7 +13,6 @@ from __future__ import annotations
 # status, alert summaries) as hostile terminal input to be passed through safe().
 
 import argparse
-import getpass
 import threading
 import json
 import os
@@ -22,7 +21,7 @@ import urllib.error
 import urllib.request
 
 API = os.environ.get("SBX_API", "http://127.0.0.1:8443")
-USER = os.environ.get("SBX_USER", getpass.getuser())
+USER = os.environ.get("SBX_USER", "dev")       # prototype identities: dev (spec owner/author), secops (approver/admin)
 # Agent output and diffs are attacker-controlled: never let them reach the terminal as control
 # sequences (OSC 52 clipboard writes, cursor moves that hide lines, title changes, ...).
 _CONTROL_CHAR_ESCAPES = {c: f"\\x{c:02x}" for c in list(range(0x00, 0x20)) + list(range(0x7f, 0xa0))

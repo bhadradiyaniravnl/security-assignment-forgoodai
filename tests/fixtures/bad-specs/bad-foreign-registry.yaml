@@ -4,7 +4,7 @@ kind: AgentSpec
 metadata:
   name: bad-foreign-registry
   version: 1
-  owners: [monalir]
+  owners: [dev]
 spec:
   runtime:
     image: docker.io/library/python@sha256:0000000000000000000000000000000000000000000000000000000000000000
