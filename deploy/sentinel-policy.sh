@@ -3,11 +3,11 @@
 # it), apply it as the ConfigMap sentinel-detection, hot-reload, and confirm the sentinel runs exactly
 # this file (digest match). An invalid file never reaches the cluster; if one does (applied by hand),
 # the sentinel rejects it, raises a POL alert and keeps its last good policy.
-#   deploy/sentinel-policy.sh [FILE]      default policies/sentinel/detection.yaml
+#   deploy/sentinel-policy.sh [FILE]      default config/sentinel/detection.yaml
 #   CHECK_ONLY=1 deploy/sentinel-policy.sh FILE    validate + diff only
 set -euo pipefail
 cd "$(dirname "$0")/.."
-FILE=${1:-policies/sentinel/detection.yaml}
+FILE=${1:-config/sentinel/detection.yaml}
 CTL=(kubectl -n sbx-security exec -i deploy/sentinel -- python -m sbx.sentinel.ctl)
 "${CTL[@]}" validate - < "$FILE"
 [ "${CHECK_ONLY:-0}" = 1 ] && exit 0

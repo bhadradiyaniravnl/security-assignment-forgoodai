@@ -1,6 +1,16 @@
 """Sentinel detection policy: which rules run, how they are tuned, and what each one does when it fires.
 
-Detection logic stays in code (rules.py, main.py); the policy configures it. A policy has:
+Input: the YAML text of config/sentinel/detection.yaml, delivered as the ConfigMap sentinel-detection
+(main.py hot-reloads it) or checked offline with `python -m sbx.sentinel.ctl validate`.
+Output: a validated `Policy` (lookups for the engine, a digest of the exact text,
+a summary for diffs), or a PolicyError listing every problem.
+Trust: the policy text is operator input and is NOT trusted to be safe; it is validated against a
+schema and against the FLOOR below, which is compiled into the image.
+
+Detection logic stays in code (rules.py, main.py). Every VALUE comes from the policy file: severities,
+response actions, thresholds and allowlists. The code holds no defaults for them; it only knows which
+built-in detectors exist and which parameters each one takes (BUILTIN_RULES), so a policy that omits
+one is rejected instead of silently running on a value nobody can see. A policy has:
 
   responses   named response actions, each a list of steps:
                 quarantine            the sentinel's own deny policy on the session (sentinel-q-<sid>)
@@ -8,7 +18,8 @@ Detection logic stays in code (rules.py, main.py); the policy configures it. A p
                 freeze                the sentinel's fleet-wide deny policy (sentinel-freeze)
                 notify-control-plane  best effort: control plane revokes the token, snapshots evidence
               Every alert is always recorded in the sentinel's own hash-chained log.
-  rules       built-in rules (D1-D3, EV, S1, S2, S6): enabled, mode, severity, response, params, stages
+  rules       every built-in rule (D1-D3, EV, S1, S2, S6, POL): severity, response, all its params,
+              optional stages, enabled (default true) and mode (default enforce)
               custom match rules: a source, field matchers, an optional count/window threshold
 
 mode: enforce runs the response; monitor records the alert and the steps it WOULD have run.
@@ -32,34 +43,23 @@ MODES = ("enforce", "monitor")
 SOURCES = ("gateway", "control-plane", "hubble-sessions", "hubble-platform")
 OPS = {"eq", "ne", "in", "not_in", "regex", "gt", "gte", "lt", "lte", "exists", "contains"}
 
-DEFAULT_RESPONSES = {
-    "record": {"steps": ["notify-control-plane"]},
-    "contain": {"steps": ["quarantine", "verify", "notify-control-plane"]},
-    "freeze-fleet": {"steps": ["freeze", "notify-control-plane"]},
-}
-
-# Built-in rules with their defaults. A policy may omit a rule (it keeps these values) or override fields.
-BUILTIN: dict[str, dict] = {
-    "D1": {"severity": "high", "response": "contain", "params": {}},
-    "D2": {"severity": "high", "response": "contain",
-           "stages": {"first": {"severity": "medium", "response": "record"}},
-           "params": {"default_burst": {"count": 5, "window_s": 60},      # agent spec's denyBurst wins
-                      "deny_reasons": ["default_deny", "model_not_allowed", "budget", "credproxy_refused",
-                                       "path_not_allowed", "provider_side_capability", "provider_side_tool",
-                                       "remote_content_source", "malformed_request", "write_not_allowed"]}},
-    "D3": {"severity": "medium", "response": "record",
-           "params": {"acting_tools": ["Bash", "WebFetch", "WebSearch", "BashOutput", "Task"],
-                      "acting_tool_prefixes": ["mcp__"]}},
-    "EV": {"severity": "high", "response": "record", "params": {}},
-    "S1": {"severity": "high", "response": "contain",
-           "params": {"horizon_s": 20, "min_deficit": 3, "min_ratio": 0.25, "interval_s": 10}},
-    "S2": {"severity": "high", "response": "record",
-           "params": {"world_allowlist": {"credproxy": ["api.anthropic.com", "github.com", "api.github.com"]}}},
-    "S6": {"severity": "high", "response": "contain", "params": {"grace_s": 3}},
+NUMBER = (int, float)
+# The built-in detectors implemented in code and the SHAPE of their configuration: parameter name ->
+# expected type, and the alert stages a rule emits. No values: those all come from the policy file.
+BUILTIN_RULES: dict[str, dict] = {
+    "D1": {"params": {}, "stages": ()},
+    "D2": {"params": {"default_burst": dict, "deny_reasons": list}, "stages": ("first",)},
+    "D3": {"params": {"acting_tools": list, "acting_tool_prefixes": list}, "stages": ()},
+    "EV": {"params": {}, "stages": ()},
+    "S1": {"params": {"horizon_s": NUMBER, "min_deficit": NUMBER, "min_ratio": NUMBER, "interval_s": NUMBER},
+           "stages": ()},
+    "S2": {"params": {"world_allowlist": dict}, "stages": ()},
+    "S6": {"params": {"grace_s": NUMBER}, "stages": ()},
+    "POL": {"params": {}, "stages": ()},           # a rejected policy (raised under the last good one)
 }
 
 # ------------------------------------------------------------------------------------------- floor
-ALWAYS_ON = {"D1", "EV", "S6"}                 # cannot be disabled or set to monitor
+ALWAYS_ON = {"D1", "EV", "S6", "POL"}          # cannot be disabled or set to monitor
 MUST_CONTAIN = {"D1", "S6"}                    # response must quarantine or freeze
 PARAM_BOUNDS = {                               # rule -> param path -> (min, max)
     "D2": {"default_burst.count": (1, 50), "default_burst.window_s": (5, 600)},
@@ -73,12 +73,15 @@ MAX_CUSTOM = 100
 
 
 class PolicyError(ValueError):
+    """A policy that failed validation; `errors` lists every problem found, not just the first."""
+
     def __init__(self, errors: list[str]):
         super().__init__("; ".join(errors))
         self.errors = errors
 
 
-def _get(d: dict, path: str):
+def _lookup_path(d: dict, path: str):
+    """d["a"]["b"] for path "a.b"; None if any step is missing."""
     for p in path.split("."):
         if not isinstance(d, dict) or p not in d:
             return None
@@ -87,28 +90,19 @@ def _get(d: dict, path: str):
 
 
 class Policy:
+    """A validated detection policy (construct it through load())."""
+
     def __init__(self, doc: dict, text: str, source: str):
         self.doc, self.text, self.source = doc, text, source
         self.digest = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
         meta = doc.get("metadata") or {}
         self.name, self.version = meta.get("name", "default"), meta.get("version")
-        self.responses = {**DEFAULT_RESPONSES, **(doc["spec"].get("responses") or {})}
-        self.rules: dict[str, dict] = copy.deepcopy(BUILTIN)
-        for r in BUILTIN.values():
-            r.setdefault("enabled", True)
+        self.responses = dict(doc["spec"]["responses"])
+        self.rules: dict[str, dict] = {}
         self.custom: list[dict] = []
-        for r in doc["spec"].get("rules") or []:
-            if r["id"] in BUILTIN:
-                base = self.rules[r["id"]]
-                for k, v in r.items():
-                    if k == "params":
-                        base["params"] = _merge(base.get("params", {}), v)
-                    elif k == "stages":
-                        base["stages"] = _merge(base.get("stages", {}), v)
-                    elif k != "id":
-                        base[k] = v
-            else:
-                self.custom.append(dict(r))
+        for r in doc["spec"]["rules"]:
+            (self.rules.__setitem__(r["id"], copy.deepcopy(r)) if r["id"] in BUILTIN_RULES
+             else self.custom.append(dict(r)))
         for r in list(self.rules.values()) + self.custom:
             r.setdefault("enabled", True)
             r.setdefault("mode", "enforce")
@@ -121,33 +115,25 @@ class Policy:
         return bool(r and r["enabled"])
 
     def param(self, rule: str, path: str):
-        return _get(self.rules[rule].get("params", {}), path)
+        """A built-in rule's parameter by dotted path, e.g. param("D2", "default_burst.count")."""
+        return _lookup_path(self.rules[rule].get("params", {}), path)
 
     def decide(self, rule: str, stage: str | None) -> dict:
-        """-> {severity, mode, response, steps} for an alert of this rule (and stage)."""
-        r = self.rules.get(rule) or next((c for c in self.custom if c["id"] == rule), None)
-        if r is None:                                               # internal rules (e.g. POL)
-            return {"severity": "high", "mode": "enforce", "response": "record",
-                    "steps": DEFAULT_RESPONSES["record"]["steps"], "enabled": True}
-        st = (r.get("stages") or {}).get(stage or "", {})
-        response = st.get("response", r["response"])
-        return {"severity": st.get("severity", r["severity"]), "mode": r["mode"], "response": response,
+        """-> {severity, mode, response, steps, enabled} for an alert of this rule (and stage)."""
+        r = self.rules.get(rule) or next(c for c in self.custom if c["id"] == rule)
+        overrides = (r.get("stages") or {}).get(stage or "", {})
+        response = overrides.get("response", r["response"])
+        return {"severity": overrides.get("severity", r["severity"]), "mode": r["mode"], "response": response,
                 "steps": list(self.responses[response]["steps"]), "enabled": r["enabled"]}
 
     def summary(self) -> dict:
+        """The effective settings per rule (what `ctl policy` shows and `ctl validate` diffs)."""
         return {"name": self.name, "version": self.version, "digest": self.digest, "source": self.source,
                 "rules": {k: {"enabled": v["enabled"], "mode": v["mode"], "severity": v["severity"],
                               "response": v["response"]} for k, v in self.rules.items()},
                 "custom": {c["id"]: {"enabled": c["enabled"], "mode": c["mode"], "severity": c["severity"],
                                      "response": c["response"], "source": c["source"]} for c in self.custom},
                 "responses": self.responses}
-
-
-def _merge(a: dict, b: dict) -> dict:
-    out = copy.deepcopy(a)
-    for k, v in (b or {}).items():
-        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
-    return out
 
 
 # ---------------------------------------------------------------------------------------- loading
@@ -157,23 +143,23 @@ def load(text: str, source: str = "configmap") -> Policy:
         doc = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise PolicyError([f"not valid YAML: {e}"]) from None
-    errs = validate(doc)
-    if errs:
-        raise PolicyError(errs)
-    p = Policy(doc, text, source)
-    errs = _validate_effective(p)
+    try:                     # a malformed value must surface as a rejection (POL alert), not a crash
+        errs = validate(doc)
+        if errs:
+            raise PolicyError(errs)
+        p = Policy(doc, text, source)
+        errs = _validate_effective(p)
+    except (TypeError, ValueError, AttributeError, KeyError) as e:
+        if isinstance(e, PolicyError):
+            raise
+        raise PolicyError([f"malformed policy: {type(e).__name__}: {e}"]) from None
     if errs:
         raise PolicyError(errs)
     return p
 
 
-def default_policy() -> Policy:
-    doc = {"apiVersion": "sbx.forgood.ai/v1", "kind": "DetectionPolicy",
-           "metadata": {"name": "built-in-defaults"}, "spec": {}}
-    return Policy(doc, yaml.safe_dump(doc), "built-in")
-
-
 def validate(doc) -> list[str]:
+    """Schema check of the parsed document; returns every error (empty list = valid)."""
     e: list[str] = []
     if not isinstance(doc, dict):
         return ["policy must be a mapping"]
@@ -184,7 +170,9 @@ def validate(doc) -> list[str]:
     spec = doc.get("spec")
     if not isinstance(spec, dict) or set(spec) - {"responses", "rules"}:
         return e + ["spec must be a mapping with only 'responses' and 'rules'"]
-    responses = {**DEFAULT_RESPONSES}
+    if not isinstance(spec.get("responses"), dict) or not spec["responses"]:
+        e.append("spec.responses must define the response actions (there are no built-in ones)")
+    responses = {}
     for name, r in (spec.get("responses") or {}).items():
         if not re.match(r"^[a-z][a-z0-9-]{1,31}$", str(name)):
             e.append(f"response name {name!r} must be lowercase-kebab")
@@ -219,31 +207,46 @@ def validate(doc) -> list[str]:
             e.append(f"{where}: mode must be one of {MODES}")
         if "severity" in r and r["severity"] not in SEVERITIES:
             e.append(f"{where}: severity must be one of {SEVERITIES}")
+        for k in ("severity", "response"):
+            if k not in r:
+                e.append(f"{where}: needs {k} (no built-in default)")
         if "response" in r and r["response"] not in responses:
             e.append(f"{where}: unknown response {r['response']!r}")
         for sname, st in (r.get("stages") or {}).items():
+            if not isinstance(st, dict) or not {"severity", "response"} <= set(st):
+                e.append(f"{where}: stage {sname}: needs severity and response")
+                continue
             if st.get("response") and st["response"] not in responses:
                 e.append(f"{where}: stage {sname}: unknown response {st['response']!r}")
             if st.get("severity") and st["severity"] not in SEVERITIES:
                 e.append(f"{where}: stage {sname}: bad severity")
-        if rid in BUILTIN:
+        if rid in BUILTIN_RULES:
+            shape = BUILTIN_RULES[rid]
             if r.get("type") == "match" or "match" in r:
                 e.append(f"{where}: built-in rules take params, not match")
-            unknown = set(r.get("params") or {}) - set(BUILTIN[rid].get("params", {}))
-            if unknown:
-                e.append(f"{where}: unknown params {sorted(unknown)}")
-            unknown = set(r.get("stages") or {}) - set(BUILTIN[rid].get("stages", {}))
-            if unknown:
-                e.append(f"{where}: unknown stages {sorted(unknown)}")
+            params = r.get("params") or {}
+            if set(params) - set(shape["params"]):
+                e.append(f"{where}: unknown params {sorted(set(params) - set(shape['params']))}")
+            for pname, ptype in shape["params"].items():
+                if pname not in params:
+                    e.append(f"{where}: needs params.{pname} (no built-in default)")
+                elif not isinstance(params[pname], ptype) or isinstance(params[pname], bool):
+                    e.append(f"{where}: params.{pname} has the wrong type")
+            if set(r.get("stages") or {}) - set(shape["stages"]):
+                e.append(f"{where}: unknown stages {sorted(set(r.get('stages') or {}) - set(shape['stages']))}")
             continue
         n_custom += 1
         e += _validate_custom(r, where)
+    missing = set(BUILTIN_RULES) - seen
+    if missing:
+        e.append(f"every built-in rule must be configured (enabled: false to switch one off); missing {sorted(missing)}")
     if n_custom > MAX_CUSTOM:
         e.append(f"at most {MAX_CUSTOM} custom rules")
     return e
 
 
 def _validate_custom(r: dict, where: str) -> list[str]:
+    """Schema check of one custom match rule."""
     e = []
     if not CUSTOM_ID.match(str(r["id"])):
         e.append(f"{where}: custom ids are UPPER-kebab, 2-32 chars, and must not reuse a built-in id")
@@ -355,19 +358,21 @@ def flow_fields(f: dict) -> dict:
     src, dst, l4 = f.get("source", {}), f.get("destination", {}), f.get("l4") or {}
     proto = next(iter(l4), None)
     http = (f.get("l7") or {}).get("http") or {}
-    lab = lambda labels, k: next((l.split("=", 1)[1] for l in labels if l.startswith(f"k8s:{k}=")), None)  # noqa: E731
+    label = lambda labels, k: next((l.split("=", 1)[1] for l in labels if l.startswith(f"k8s:{k}=")), None)  # noqa: E731
     return {"verdict": f.get("verdict"), "direction": f.get("traffic_direction"), "proto": proto,
             "dest_port": (l4.get(proto) or {}).get("destination_port") if proto else None,
             "dest_ip": (f.get("IP") or {}).get("destination"), "dest_names": f.get("destination_names") or [],
             "dest_namespace": dst.get("namespace"), "dest_pod": dst.get("pod_name"),
             "dest_world": "reserved:world" in dst.get("labels", []),
             "drop_reason": f.get("drop_reason_desc"), "src_pod": src.get("pod_name"),
-            "src_app": lab(src.get("labels", []), "app"), "session": lab(src.get("labels", []), "sbx/session"),
+            "src_app": label(src.get("labels", []), "app"), "session": label(src.get("labels", []), "sbx/session"),
             "http_method": http.get("method"), "http_url": http.get("url"), "http_code": http.get("code"),
             "l7_type": (f.get("l7") or {}).get("type")}
 
 
-class _Fmt(dict):
+class _BlankFormat(dict):
+    """format_map() mapping that renders unknown {fields} in a summary template as "?"."""
+
     def __missing__(self, k):
         return "?"
 
@@ -379,12 +384,14 @@ class CustomRules:
         self.windows: dict[tuple, deque] = defaultdict(deque)
 
     def evaluate(self, pol: Policy, source: str, event: dict, sid: str | None) -> list[dict]:
+        """Matches for one event from `source` (a shipped evidence record or a Hubble flow), as dicts
+        main.py turns into alerts. Hubble flows also expose the friendly fields of flow_fields()."""
         out = []
         fields = {**flow_fields(event), **event} if source.startswith("hubble") else event
         for r in pol.custom:
             if not r["enabled"] or r["source"] != source:
                 continue
-            if not all(pred(fields.get(f) if f in fields else _get(event, f)) for f, pred in r["_matchers"]):
+            if not all(pred(fields.get(f) if f in fields else _lookup_path(event, f)) for f, pred in r["_matchers"]):
                 continue
             t = r.get("threshold") or {}
             count, window = int(t.get("count", 1)), int(t.get("window_s", 60))
@@ -398,7 +405,7 @@ class CustomRules:
                 continue
             q.clear()
             observed = {k: fields.get(k) for k in r["match"] if k in fields}
-            summary = (r.get("summary") or f"{r['id']} matched").format_map(_Fmt({**fields, "count": count}))
+            summary = (r.get("summary") or f"{r['id']} matched").format_map(_BlankFormat({**fields, "count": count}))
             if count > 1:
                 summary += f" ({count} within {window}s)"
             out.append({"rule": r["id"], "session_id": sid, "summary": summary,

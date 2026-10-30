@@ -1,5 +1,7 @@
 """Security-team CLI inside the sentinel pod (reach it with `kubectl exec`, i.e. cluster access to the
-sbx-security namespace is the authorisation). Talks to the sentinel's localhost-only admin API.
+sbx-security namespace is the authorisation). Talks to the sentinel's localhost-only admin API
+(main.admin, 127.0.0.1:9101) and prints its answers; the test suites grep this output, so keep its
+format stable. The actor recorded with each command is $SENTINEL_ACTOR, else the local uid.
 
   python -m sbx.sentinel.ctl status | alerts [N] | freeze REASON | unfreeze | release SID
                              policy | reload | validate FILE|-   (validate prints the diff vs the active policy)
@@ -13,6 +15,7 @@ import urllib.request
 
 
 def call(cmd: str, body: dict) -> object:
+    """POST /admin/{cmd} on the local admin API and return the decoded JSON answer."""
     req = urllib.request.Request(f"http://127.0.0.1:9101/admin/{cmd}", method="POST",
                                  data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -35,7 +38,7 @@ def main(argv: list[str]) -> None:
     elif cmd == "validate":
         import difflib
 
-        from sbx.sentinel import policy as detpol
+        from sbx.sentinel import detection_policy as detpol
         text = sys.stdin.read() if not rest or rest[0] == "-" else open(rest[0]).read()
         try:
             new = detpol.load(text, source="candidate")
@@ -51,11 +54,11 @@ def main(argv: list[str]) -> None:
         diff = list(difflib.unified_diff(active["text"].splitlines(), text.splitlines(),
                                          "active", "candidate", lineterm="", n=1))
         print("\n".join(diff[2:]) if diff else "")
-        s, a = new.summary(), active
-        for kind in ("rules", "custom"):
-            for rid in sorted(set(s[kind]) | set(a[kind])):
-                if s[kind].get(rid) != a[kind].get(rid):
-                    print(f"  {rid}: {a[kind].get(rid)} -> {s[kind].get(rid)}")
+        candidate = new.summary()
+        for kind in ("rules", "custom"):                         # effective per-rule changes
+            for rid in sorted(set(candidate[kind]) | set(active[kind])):
+                if candidate[kind].get(rid) != active[kind].get(rid):
+                    print(f"  {rid}: {active[kind].get(rid)} -> {candidate[kind].get(rid)}")
     elif cmd == "release":
         print(json.dumps(call("release", {"actor": actor, "session_id": rest[0]})))
     else:

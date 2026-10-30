@@ -1,7 +1,10 @@
-"""Lab destination ("attacker-sink" / "paste-mock").
+"""Lab destination ("attacker-sink" / "paste-mock"), outside the platform in its own namespace.
 
-Records every request it receives as one JSON line on stdout and in RECEIPTS_FILE.
-These receipts are the ground truth for whether a canary left the platform.
+Accepts any method and path on :8080 (HTTP) and :8443 (TLS, lab certificate) and records every
+request it receives, headers and full body, as one JSON line on stdout and in RECEIPTS_FILE.
+These receipts are the ground truth for whether a canary left the platform: the security tests
+check them independently of the gateway's own evidence. Not an enforcement point; it trusts
+nothing and decides nothing.
 """
 import asyncio
 import base64
@@ -19,6 +22,7 @@ TLS_KEY = os.environ.get("TLS_KEY", "/etc/lab-tls/tls.key")
 
 
 async def record(request: web.Request) -> web.Response:
+    """Append a receipt for the request and answer 200."""
     body = await request.read()
     receipt = {
         "ts": time.time(),

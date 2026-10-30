@@ -2,8 +2,12 @@
 # Deploy:   make sentinel-policy            (validate + diff in the sentinel, apply, hot-reload, confirm digest)
 # Inspect:  kubectl -n sbx-security exec deploy/sentinel -- python -m sbx.sentinel.ctl policy
 #
+# This file is the ONLY source of severities, responses, thresholds and allowlists: the sentinel has no
+# defaults in code, and a policy that leaves out a built-in rule, a response or a param is rejected.
+# The image carries a copy of this file, used only if the ConfigMap is missing on first boot.
+#
 # Floor (compiled into the sentinel, a policy that breaks it is rejected and the last good one stays):
-#   D1, EV, S6 always enabled in enforce mode; D1 and S6 must quarantine or freeze; thresholds bounded;
+#   D1, EV, S6, POL always enabled in enforce mode; D1 and S6 must quarantine or freeze; thresholds bounded;
 #   only high-severity rules may freeze; platform-flow rules can't quarantine (no session).
 apiVersion: sbx.forgood.ai/v1
 kind: DetectionPolicy
@@ -75,6 +79,11 @@ spec:
       severity: high
       response: contain
       params: { grace_s: 3 }
+
+    - id: POL
+      description: a detection policy was rejected (raised under the last good policy, which stays active)
+      severity: high
+      response: record
 
     # ---- custom match rules -----------------------------------------------------------
     # source: gateway | control-plane | hubble-sessions | hubble-platform

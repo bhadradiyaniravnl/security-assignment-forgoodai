@@ -2,9 +2,8 @@
 
 A single-machine prototype: kind on Colima, gVisor sandboxes, Cilium + Hubble, explicit AI/egress
 gateways, a credentials proxy, and a GitHub App.
-- Setup: [SETUP.md](SETUP.md).
-- Design and build log: [DESIGN.md](DESIGN.md).
-- Review: [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
+- Run it: [AGENTS.md](../AGENTS.md). Design: [ARCHITECTURE.md](ARCHITECTURE.md).
+- Review: [SECURITY_REVIEW.md](SECURITY_REVIEW.md). Build log: [BUILD_LOG.md](BUILD_LOG.md).
 - Evidence: [results/security-test-2026-10-30.md](results/security-test-2026-10-30.md).
 
 ## Scenario, assets, attackers, boundaries
@@ -57,29 +56,29 @@ telling the agent to POST `.env` to a lab destination.
 | **S** | Token replay from another pod; attacker's own API key via our AI host | IP-bound token; client credentials stripped | D (B7, B6) |
 | S | Platform pod impersonates another | Per-component keys and endpoint scopes | D (B19) |
 | S | User identity | `X-User` header, `system:*` reserved | D partial; Des (OIDC, SPIFFE) |
-| **T** | Agent forges its diff, hides CI or dependency changes | Diff computed by the control plane; staged-path check; App lacks Workflows permission | D (m8) |
+| **T** | Agent forges its diff, hides CI or dependency changes | Diff computed by the control plane; staged-path check; App lacks Workflows permission | D (github suite) |
 | T | Repo `.env` symlink or `.claude` settings | No-follow write; `--setting-sources user --strict-mcp-config` | D |
-| T | Unreviewed spec widening; weaker pod | Two-person approval of exact digest; admission policy | D (m6, B14, B15) |
+| T | Unreviewed spec widening; weaker pod | Two-person approval of exact digest; admission policy | D (specs suite, B14, B15) |
 | **R** | Unattributed actions; agent misreports its own actions | User/session/spec digest on every event; verdicts from gateway, Hubble and diff, never agent text | D |
-| R | Evidence tampering or under-reporting | Chain + sequence verified on arrival by the sentinel, which keeps its own copy in a separate zone | D (m9); Des (WORM + anchor, L7 reconciliation) |
+| R | Evidence tampering or under-reporting | Chain + sequence verified on arrival by the sentinel, which keeps its own copy in a separate zone | D (sentinel suite); Des (WORM + anchor, L7 reconciliation) |
 | R | Reasoning chain lost with the pod | Full prompt/response bodies (canary-redacted) + Claude transcript saved outside the sandbox | D (e2e, containment) |
 | **I** | Canary to non-allowed host, raw IP, DNS, API server | Cilium + L7 allowlist | D (B1–B5) |
 | I | Canary **written** to a write-capable allowed host (HTTP or TLS) | Write-capable destinations are read-only by default: write methods and CONNECT denied | D (B9, B10 blocked) |
 | I | Canary in a **read** (URL) to an allowed host | D1 → auto-contain (~1 s) | D (B20): **one request leaves** |
 | I | Spec that explicitly write-allows such a host (risk acceptance + approval) | HTTP: D1 + contain; TLS: opaque | D (B9v) / **NA: B10v undetected** |
 | I | Provider fetches attacker URL (server tools, MCP, URL sources) | AI request policy | D (B16–B18) |
-| I | Canary via PR diff or PR body | Canary scan → refusal + D1; summary in code fence | D (m8) |
+| I | Canary via PR diff or PR body | Canary scan → refusal + D1; summary in code fence | D (github suite) |
 | **D** | One sandbox exhausts the gateway; runaway cost | Per-IP caps, size and time limits, pod limits; budget; TTL | D (budget race open) |
 | D | Injection breaks the legitimate task | Pre-run content scan warns the reviewer (INJ alert + PR section) | Partial: D (B22); refusals 14/24 |
-| D | Runaway or compromised fleet | `sbxctl freeze`: revoke all, namespace-wide deny, block new runs; sentinel freeze works without the control plane | D (containment, m9) |
+| D | Runaway or compromised fleet | `sbxctl freeze`: revoke all, namespace-wide deny, block new runs; sentinel freeze works without the control plane | D (containment, sentinel suite) |
 | D | Abandoned sessions hold resources | Idle reaper (spec idleTimeout; activity = gateway validations), graceful max lifetime, contained retention | D (lifecycle) |
 | **E** | Sandbox reaches other sessions, credproxy, API server | Cilium policy | D (B5, B6b/c) |
 | E | gVisor escape lands next to the secrets | Sandboxes only on a tainted sandbox node; credproxy on the platform node (admission enforces) | D (B21); kind nodes share one VM |
-| E | Run-time policy widening; session back door; state races | Parameters only; endpoint removed; compare-and-set; admin-only release; durable state + orphan sweep | D (B12, B19, m4) |
+| E | Run-time policy widening; session back door; state races | Parameters only; endpoint removed; compare-and-set; admin-only release; durable state + orphan sweep | D (B12, B19, containment suite) |
 | E | gVisor escape; control-plane `pods/exec` abuse | gVisor; scoped RBAC | Des (microVM; volume delivery) |
-| E | Compromised control plane lifts containment or is down | Sentinel: own node, own deny policies (protected by admission), S6 re-quarantine, S2 platform-egress alerts | D (m9: containment with the control plane scaled to zero) |
-| T | Detection weakened by a policy change (rule disabled, response downgraded) | Compiled-in floor (D1/EV/S6 on, D1/S6 contain, bounded thresholds); a rejected policy keeps the last good one and raises POL; every load is in the sentinel's chained log | D (m11); no second-person review yet |
-| R | Compromised or buggy gateway under-reports (drops evidence for a session) | S1: sentinel reconciles Hubble L7/L4 request counts with shipped gateway evidence; Hubble redacts credentials | D (m10: lab fault injection, AI and egress channels) |
+| E | Compromised control plane lifts containment or is down | Sentinel: own node, own deny policies (protected by admission), S6 re-quarantine, S2 platform-egress alerts | D (sentinel suite: containment with the control plane scaled to zero) |
+| T | Detection weakened by a policy change (rule disabled, response downgraded) | Compiled-in floor (D1/EV/S6 on, D1/S6 contain, bounded thresholds); a rejected policy keeps the last good one and raises POL; every load is in the sentinel's chained log | D (sentinel-policy suite); no second-person review yet |
+| R | Compromised or buggy gateway under-reports (drops evidence for a session) | S1: sentinel reconciles Hubble L7/L4 request counts with shipped gateway evidence; Hubble redacts credentials | D (sentinel-completeness suite: lab fault injection, AI and egress channels) |
 
 ## Evidence summary
 

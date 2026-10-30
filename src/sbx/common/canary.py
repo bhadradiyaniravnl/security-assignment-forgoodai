@@ -1,8 +1,15 @@
 """Canary matching across the encodings an exfil attempt is likely to use.
 
+Canaries are fake secrets planted in each session (values come from the control plane's policy
+lookup). Any outbound byte stream that contains one is proof of an exfiltration attempt, whatever
+the destination. The gateway scans every model request, tool_use input and plain-HTTP egress
+request with this; the control plane and the security test harness reuse it.
+
 Covers plain, base64 (all three byte alignments, so a canary embedded in a larger
 base64 blob is still found), hex and URL-encoding, plus one level of base64 decoding
-of the whole payload. Known gaps: encryption, compression, splitting across requests.
+of every base64-looking run in the payload. Known gaps: encryption, compression,
+splitting across requests. This is a tripwire, not a DLP engine: it decides nothing on its own,
+it only labels evidence (canary_match) that the sentinel acts on.
 """
 from __future__ import annotations
 
@@ -11,10 +18,16 @@ import binascii
 import re
 import urllib.parse
 
-_B64_RUN = re.compile(rb"[A-Za-z0-9+/=_-]{16,}")
+_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/=_-]{16,}")
 
 
-def _b64_variants(value: bytes) -> list[bytes]:
+def _base64_substrings(value: bytes) -> list[bytes]:
+    """Stable inner substrings of base64(value) at each of the 3 possible byte offsets.
+
+    base64 encodes 3 bytes at a time, so how `value` encodes depends on where it starts inside
+    the larger blob; we encode with 0-2 prefix bytes and keep only the characters that depend
+    solely on `value` (plus the URL-safe alphabet variant).
+    """
     out = []
     for pad in range(3):
         enc = base64.b64encode(b"\0" * pad + value)
@@ -26,29 +39,33 @@ def _b64_variants(value: bytes) -> list[bytes]:
     return out
 
 
-def _needles(canary: str) -> dict[str, list[bytes]]:
+def _encoded_forms(canary: str) -> dict[str, list[bytes]]:
+    """encoding name -> byte strings whose presence means the canary is in the payload."""
     raw = canary.encode()
     return {
         "plain": [raw],
-        "base64": _b64_variants(raw),
+        "base64": _base64_substrings(raw),
         "hex": [raw.hex().encode(), raw.hex().upper().encode()],
         "urlencoded": [urllib.parse.quote(canary, safe="").encode(), urllib.parse.quote_plus(canary).encode()],
     }
 
 
 def scan(data: bytes, canaries: list[dict]) -> dict | None:
-    """canaries: [{"id": ..., "value": ...}]. Returns the first match or None."""
+    """Look for any canary in `data`.
+
+    canaries: [{"id": ..., "value": ...}]. Returns {"id", "encoding"} for the first match, or None.
+    """
     if not data or not canaries:
         return None
-    for c in canaries:
-        for encoding, needles in _needles(c["value"]).items():
-            if any(n in data for n in needles):
-                return {"id": c["id"], "encoding": encoding}
-        for run in _B64_RUN.findall(data):
+    for canary in canaries:
+        for encoding, needles in _encoded_forms(canary["value"]).items():
+            if any(needle in data for needle in needles):
+                return {"id": canary["id"], "encoding": encoding}
+        for run in _BASE64_RUN.findall(data):
             try:
                 decoded = base64.b64decode(run + b"=" * (-len(run) % 4), altchars=b"-_" if b"-" in run or b"_" in run else None)
             except (binascii.Error, ValueError):
                 continue
-            if c["value"].encode() in decoded:
-                return {"id": c["id"], "encoding": "base64-decoded"}
+            if canary["value"].encode() in decoded:
+                return {"id": canary["id"], "encoding": "base64-decoded"}
     return None

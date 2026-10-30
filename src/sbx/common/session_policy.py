@@ -1,4 +1,12 @@
-"""Policy helpers shared by the gateway and credproxy, plus a cached control-plane client."""
+"""Session policy lookups shared by the gateway, credproxy and sentinel.
+
+- normalize_host / host_allowed: the one allowlist comparison used by every enforcement point, so
+  the gateway and credproxy cannot disagree about whether a destination is in the spec.
+- ControlPlane: client for the control plane's internal API (token validation, compiled session
+  policy). The control plane is the source of truth; answers are cached for `ttl` seconds, which
+  bounds how long a revoked session can keep working. Any failure to reach it is answered as 503,
+  so callers fail closed.
+"""
 from __future__ import annotations
 
 import time
@@ -11,10 +19,11 @@ _SUFFIXES = (".svc.cluster.local", ".svc")
 
 
 def normalize_host(host: str) -> str:
+    """Lower-case, drop the trailing dot and the in-cluster service suffix (svc / svc.cluster.local)."""
     host = host.lower().rstrip(".")
-    for s in _SUFFIXES:
-        if host.endswith(s):
-            return host[: -len(s)]
+    for suffix in _SUFFIXES:
+        if host.endswith(suffix):
+            return host[: -len(suffix)]
     return host
 
 
@@ -51,8 +60,11 @@ class ControlPlane:
         return status, body
 
     async def validate(self, token: str, ip: str) -> tuple[int, dict]:
+        """Check a session token presented from `ip` (tokens are bound to the pod IP)."""
         return await self._cached(("v", token, ip), "POST", "/internal/validate", {"token": token, "ip": ip})
 
     async def policy(self, session_id: str, fresh: bool = False) -> tuple[int, dict]:
-        """fresh=True skips the cache: used for rare, high-impact operations (GitHub clone/publish)."""
+        """Compiled policy, state and canaries for a session.
+
+        fresh=True skips the cache: used for rare, high-impact operations (GitHub clone/publish)."""
         return await self._cached(("p", session_id), "GET", f"/internal/policy/{session_id}", fresh=fresh)

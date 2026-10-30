@@ -1,8 +1,11 @@
 """Service-to-service auth inside sbx-system (prototype: one key per component; production: mTLS/SPIFFE).
 
-Each component sends its OWN key (SBX_INTERNAL_KEY). Receivers know the keys of the callers they
-accept (SBX_KEY_<COMPONENT>) and authorise per endpoint, so a compromised gateway cannot use
-sentinel-only endpoints, and the sentinel cannot validate tokens or reach credproxy."""
+Each component sends its OWN key (SBX_INTERNAL_KEY) in the X-Sbx-Internal header. Receivers know
+the keys of the callers they accept (SBX_KEY_<COMPONENT>) and authorise per endpoint, so a
+compromised gateway cannot use sentinel-only endpoints, and the sentinel cannot validate tokens or
+reach credproxy. Keys shorter than 32 characters are treated as absent (fail closed).
+
+Also holds the in-cluster service URLs, so every component addresses its peers the same way."""
 from __future__ import annotations
 
 import hmac
@@ -16,6 +19,7 @@ CREDPROXY_TUNNEL = (os.environ.get("CREDPROXY_TUNNEL_HOST", "credproxy.sbx-syste
 
 
 def key() -> str:
+    """This component's own internal key; raises if it is missing or weak."""
     k = os.environ.get("SBX_INTERNAL_KEY", "")
     if len(k) < 32:
         raise RuntimeError("SBX_INTERNAL_KEY missing or too short")
@@ -23,6 +27,7 @@ def key() -> str:
 
 
 def headers() -> dict:
+    """Auth header to attach to calls to other platform components."""
     return {HEADER: key()}
 
 

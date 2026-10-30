@@ -1,9 +1,9 @@
-# One image for all platform services (control-plane, gateway, credproxy, detector, lab).
+# One image for all platform services (control-plane, gateway, credproxy, sentinel, lab).
 # The command is chosen per Deployment.
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends openssl git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-# Hubble CLI for the detector (pinned release, checksum verified).
+# Hubble CLI for the sentinel (pinned release, checksum verified).
 ARG HUBBLE_VERSION=v1.20.2
 ARG HUBBLE_ARCH=arm64
 RUN cd /tmp && f=hubble-linux-${HUBBLE_ARCH}.tar.gz \
@@ -17,9 +17,10 @@ RUN mkdir -p /etc/lab-tls && openssl req -x509 -newkey rsa:2048 -nodes -days 365
       -subj "/CN=lab-ext" -addext "subjectAltName=DNS:paste-mock.lab-ext.svc,DNS:attacker-sink.lab-ext.svc" \
       -keyout /etc/lab-tls/tls.key -out /etc/lab-tls/tls.crt && chmod 0644 /etc/lab-tls/tls.key
 COPY src /app/src
-COPY specs /app/specs
-COPY demo-repo /app/demo-repo
-COPY fixtures /app/fixtures
+COPY config/agent-specs /app/agent-specs
+COPY config/sentinel /app/config/sentinel
+COPY samples/slugkit /app/samples/slugkit
+COPY tests/fixtures/injections /app/fixtures/injections
 ENV PYTHONPATH=/app/src PYTHONUNBUFFERED=1
 USER 10001
 WORKDIR /app

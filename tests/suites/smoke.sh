@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# M1 smoke test: verifies the L3/L4 boundary using the real manifests and stand-in pods.
+# Smoke test: verifies the L3/L4 boundary using the real manifests and stand-in pods.
 #   - a gVisor session pod can reach only the gateway (stand-in) and nothing else
 #   - lab-ext accepts traffic only from credproxy (stand-in)
 #   - containment via per-session egressDeny takes effect
 # Stand-ins carry the real labels (app=gateway / app=credproxy) and are removed afterwards.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.." && source tests/lib.sh
 SID="smoke$RANDOM"
-pass=0; fail=0
 check() { # name expected actual
   if [ "$2" = "$3" ]; then echo "PASS  $1 (got $3)"; pass=$((pass+1)); else echo "FAIL  $1 (expected $2, got $3)"; fail=$((fail+1)); fi
 }
@@ -126,5 +125,4 @@ for _ in $(seq 1 20); do [ "$(code "http://$GW:8080/")" != 200 ] && break; sleep
 check "gateway blocked after quarantine" "000" "$(code "http://$GW:8080/")"
 echo "      containment took $(( $(date +%s) - start ))s"
 
-echo; echo "passed=$pass failed=$fail"
-[ "$fail" = 0 ]
+finish

@@ -1,13 +1,20 @@
-"""Control plane API.
+"""Control plane HTTP API (FastAPI); thin routing over sessions.py and specs.py.
 
-Public (sbxctl, via NodePort bound to 127.0.0.1): runs, sessions, logs, stop, destroy, diff.
-  Prototype identity is the X-User header; production replaces it with OIDC.
+Public (sbxctl, via NodePort bound to 127.0.0.1): runs, sessions, logs, messages, stop, destroy,
+  diff, contain, specs, alerts, and the fleet freeze (security admins only, checked in sessions.py).
+  Prototype identity is the X-User header, trusted as-is; production replaces it with OIDC.
+  `system:` identities are reserved for in-process callers and refused here.
 Internal (X-Sbx-Internal, per-component keys): token validation (gateway), compiled policy
-(gateway, credproxy, sentinel), alerts (sentinel). There is deliberately no internal way to create
-a session: every session goes through /runs, i.e. the spec registry and its baseline.
+(gateway, credproxy, sentinel), alerts (sentinel). Each endpoint names the components it accepts.
+There is deliberately no internal way to create a session: every session goes through /runs,
+i.e. the spec registry and its baseline.
+
+Logs returned to users are pod stdout (untrusted); sbxctl escapes them before display.
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -24,25 +31,28 @@ store = Store()
 
 @app.on_event("startup")
 def _startup() -> None:
-    for r in specs.bootstrap(store):
-        action = "spec_rejected" if "rejected" in r else "spec_registered"
-        sessions.evidence.write_sync(action, by="system:bootstrap", **{k: v for k, v in r.items() if k != "unchanged"})
+    """Registers the shipped specs through the baseline gate, then starts the reconciler."""
+    for result in specs.bootstrap(store):
+        action = "spec_rejected" if "rejected" in result else "spec_registered"
+        sessions.evidence.write_sync(action, by="system:bootstrap",
+                                     **{k: v for k, v in result.items() if k != "unchanged"})
     sessions.reconcile_forever(store)
 
 
 def scope(*allowed: str):
     """Dependency: internal endpoint callable only by the listed components."""
     def dep(x_sbx_internal: str | None = Header(default=None)) -> str:
-        who = internal.caller(x_sbx_internal)
-        if who is None:
+        caller = internal.caller(x_sbx_internal)
+        if caller is None:
             raise HTTPException(401, "internal auth required")
-        if who not in allowed:
-            raise HTTPException(403, f"{who} may not call this endpoint")
-        return who
+        if caller not in allowed:
+            raise HTTPException(403, f"{caller} may not call this endpoint")
+        return caller
     return dep
 
 
 def require_user(x_user: str | None = Header(default=None)) -> str:
+    """Dependency: the calling user (prototype: the X-User header)."""
     if not x_user:
         raise HTTPException(401, "X-User required")
     if x_user.startswith("system:"):                      # reserved for in-process callers (bootstrap)
@@ -50,7 +60,8 @@ def require_user(x_user: str | None = Header(default=None)) -> str:
     return x_user
 
 
-def _call(fn, *args):
+def _call_session_op(fn, *args):
+    """Calls a sessions.* operation with the store, mapping SessionError to its HTTP status."""
     try:
         return fn(store, *args)
     except sessions.SessionError as e:
@@ -62,16 +73,16 @@ async def register_spec(request: Request, user: str = Depends(require_user)) -> 
     """Spec authors register a new version (raw YAML body). Rejected specs never reach the registry."""
     raw = await request.body()
     try:
-        r = specs.register(store, raw, user)
+        result = specs.register(store, raw, user)
     except PermissionError as e:
         sessions.evidence.write_sync("spec_rejected", by=user, digest=specs.digest_of(raw), reasons=[str(e)])
         raise HTTPException(403, str(e)) from None
     except specs.SpecError as e:
         sessions.evidence.write_sync("spec_rejected", by=user, digest=specs.digest_of(raw), reasons=e.details or [str(e)])
         raise HTTPException(422, {"error": str(e), "reasons": e.details or [str(e)]}) from None
-    if not r.get("unchanged"):
-        sessions.evidence.write_sync("spec_registered", by=user, **r)
-    return r
+    if not result.get("unchanged"):
+        sessions.evidence.write_sync("spec_registered", by=user, **result)
+    return result
 
 
 @app.post("/specs/approvals")
@@ -79,13 +90,13 @@ async def approve_spec(request: Request, user: str = Depends(require_user)) -> d
     """Security approvers approve exact spec bytes; authors then register them (two-person rule)."""
     raw = await request.body()
     try:
-        r = specs.approve(store, raw, user)
+        result = specs.approve(store, raw, user)
     except PermissionError as e:
         raise HTTPException(403, str(e)) from None
     except specs.SpecError as e:
         raise HTTPException(422, {"error": str(e), "reasons": e.details or [str(e)]}) from None
-    sessions.evidence.write_sync("spec_approved", **r)
-    return r
+    sessions.evidence.write_sync("spec_approved", **result)
+    return result
 
 
 @app.get("/specs")
@@ -100,12 +111,12 @@ class RunIn(BaseModel):
 
 @app.post("/runs")
 def create_run(r: RunIn, user: str = Depends(require_user)) -> dict:
-    return _call(sessions.run, user, r.spec, r.params)
+    return _call_session_op(sessions.run, user, r.spec, r.params)
 
 
 @app.get("/sessions")
 def list_sessions(user: str = Depends(require_user)) -> list:
-    return [_public(s) for s in store.list() if s["user"] == user]
+    return [_public_view(s) for s in store.list() if s["user"] == user]
 
 
 @app.get("/sessions/{sid}")
@@ -113,7 +124,7 @@ def get_session(sid: str, user: str = Depends(require_user)) -> dict:
     s = store.get(sid)
     if s is None or s["user"] != user:
         raise HTTPException(404, "no such session")
-    return {**_public(s), "pod_status": k8s.pod_status(sid)}
+    return {**_public_view(s), "pod_status": k8s.pod_status(sid)}
 
 
 @app.get("/sessions/{sid}/logs")
@@ -133,17 +144,17 @@ class MessageIn(BaseModel):
 
 @app.post("/sessions/{sid}/messages")
 def send_message(sid: str, m: MessageIn, user: str = Depends(require_user)) -> dict:
-    return _call(sessions.send_message, sid, user, m.text)
+    return _call_session_op(sessions.send_message, sid, user, m.text)
 
 
 @app.post("/sessions/{sid}/stop")
 def stop_session(sid: str, user: str = Depends(require_user)) -> dict:
-    return _call(sessions.stop, sid, user)
+    return _call_session_op(sessions.stop, sid, user)
 
 
 @app.delete("/sessions/{sid}")
 def destroy_session(sid: str, user: str = Depends(require_user)) -> dict:
-    return _call(sessions.destroy, sid, user)
+    return _call_session_op(sessions.destroy, sid, user)
 
 
 @app.post("/sessions/{sid}/contain")
@@ -151,7 +162,7 @@ def contain_session(sid: str, user: str = Depends(require_user)) -> dict:
     s = store.get(sid)
     if s is None or s["user"] != user:
         raise HTTPException(404, "no such session")
-    return _call(sessions.contain, sid, f"user:{user}", None, "manual")
+    return _call_session_op(sessions.contain, sid, f"user:{user}", None, "manual")
 
 
 class FreezeIn(BaseModel):
@@ -160,24 +171,25 @@ class FreezeIn(BaseModel):
 
 @app.post("/admin/freeze")
 def freeze(f: FreezeIn, user: str = Depends(require_user)) -> dict:
-    return _call(sessions.freeze, user, f.reason)
+    return _call_session_op(sessions.freeze, user, f.reason)
 
 
 @app.post("/admin/unfreeze")
 def unfreeze(user: str = Depends(require_user)) -> dict:
-    return _call(sessions.unfreeze, user)
+    return _call_session_op(sessions.unfreeze, user)
 
 
 @app.get("/alerts")
 def list_alerts(user: str = Depends(require_user)) -> list:
     """Alerts on the caller's sessions, with containment verifications attached."""
     rows = _read_alerts()
-    verif = {r["alert_id"]: r for r in rows if r.get("action") == "containment_verification"}
-    cont = {r["alert_id"]: r["result"] for r in rows if r.get("action") == "containment"}
+    verifications = {r["alert_id"]: r for r in rows if r.get("action") == "containment_verification"}
+    containments = {r["alert_id"]: r["result"] for r in rows if r.get("action") == "containment"}
     out = []
-    for a in rows:
-        if a.get("action") == "alert" and a.get("user") == user:
-            out.append({**a, "containment": cont.get(a["alert_id"]), "verification": verif.get(a["alert_id"])})
+    for row in rows:
+        if row.get("action") == "alert" and row.get("user") == user:
+            out.append({**row, "containment": containments.get(row["alert_id"]),
+                        "verification": verifications.get(row["alert_id"])})
     return out
 
 
@@ -193,21 +205,23 @@ class AlertIn(BaseModel):
 
 
 @app.post("/internal/alerts", dependencies=[Depends(scope("sentinel"))])
-def raise_alert(a: AlertIn) -> dict:
+def raise_alert(alert: AlertIn) -> dict:
     """Alert sink for the sentinel. Joins user/spec from the registry so every alert links
     initiating user -> session -> observed action. The alert is recorded at detection time,
     then (if requested) the session is contained and a linked containment record is written."""
-    s = store.get(a.session_id) if a.session_id else None
-    who = {"user": s["user"], "spec": s["spec_name"], "spec_digest": s["spec_digest"], "pod": s["pod_name"],
-           "pod_ip": s["pod_ip"]} if s else {}
-    rec = sessions.alerts.write_sync("alert", **a.model_dump(), **who)
+    session = store.get(alert.session_id) if alert.session_id else None
+    who = {"user": session["user"], "spec": session["spec_name"], "spec_digest": session["spec_digest"],
+           "pod": session["pod_name"], "pod_ip": session["pod_ip"]} if session else {}
+    rec = sessions.alerts.write_sync("alert", **alert.model_dump(), **who)
     containment = None
-    if a.contain and s and s["state"] in ("running", "creating", "stopping"):
+    if alert.contain and session and session["state"] in ("running", "creating", "stopping"):
         try:
-            containment = sessions.contain(store, a.session_id, "sentinel", a.alert_id, f"{a.rule}: {a.summary}")
+            containment = sessions.contain(store, alert.session_id, "sentinel", alert.alert_id,
+                                           f"{alert.rule}: {alert.summary}")
         except sessions.SessionError as e:
             containment = {"error": str(e)}
-        sessions.alerts.write_sync("containment", alert_id=a.alert_id, session_id=a.session_id, result=containment)
+        sessions.alerts.write_sync("containment", alert_id=alert.alert_id, session_id=alert.session_id,
+                                   result=containment)
     return {**rec, "containment": containment}
 
 
@@ -220,6 +234,7 @@ class VerificationIn(BaseModel):
 
 @app.post("/internal/alerts/verification", dependencies=[Depends(scope("sentinel"))])
 def verify_alert(v: VerificationIn) -> dict:
+    """The sentinel's independent check that a containment actually took effect."""
     return sessions.alerts.write_sync("containment_verification", **v.model_dump())
 
 
@@ -229,8 +244,6 @@ def internal_alerts() -> list:
 
 
 def _read_alerts() -> list:
-    import json
-    import os
     path = sessions.alerts.path
     if not os.path.exists(path):
         return []
@@ -240,10 +253,11 @@ def _read_alerts() -> list:
 
 @app.get("/sessions/{sid}/diff", response_class=PlainTextResponse)
 def session_diff(sid: str, user: str = Depends(require_user)) -> str:
-    return _call(sessions.diff, sid, user)
+    return _call_session_op(sessions.diff, sid, user)
 
 
-def _public(s: dict) -> dict:
+def _public_view(s: dict) -> dict:
+    """Session fields users may see: never the token hash, policy or canaries."""
     return {k: s.get(k) for k in ("session_id", "user", "spec_name", "spec_digest", "params", "pod_name",
                                   "pod_ip", "state", "detail", "turns", "scan", "created_at", "last_activity", "state_changed_at", "ended_at")}
 
@@ -260,6 +274,7 @@ def healthz() -> dict:
 
 @app.post("/internal/validate", dependencies=[Depends(scope("gateway"))])
 def validate(v: ValidateIn) -> dict:
+    """Gateway check on every model/egress call: token known, bound to the caller's pod IP, session running."""
     s = store.by_token(v.token)
     if s is None:
         raise HTTPException(401, "unknown token")
@@ -270,16 +285,17 @@ def validate(v: ValidateIn) -> dict:
     now = time.time()
     if now - (s.get("last_activity") or 0) > 10:      # every model/egress call is activity (idle reaper)
         store.update(s["session_id"], last_activity=now)
-    return _context(s)
+    return _session_context(s)
 
 
 @app.get("/internal/policy/{session_id}", dependencies=[Depends(scope("gateway", "credproxy", "sentinel"))])
 def policy(session_id: str) -> dict:
+    """Compiled policy and canaries for one session (enforcement points and the sentinel only)."""
     s = store.get(session_id)
     if s is None:
         raise HTTPException(404, "no such session")
-    return {**_context(s), "policy": s["policy"], "canaries": s["canaries"]}
+    return {**_session_context(s), "policy": s["policy"], "canaries": s["canaries"]}
 
 
-def _context(s: dict) -> dict:
+def _session_context(s: dict) -> dict:
     return {k: s[k] for k in ("session_id", "user", "spec_name", "spec_digest", "pod_name", "pod_ip", "state")}

@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# M2 end-to-end: a gVisor sandbox pod with only a placeholder token uses the AI and egress
+# End to end: a gVisor sandbox pod with only a placeholder token uses the AI and egress
 # gateways; credproxy injects the real key. Verifies enforcement and evidence from outside
 # the sandbox (gateway evidence log + lab receipts). The session is created through the normal
 # path (sbxctl run -> spec registry -> control plane); there is no back door to register one.
 set -uo pipefail
-cd "$(dirname "$0")/.."
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "PASS  $1 (got $3)"; pass=$((pass+1)); else echo "FAIL  $1 (expected $2, got $3)"; fail=$((fail+1)); fi; }
+cd "$(dirname "$0")/../.." && source tests/lib.sh
 # bugfix-agent-open write-allows paste-mock (deliberately vulnerable), so the HTTP/TLS exfil mechanics
 # below are reachable; the default bugfix-agent spec blocks them (security_test B9/B10).
 SID=$(bin/sbxctl run bugfix-agent-open -p repo=demo/app -p task="Reply with the word ok. Do not use any tools." | sed -n 's/^session \([a-z0-9]*\) started.*/\1/p')
@@ -20,7 +18,7 @@ sb() { kubectl -n sbx-sessions exec "$POD" -- "$@" 2>/dev/null; }
 code() { sb curl -s -o /dev/null -m 10 -w '%{http_code}' "$@" || true; }
 for _ in $(seq 1 20); do [ "$(code http://paste-mock.lab-ext/ping)" = 200 ] && break; sleep 1; done
 
-# Order matters now that detection is live (sentinel): an HTTP canary send triggers D1 auto-containment,
+# Order matters because the sentinel is watching: an HTTP canary send triggers D1 auto-containment,
 # so functional checks run first, the (undetectable) TLS canary next, and the HTTP canary last.
 echo "--- egress gateway"
 check "allowed host, benign POST"         200 "$(code -X POST --data 'hello' http://paste-mock.lab-ext/upload)"
@@ -67,8 +65,7 @@ check "hash chain verifies" True "$(kubectl -n sbx-system exec deploy/gateway --
 echo "--- ground truth (lab receipts)"
 REC=$(kubectl -n lab-ext logs deploy/paste-mock; kubectl -n lab-ext logs deploy/attacker-sink)
 B64=$(printf '%s' "$CANARY" | base64)
-check "canary reached paste-mock (exfil via allowed destination)" yes "$(echo "$REC" | grep '"sink": "paste-mock"' | grep -q "$(printf 'PAYMENTS_API_KEY=%s\n' "$CANARY" | base64)" && echo yes || echo no)"
+check "canary reached paste-mock (exfil via allowed destination)" yes "$(echo "$REC" | grep '"sink": "paste-mock"' | contains "$(printf 'PAYMENTS_API_KEY=%s\n' "$CANARY" | base64)" && echo yes || echo no)"
 check "canary never reached attacker-sink" 0 "$(echo "$REC" | grep '"sink": "attacker-sink"' | grep -c "${B64:0:16}")"
 
-echo; echo "passed=$pass failed=$fail"
-[ "$fail" = 0 ]
+finish

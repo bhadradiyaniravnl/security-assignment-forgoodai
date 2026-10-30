@@ -2,13 +2,10 @@
 # GitHub flow: clone through credproxy with a repo-scoped read token, agent works offline, the control
 # plane opens a draft PR with a separate write token, and both tokens are revoked. Negative controls:
 # a CI-workflow change and a canary in the diff must both be refused.
-#   AGENT=1 harness/m8_github.sh   also runs the real testwriter agent and opens a real PR (~$0.40)
+#   AGENT=1 tests/suites/github.sh   also runs the real testwriter agent and opens a real PR (~$0.40)
 set -uo pipefail
-cd "$(dirname "$0")/.."
-CTL=bin/sbxctl
+cd "$(dirname "$0")/../.." && source tests/lib.sh
 REPO=bhadradiyaniravnl/items-api-sample
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "PASS  $1 (got $3)"; pass=$((pass+1)); else echo "FAIL  $1 (expected $2, got $3)"; fail=$((fail+1)); fi; }
 run() { $CTL run testwriter-agent -p repo=github:$REPO -p task="$1" | sed -n 's/^session \([a-z0-9]*\) started.*/\1/p'; }
 pr_field() { python3 -c "import json,sys; p=json.load(sys.stdin).get('pr') or {}; print(p.get('$1',''))"; }
 ev() { kubectl -n sbx-system exec deploy/control-plane -- sh -c "grep '\"$1\"' /evidence/control-plane.jsonl"; }
@@ -32,7 +29,7 @@ check "PR touching .github/workflows refused" "protected" "$($CTL stop "$A" | pr
 B=$(run "Reply with the word ok. Do not use any tools.")
 kubectl -n sbx-sessions exec "sandbox-$B" -- sh -c 'mkdir -p /workspace/repo/tests && printf "KEY = \"%s\"\n" "$(cut -d= -f2 /workspace/repo/.env)" > /workspace/repo/tests/test_fixture.py'
 check "PR containing the canary refused" "canary" "$($CTL stop "$B" | pr_field error | grep -o canary)"
-check "D1 alert for the PR channel" yes "$($CTL alerts | grep -A1 " D1 .*$B" | grep -q 'PR publication refused' && echo yes || echo no)"
+check "D1 alert for the PR channel" yes "$($CTL alerts | grep -A1 " D1 .*$B" | contains 'PR publication refused' && echo yes || echo no)"
 check "no branch pushed for refused sessions" 0 "$(gh api repos/$REPO/branches --jq '.[].name' | grep -c -E "agent/($A|$B)")"
 
 echo "--- security-review regressions"
@@ -45,7 +42,7 @@ kubectl -n sbx-sessions exec "sandbox-$C" -- sh -c '
   chmod +x /tmp/fake.sh && git config diff.external /tmp/fake.sh'
 OUT=$($CTL stop "$C")
 check "forged diff ignored; quoted-path workflow refused" "protected" "$(echo "$OUT" | pr_field error | grep -o protected | head -1)"
-check "control-plane diff contains the real workflow file" yes "$($CTL diff "$C" | grep -q 'ci.*\.yml' && echo yes || echo no)"
+check "control-plane diff contains the real workflow file" yes "$($CTL diff "$C" | contains 'ci.*\.yml' && echo yes || echo no)"
 D=$(run "Reply with the word ok. Do not use any tools.")
 kubectl -n sbx-sessions exec "sandbox-$D" -- sh -c '
   cd /workspace/repo && mkdir -p tests && echo "def test_ok(): pass" > tests/test_ok.py &&
@@ -70,5 +67,4 @@ if [ "${AGENT:-0}" = 1 ]; then
   $CTL destroy "$C" >/dev/null
 fi
 for s in "$A" "$B"; do $CTL destroy "$s" >/dev/null; done
-echo; echo "passed=$pass failed=$fail"
-[ "$fail" = 0 ]
+finish

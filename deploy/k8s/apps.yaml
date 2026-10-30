@@ -89,7 +89,6 @@ spec:
           command: ["python", "-m", "sbx.gateway.main"]
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
-            - { name: SBX_FAULT_INJECTION, value: "1" }    # LAB ONLY: lets m10 simulate an under-reporting gateway
             - name: SBX_INTERNAL_KEY      # its own key only
               valueFrom: { secretKeyRef: { name: sbx-internal, key: gateway-key } }
           ports:
@@ -102,7 +101,7 @@ spec:
             capabilities: { drop: [ALL] }
           volumeMounts:
             - { name: evidence, mountPath: /evidence }
-            - { name: gwtmp, mountPath: /tmp }
+            - { name: gwtmp, mountPath: /tmp }       # scratch (read-only root fs)
         - name: evidence-shipper                          # pushes hash-chained evidence to the sentinel
           image: sbx/services:dev
           imagePullPolicy: Never

@@ -1,16 +1,26 @@
 """Sentinel: continuously running detection and response, in its own namespace and on its own node.
 
-  sources   shipped platform evidence (verified on arrival: sequence + hash chain)
-            Hubble flows from session pods AND platform pods (kernel datapath, platform can't fake)
-  detect    D1-D3, EV (evidence integrity), S1 (gateway under-reporting: Cilium L7/L4 counts vs shipped
-            gateway evidence), S2 (platform egress), S6 (leak after containment)
+What it trusts:
+  - Hubble flows from session pods AND platform pods: produced by Cilium's eBPF datapath, so no pod
+    (platform or sandbox) can fake them. Treated as ground truth for where traffic went.
+  - Shipped platform evidence (gateway.jsonl, control-plane.jsonl): claims made by the platform.
+    Verified on arrival (sequence continuity + hash chain) and copied to the sentinel's own volume,
+    so a gap or an edit raises EV; it may still be incomplete, which S1 checks.
+  - The control plane only for per-session policy lookups (cached; built-in defaults if it is down).
+
+What it does:
+  detect    D1-D3, EV (evidence integrity), S1 (gateway completeness: Cilium L7/L4 request counts vs
+            shipped gateway evidence), S2 (platform pod egress), S6 (traffic after containment),
+            plus the detection policy's custom match rules
   policy    detection policy (rules, tuning, response actions) from the ConfigMap sentinel-detection,
             hot-reloaded, validated against a compiled-in floor; every load or rejection is recorded
   respond   its OWN quarantine/freeze Cilium deny policies (works with the control plane down),
             then best-effort token revocation + snapshot via the control plane
-  record    its own hash-chained alert/action log on its own volume
+  record    its own hash-chained alert/action log on its own volume ($SENTINEL_DATA/sentinel.jsonl),
+            a verified copy of shipped evidence ($SENTINEL_DATA/copy/), and one JSON line per event on stdout
 
-Ports: 9100 ingest (from the shipper only), 127.0.0.1:9101 admin (kubectl exec into this pod).
+Ports: 9100 ingest (from the evidence shipper only, keyed), 127.0.0.1:9101 admin (reached with
+`kubectl exec` into this pod; see ctl.py).
 """
 from __future__ import annotations
 
@@ -24,56 +34,63 @@ from aiohttp import web
 
 from sbx.common import internal
 from sbx.common.evidence import GENESIS, EvidenceLog, _digest
-from sbx.common.policy import ControlPlane
+from sbx.common.session_policy import ControlPlane
 from sbx.sentinel import actions
-from sbx.sentinel import policy as detpol
-from sbx.sentinel.rules import Engine, _ts, alert, leak_after_containment, platform_flow_alert
+from sbx.sentinel import detection_policy as detpol
+from sbx.sentinel.rules import Engine, alert, leak_after_containment, parse_time, platform_flow_alert
 
 DATA = os.environ.get("SENTINEL_DATA", "/data")
-HUBBLE = os.environ.get("HUBBLE_SERVER", "hubble-relay.kube-system.svc:80")
+HUBBLE_SERVER = os.environ.get("HUBBLE_SERVER", "hubble-relay.kube-system.svc:80")
 INGEST_KEY = os.environ.get("SENTINEL_INGEST_KEY", "")
+# Session policy used when the control plane can't be asked and nothing is cached for the session.
 DEFAULT_POLICY = {"state": "running", "policy": {"deny_burst": {"count": 5, "window_s": 60}}}
+# Shipped events this much older than our start are replayed history: verified and copied, not alerted on.
 REPLAY_GRACE_S = 60
+BOOT_POLICY = os.environ.get("SENTINEL_BOOT_POLICY", "/app/config/sentinel/detection.yaml")
 
-cp = ControlPlane(ttl=2.0)
+control_plane = ControlPlane(ttl=2.0)
 engine = Engine()
 log = EvidenceLog("sentinel", DATA)                         # alerts, actions, verifications
 started = time.time()
-sent: set[str] = set()
+raised_alert_ids: set[str] = set()                           # dedupe: every alert id ever written (survives restarts)
 contained: dict[str, float] = {}                             # sid -> time containment took effect
 forwarded: dict[str, list] = {}                              # sid -> times Cilium forwarded egress after containment
-custom = detpol.CustomRules()
-policy_rv: str | None = None                                 # ConfigMap resourceVersion last seen
-# S1: what the kernel saw vs what the gateway logged, per session
+custom_rules = detpol.CustomRules()
+policy_resource_version: str | None = None                   # ConfigMap resourceVersion last seen
+# S1 (gateway completeness): what the kernel saw vs what the gateway logged, per session
 seen_ai: dict[str, list] = {}       # Cilium L7: HTTP requests to the AI gateway (excl. /healthz)
 seen_egress: dict[str, list] = {}   # Cilium L4: new TCP connections to the egress proxy (1 connection = 1 request)
 logged_ai: dict[str, list] = {}     # shipped gateway evidence: ai_request events
 logged_egress: dict[str, list] = {}  # shipped gateway evidence: egress events (excl. connect_close)
 ip_to_sid: dict[str, str] = {}
-_recent: dict[tuple, float] = {}
-policies: dict[str, dict] = {}
+datapath_dedup: dict[tuple, float] = {}                      # S1 counting: flow key -> last time counted
+session_policies: dict[str, dict] = {}                       # sid -> last policy the control plane returned
 positions: dict[str, int] = {}                              # file -> last verified seq
-chain_head: dict[str, str] = {}
-broken: set[str] = set()
+chain_head: dict[str, str] = {}                             # file -> hash of the last verified record
+broken_files: set[str] = set()                              # files with a gap or chain break (alerted once)
 
 
-def out(**kw) -> None:
+def emit(**kw) -> None:
+    """One JSON line on stdout (the pod log); the hash-chained log is the record of truth."""
     print(json.dumps({"ts": time.time(), **kw}), flush=True)
 
 
 # ------------------------------------------------------------------------------------------ helpers
-async def policy(sid: str) -> dict:
+async def session_policy(sid: str) -> dict:
+    """The session's policy (state + deny burst) from the control plane, falling back to the last
+    answer we cached, then to DEFAULT_POLICY: detection never stops because the control plane is down."""
     try:
-        status, body = await cp.policy(sid)
+        status, body = await control_plane.policy(sid)
         if status == 200:
-            policies[sid] = body
+            session_policies[sid] = body
             return body
     except Exception:  # noqa: BLE001 - control plane down: keep detecting with defaults
         pass
-    return policies.get(sid, DEFAULT_POLICY)
+    return session_policies.get(sid, DEFAULT_POLICY)
 
 
-async def cp_post(http: aiohttp.ClientSession, path: str, body: dict) -> dict | None:
+async def post_to_control_plane(http: aiohttp.ClientSession, path: str, body: dict) -> dict | None:
+    """Best-effort POST to the control plane's internal API; failures come back as a dict, never raise."""
     try:
         async with http.post(internal.CONTROL_PLANE_URL + path, json=body,
                              timeout=aiohttp.ClientTimeout(total=30)) as r:
@@ -83,25 +100,27 @@ async def cp_post(http: aiohttp.ClientSession, path: str, body: dict) -> dict | 
 
 
 # ---------------------------------------------------------------------------------------- response
-async def respond(http: aiohttp.ClientSession, a: dict) -> None:
+async def respond(http: aiohttp.ClientSession, new_alert: dict) -> None:
     """Run what the active detection policy says for this rule (and stage). Monitor mode records the
-    alert and the steps it would have run, and does nothing else."""
+    alert and the steps it would have run, and does nothing else. Each alert id is handled once."""
     pol = engine.pol
-    d = pol.decide(a["rule"], a.pop("stage", None))
-    if not d["enabled"]:
+    decision = pol.decide(new_alert["rule"], new_alert.pop("stage", None))
+    if not decision["enabled"]:
         return
-    if d["mode"] == "monitor":
-        a["alert_id"] += "-monitor"
-    if a["alert_id"] in sent:
+    if decision["mode"] == "monitor":
+        new_alert["alert_id"] += "-monitor"
+    if new_alert["alert_id"] in raised_alert_ids:
         return
-    sent.add(a["alert_id"])
-    sid = a.get("session_id")
-    a.update(severity=d["severity"], mode=d["mode"], response=d["response"], policy=pol.digest[:19])
-    if d["mode"] == "monitor":
-        log.write_sync("alert", **a, would_run=d["steps"], sentinel_action=None)
-        out(alert=a["rule"], mode="monitor", session=sid, summary=a["summary"], would_run=d["steps"])
+    raised_alert_ids.add(new_alert["alert_id"])
+    sid = new_alert.get("session_id")
+    new_alert.update(severity=decision["severity"], mode=decision["mode"], response=decision["response"],
+                     policy=pol.digest[:19])
+    if decision["mode"] == "monitor":
+        log.write_sync("alert", **new_alert, would_run=decision["steps"], sentinel_action=None)
+        emit(alert=new_alert["rule"], mode="monitor", session=sid, summary=new_alert["summary"],
+             would_run=decision["steps"])
         return
-    steps, acted = d["steps"], None
+    steps, acted = decision["steps"], None
     if "quarantine" in steps and sid:
         t0 = time.time()
         created = await asyncio.to_thread(actions.quarantine, sid)     # 1. our own deny policy, first
@@ -111,16 +130,17 @@ async def respond(http: aiohttp.ClientSession, a: dict) -> None:
     if "freeze" in steps:
         created = await asyncio.to_thread(actions.freeze)
         acted = {**(acted or {}), "freeze": {"policy": actions.FREEZE, "created": created}}
-    log.write_sync("alert", **a, sentinel_action=acted)
+    log.write_sync("alert", **new_alert, sentinel_action=acted)
     if "notify-control-plane" in steps:
         # 2. best effort: control plane revokes the token, snapshots evidence, records the alert for users
-        cp_result = await cp_post(http, "/internal/alerts", {**a, "contain": "quarantine" in steps})
-        log.write_sync("control_plane_notified", alert_id=a["alert_id"], session_id=sid,
+        cp_result = await post_to_control_plane(http, "/internal/alerts",
+                                                {**new_alert, "contain": "quarantine" in steps})
+        log.write_sync("control_plane_notified", alert_id=new_alert["alert_id"], session_id=sid,
                        result={k: (cp_result or {}).get(k) for k in ("seq", "error", "status")})
-    out(alert=a["rule"], severity=a["severity"], session=sid, summary=a["summary"], response=d["response"],
-        quarantined=bool(acted and "policy" in acted))
+    emit(alert=new_alert["rule"], severity=new_alert["severity"], session=sid, summary=new_alert["summary"],
+         response=decision["response"], quarantined=bool(acted and "policy" in acted))
     if acted and "policy" in acted and "verify" in steps:
-        asyncio.create_task(verify(http, a["alert_id"], sid, acted["at"]))
+        asyncio.create_task(verify(http, new_alert["alert_id"], sid, acted["at"]))
 
 
 async def verify(http: aiohttp.ClientSession, alert_id: str, sid: str, at: float) -> None:
@@ -140,19 +160,22 @@ async def verify(http: aiohttp.ClientSession, alert_id: str, sid: str, at: float
                "sentinel_policy_present": present, "result": "verified" if ok else
                ("leaking" if fwd else ("inconclusive: no traffic observed" if not drops else "policy missing"))}
     log.write_sync("containment_verification", alert_id=alert_id, session_id=sid, verified=ok, sources=sources)
-    await cp_post(http, "/internal/alerts/verification",
-                  {"alert_id": alert_id, "session_id": sid, "verified": ok, "sources": sources})
-    out(verification=sid, verified=ok, **sources)
+    await post_to_control_plane(http, "/internal/alerts/verification",
+                                {"alert_id": alert_id, "session_id": sid, "verified": ok, "sources": sources})
+    emit(verification=sid, verified=ok, **sources)
 
 
 # ------------------------------------------------------------------------------- ingest (evidence)
 async def ingest_position(request: web.Request) -> web.Response:
+    """GET /ingest/position: last verified seq per file, so the shipper resumes from there."""
     if request.headers.get("X-Sbx-Ingest") != INGEST_KEY or not INGEST_KEY:
         raise web.HTTPUnauthorized()
     return web.json_response(positions)
 
 
 async def ingest(request: web.Request) -> web.Response:
+    """POST /ingest {file, events}: verify each new record (sequence continuity, hash chain), keep a
+    copy, then run detection on it. The first gap or break per file raises one EV alert."""
     if request.headers.get("X-Sbx-Ingest") != INGEST_KEY or not INGEST_KEY:
         raise web.HTTPUnauthorized()
     body = await request.json()
@@ -161,66 +184,72 @@ async def ingest(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest()
     http = request.app["http"]
     with open(os.path.join(DATA, "copy", name), "a") as copy:
-        for e in body["events"]:
+        for event in body["events"]:
             last = positions.get(name, 0)
-            if e["seq"] <= last:
+            if event["seq"] <= last:
                 continue
-            if e["seq"] != last + 1 and name not in broken:          # a hole: something was never shipped
-                broken.add(name)
-                await respond(http, alert("EV", "high", None, f"{name}: sequence gap {last} -> {e['seq']}",
-                                          {"file": name}, [{"source": "shipper", "seq": e["seq"]}]))
-            claimed = e.get("hash")
-            body_ = {k: v for k, v in e.items() if k != "hash"}
+            if event["seq"] != last + 1 and name not in broken_files:     # a hole: something was never shipped
+                broken_files.add(name)
+                await respond(http, alert("EV", None, f"{name}: sequence gap {last} -> {event['seq']}",
+                                          {"file": name}, [{"source": "shipper", "seq": event["seq"]}]))
+            claimed = event.get("hash")
+            unhashed = {k: v for k, v in event.items() if k != "hash"}
             prev = chain_head.get(name, GENESIS)
-            if (body_.get("prev_hash") != prev or _digest(prev, body_) != claimed) and name not in broken:
-                broken.add(name)
-                await respond(http, alert("EV", "high", None, f"{name}: hash chain broken at seq {e['seq']}",
-                                          {"file": name}, [{"source": "shipper", "seq": e["seq"]}]))
-            copy.write(json.dumps(e, sort_keys=True) + "\n")
-            positions[name], chain_head[name] = e["seq"], claimed
-            await handle_event(http, name, e)
+            if (unhashed.get("prev_hash") != prev or _digest(prev, unhashed) != claimed) and name not in broken_files:
+                broken_files.add(name)
+                await respond(http, alert("EV", None, f"{name}: hash chain broken at seq {event['seq']}",
+                                          {"file": name}, [{"source": "shipper", "seq": event["seq"]}]))
+            copy.write(json.dumps(event, sort_keys=True) + "\n")
+            positions[name], chain_head[name] = event["seq"], claimed
+            await handle_event(http, name, event)
     return web.json_response({"ok": True, "position": positions.get(name, 0)})
 
 
 def grace_s() -> float:
+    """S6 grace period: traffic this soon after containment is not yet a leak."""
     return float(engine.pol.param("S6", "grace_s"))
 
 
-async def run_custom(http: aiohttp.ClientSession, source: str, event: dict, sid: str | None) -> None:
-    for c in custom.evaluate(engine.pol, source, event, sid):
-        await respond(http, alert(c["rule"], "medium", sid, c["summary"], c["observed"], c["evidence"], key=c["key"]))
+async def run_custom_rules(http: aiohttp.ClientSession, source: str, event: dict, sid: str | None) -> None:
+    """Evaluate the detection policy's custom match rules for one event from `source`."""
+    for match in custom_rules.evaluate(engine.pol, source, event, sid):
+        await respond(http, alert(match["rule"], sid, match["summary"], match["observed"],
+                                  match["evidence"], key=match["key"]))
 
 
-async def handle_event(http: aiohttp.ClientSession, name: str, e: dict) -> None:
-    if e.get("ts", 0) >= started - REPLAY_GRACE_S:
-        await run_custom(http, name.removesuffix(".jsonl"), e, e.get("session_id"))
+async def handle_event(http: aiohttp.ClientSession, name: str, event: dict) -> None:
+    """Detection on one verified shipped record: custom rules, containment bookkeeping (control
+    plane), S1 logged-request counts and the built-in gateway rules (gateway)."""
+    if event.get("ts", 0) >= started - REPLAY_GRACE_S:
+        await run_custom_rules(http, name.removesuffix(".jsonl"), event, event.get("session_id"))
     if name == "control-plane.jsonl":
-        if e.get("action") == "session_contain" and e.get("session_id"):
-            contained.setdefault(e["session_id"], e.get("quarantined_at") or e["ts"])
-        elif e.get("action") == "fleet_freeze":
-            for sid in e.get("frozen_sessions", []):
-                contained.setdefault(sid, e["ts"])
+        if event.get("action") == "session_contain" and event.get("session_id"):
+            contained.setdefault(event["session_id"], event.get("quarantined_at") or event["ts"])
+        elif event.get("action") == "fleet_freeze":
+            for sid in event.get("frozen_sessions", []):
+                contained.setdefault(sid, event["ts"])
         return
-    sid = e.get("session_id") or ip_to_sid.get(e.get("pod_ip", ""))
-    if sid and e.get("ts", 0) >= started:
-        if e.get("action") == "ai_request":
-            logged_ai.setdefault(sid, []).append(e["ts"])
-        elif e.get("action", "").startswith("egress") and e.get("action") != "egress_connect_close":
-            logged_egress.setdefault(sid, []).append(e["ts"])
-    sid = e.get("session_id")
-    if not sid or e.get("ts", 0) < started - REPLAY_GRACE_S:
+    sid = event.get("session_id") or ip_to_sid.get(event.get("pod_ip", ""))
+    if sid and event.get("ts", 0) >= started:
+        if event.get("action") == "ai_request":
+            logged_ai.setdefault(sid, []).append(event["ts"])
+        elif event.get("action", "").startswith("egress") and event.get("action") != "egress_connect_close":
+            logged_egress.setdefault(sid, []).append(event["ts"])
+    sid = event.get("session_id")
+    if not sid or event.get("ts", 0) < started - REPLAY_GRACE_S:
         return
-    for a in engine.on_gateway(e, await policy(sid)):
-        await respond(http, a)
+    for found in engine.on_gateway(event, await session_policy(sid)):
+        await respond(http, found)
 
 
 # --------------------------------------------------------------------------------- Hubble streams
 async def hubble_stream(http: aiohttp.ClientSession, namespace: str, handler) -> None:
+    """Follow `hubble observe` for flows from `namespace` forever (reconnecting), one handler call per flow."""
     while True:
         proc = await asyncio.create_subprocess_exec(
-            "hubble", "observe", "--server", HUBBLE, "--from-namespace", namespace, "--follow", "-o", "json",
+            "hubble", "observe", "--server", HUBBLE_SERVER, "--from-namespace", namespace, "--follow", "-o", "json",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out(hubble="connected", namespace=namespace)
+        emit(hubble="connected", namespace=namespace)
         assert proc.stdout
         async for raw in proc.stdout:
             try:
@@ -228,11 +257,12 @@ async def hubble_stream(http: aiohttp.ClientSession, namespace: str, handler) ->
             except ValueError:
                 continue
             await handler(http, flow)
-        out(hubble="disconnected", namespace=namespace, rc=await proc.wait())
+        emit(hubble="disconnected", namespace=namespace, rc=await proc.wait())
         await asyncio.sleep(3)
 
 
 async def on_session_flow(http: aiohttp.ClientSession, flow: dict) -> None:
+    """A flow from a sandbox pod: S1 counting, custom rules, D2 (drops) and S6 (traffic after containment)."""
     sid = next((l.split("=", 1)[1] for l in flow.get("source", {}).get("labels", [])
                 if l.startswith("k8s:sbx/session=")), None)
     if not sid:
@@ -240,26 +270,26 @@ async def on_session_flow(http: aiohttp.ClientSession, flow: dict) -> None:
     src_ip = flow.get("IP", {}).get("source")
     if src_ip:
         ip_to_sid[src_ip] = sid
-    _count_for_s1(sid, flow)
-    await run_custom(http, "hubble-sessions", flow, sid)
+    _count_datapath_requests(sid, flow)
+    await run_custom_rules(http, "hubble-sessions", flow, sid)
     if flow.get("verdict") == "DROPPED":
-        pol = await policy(sid)
-        for a in engine.on_flow(flow, lambda s: pol):
-            await respond(http, a)
+        pol = await session_policy(sid)
+        for found in engine.on_flow(flow, lambda s: pol):
+            await respond(http, found)
     elif sid in contained:
         if flow.get("verdict") == "FORWARDED" and flow.get("traffic_direction") == "EGRESS":
-            forwarded.setdefault(sid, []).append(_ts(flow.get("time")))
-        a = leak_after_containment(flow, contained[sid], grace_s())
-        if a:
+            forwarded.setdefault(sid, []).append(parse_time(flow.get("time")))
+        leak = leak_after_containment(flow, contained[sid], grace_s())
+        if leak:
             if contained.get(sid, 0) < time.time() - grace_s():     # containment was lifted: ours takes over
                 contained[sid] = time.time()
-            await respond(http, a)
+            await respond(http, leak)
 
 
-def _count_for_s1(sid: str, flow: dict) -> None:
-    """Independent request counts from the datapath. Hubble may report one packet at several
+def _count_datapath_requests(sid: str, flow: dict) -> None:
+    """S1: independent request counts from the datapath. Hubble may report one packet at several
     observation points (source and destination node), so de-duplicate by source port."""
-    ts = _ts(flow.get("time"))
+    ts = parse_time(flow.get("time"))
     if ts < started:
         return
     http = (flow.get("l7") or {}).get("http")
@@ -268,8 +298,8 @@ def _count_for_s1(sid: str, flow: dict) -> None:
             return
         sport = (flow.get("l4", {}).get("TCP") or {}).get("source_port")
         key = ("l7", sid, sport, http.get("method"), http.get("url"), round(ts, 1))
-        if key not in _recent:
-            _recent[key] = ts
+        if key not in datapath_dedup:
+            datapath_dedup[key] = ts
             seen_ai.setdefault(sid, []).append(ts)
         return
     tcp = (flow.get("l4") or {}).get("TCP") or {}
@@ -277,86 +307,119 @@ def _count_for_s1(sid: str, flow: dict) -> None:
     if (flow.get("verdict") == "FORWARDED" and tcp.get("destination_port") == 3128
             and flags.get("SYN") and not flags.get("ACK")):
         key = ("syn", sid, tcp.get("source_port"))
-        if ts - _recent.get(key, 0) > 30:
-            _recent[key] = ts
+        if ts - datapath_dedup.get(key, 0) > 30:
+            datapath_dedup[key] = ts
             seen_egress.setdefault(sid, []).append(ts)
 
 
 async def reconcile(http: aiohttp.ClientSession) -> None:
     """S1: if the kernel saw materially more requests from a session than the gateway logged, the
-    gateway's account of that session is incomplete (compromised, buggy or tampered): contain it."""
+    gateway's account of that session is incomplete (compromised, buggy or tampered): contain it.
+    Only requests older than the horizon are compared, so shipping lag is not a deficit."""
     while True:
-        p = engine.pol.rules["S1"]["params"]
-        await asyncio.sleep(p["interval_s"])
+        params = engine.pol.rules["S1"]["params"]
+        await asyncio.sleep(params["interval_s"])
         if not engine.pol.enabled("S1"):
             continue
-        horizon = time.time() - p["horizon_s"]
+        horizon = time.time() - params["horizon_s"]
         for channel, seen, logged in (("AI", seen_ai, logged_ai), ("egress", seen_egress, logged_egress)):
             for sid in list(seen):
                 n_seen = sum(1 for t in seen[sid] if t <= horizon)
                 n_logged = sum(1 for t in logged.get(sid, []) if t <= horizon)
                 deficit = n_seen - n_logged
-                if deficit >= p["min_deficit"] and deficit >= p["min_ratio"] * n_seen:
+                if deficit >= params["min_deficit"] and deficit >= params["min_ratio"] * n_seen:
                     await respond(http, alert(
-                        "S1", "high", sid, f"gateway evidence incomplete ({channel}): the datapath saw {n_seen} "
+                        "S1", sid, f"gateway evidence incomplete ({channel}): the datapath saw {n_seen} "
                         f"requests, the gateway logged {n_logged}",
                         {"action": "evidence_reconciliation", "channel": channel, "seen": n_seen, "logged": n_logged},
                         [{"source": "hubble"}, {"source": "shipped-gateway-evidence"}], key=channel))
         cutoff = time.time() - 300
-        for k in [k for k, v in _recent.items() if v < cutoff]:
-            _recent.pop(k, None)
+        for k in [k for k, v in datapath_dedup.items() if v < cutoff]:
+            datapath_dedup.pop(k, None)
 
 
 async def on_platform_flow(http: aiohttp.ClientSession, flow: dict) -> None:
-    a = platform_flow_alert(flow, engine.pol.param("S2", "world_allowlist") or {})
-    if a:
-        await respond(http, a)
-    await run_custom(http, "hubble-platform", flow, None)
+    """A flow from a platform pod (sbx-system): S2 and custom rules on platform flows."""
+    found = platform_flow_alert(flow, engine.pol.param("S2", "world_allowlist") or {})
+    if found:
+        await respond(http, found)
+    await run_custom_rules(http, "hubble-platform", flow, None)
 
 
 # ---------------------------------------------------------------------------------- detection policy
 async def load_policy(http: aiohttp.ClientSession, force: bool = False) -> dict:
     """Read ConfigMap sentinel-detection; on a change validate it and swap it in atomically. A policy
     that fails validation is recorded and alerted on, and the last good one stays active."""
-    global policy_rv
+    global policy_resource_version
     got = await asyncio.to_thread(actions.read_policy)
     if got is None:
         return {"loaded": False, "reason": "ConfigMap sentinel-detection not found", "active": engine.pol.digest}
     rv, text = got
-    if rv == policy_rv and not force:
+    if rv == policy_resource_version and not force:
         return {"loaded": False, "reason": "unchanged", "active": engine.pol.digest}
-    policy_rv = rv
+    policy_resource_version = rv
     try:
         new = detpol.load(text, source=f"configmap@{rv}")
     except detpol.PolicyError as e:
-        bad = "sha256:" + __import__("hashlib").sha256(text.encode()).hexdigest()
-        log.write_sync("detection_policy_rejected", digest=bad, errors=e.errors, kept=engine.pol.digest)
-        await respond(http, alert("POL", "high", None, f"detection policy {bad[:19]} rejected: {e.errors[0]}",
+        rejected = "sha256:" + __import__("hashlib").sha256(text.encode()).hexdigest()
+        log.write_sync("detection_policy_rejected", digest=rejected, errors=e.errors, kept=engine.pol.digest)
+        await respond(http, alert("POL", None, f"detection policy {rejected[:19]} rejected: {e.errors[0]}",
                                   {"action": "detection_policy_rejected", "errors": e.errors[:10]}, [],
-                                  key=f"{bad}|{rv}"))    # every apply re-alerts (ids are deduped across restarts)
+                                  key=f"{rejected}|{rv}"))    # every apply re-alerts (ids are deduped across restarts)
         return {"loaded": False, "errors": e.errors, "active": engine.pol.digest}
     if new.digest != engine.pol.digest:
         engine.pol = new
-        s = new.summary()
+        summary = new.summary()
+        every_rule = {**summary["rules"], **summary["custom"]}
         log.write_sync("detection_policy_loaded", digest=new.digest, name=new.name, version=new.version,
-                       disabled=[k for k, v in {**s["rules"], **s["custom"]}.items() if not v["enabled"]],
-                       monitor=[k for k, v in {**s["rules"], **s["custom"]}.items() if v["mode"] == "monitor"],
-                       custom=sorted(s["custom"]))
-        out(policy="loaded", digest=new.digest, version=new.version)
+                       disabled=[k for k, v in every_rule.items() if not v["enabled"]],
+                       monitor=[k for k, v in every_rule.items() if v["mode"] == "monitor"],
+                       custom=sorted(summary["custom"]))
+        emit(policy="loaded", digest=new.digest, version=new.version)
     return {"loaded": True, "active": engine.pol.digest}
 
 
+def boot_policy() -> None:
+    """The sentinel never runs without a detection policy, and never on values hidden in code: it
+    starts on the ConfigMap if that exists and is valid, otherwise on the same policy file baked into
+    the image (config/sentinel/detection.yaml). If neither loads it exits, so the failure is loud
+    (CrashLoopBackOff) rather than a sentinel that is running but blind."""
+    global policy_resource_version
+    try:
+        got = actions.read_policy()
+    except Exception as e:  # noqa: BLE001 - API server not reachable yet: fall back to the image copy
+        got = None
+        emit(policy_error=f"boot: cannot read ConfigMap: {str(e)[:150]}")
+    if got:
+        rv, text = got
+        try:
+            engine.pol = detpol.load(text, source=f"configmap@{rv}")
+            policy_resource_version = rv
+        except detpol.PolicyError as e:      # policy_watch re-reads it and raises POL under the image copy
+            emit(policy_error=f"boot: ConfigMap policy rejected: {e.errors[0]}")
+    if engine.pol is None:
+        try:
+            with open(BOOT_POLICY) as f:
+                engine.pol = detpol.load(f.read(), source=f"image:{BOOT_POLICY}")
+        except (OSError, detpol.PolicyError) as e:
+            emit(fatal=f"no valid detection policy (ConfigMap or {BOOT_POLICY}): {e}")
+            raise SystemExit(1)
+    log.write_sync("detection_policy_loaded", digest=engine.pol.digest, name=engine.pol.name,
+                   version=engine.pol.version, source=engine.pol.source, at="boot")
+
+
 async def policy_watch(http: aiohttp.ClientSession) -> None:
+    """Poll the detection-policy ConfigMap every 10 s."""
     while True:
         try:
             await load_policy(http)
         except Exception as e:  # noqa: BLE001 - API server blip: keep the active policy
-            out(policy_error=str(e)[:200])
+            emit(policy_error=str(e)[:200])
         await asyncio.sleep(10)
 
 
 # ------------------------------------------------------------------------------ housekeeping, admin
-async def gc() -> None:
+async def release_stale_quarantines() -> None:
     """Remove sentinel quarantines whose session pod no longer exists."""
     while True:
         await asyncio.sleep(30)
@@ -366,10 +429,12 @@ async def gc() -> None:
                 await asyncio.to_thread(actions.release, sid)
                 log.write_sync("quarantine_released", session_id=sid, reason="pod gone")
         except Exception as e:  # noqa: BLE001
-            out(gc_error=str(e)[:200])
+            emit(gc_error=str(e)[:200])
 
 
 async def admin(request: web.Request) -> web.Response:
+    """POST /admin/{cmd} on 127.0.0.1 only (ctl.py): freeze, unfreeze, release, alerts, policy, reload, status.
+    Reaching it needs `kubectl exec` into this pod, which is the authorisation."""
     cmd = request.match_info["cmd"]
     body = await request.json() if request.can_read_body else {}
     actor = body.get("actor", "unknown")
@@ -395,51 +460,49 @@ async def admin(request: web.Request) -> web.Response:
     if cmd == "reload":
         return web.json_response(await load_policy(request.app["http"], force=True))
     if cmd == "status":
-        return web.json_response({"positions": positions, "broken": sorted(broken), "contained": contained,
+        return web.json_response({"positions": positions, "broken": sorted(broken_files), "contained": contained,
                                   "quarantined": sorted(await asyncio.to_thread(actions.quarantined_sessions))})
     raise web.HTTPNotFound()
 
 
 def restore() -> None:
-    """Rebuild positions/chain heads and known alerts from our own files after a restart."""
+    """Rebuild positions/chain heads and known alert ids from our own files after a restart."""
     os.makedirs(os.path.join(DATA, "copy"), exist_ok=True)
     for name in ("gateway.jsonl", "control-plane.jsonl"):
         path = os.path.join(DATA, "copy", name)
         if os.path.exists(path):
             with open(path) as f:
                 for line in f:
-                    e = json.loads(line)
-                    positions[name], chain_head[name] = e["seq"], e["hash"]
+                    record = json.loads(line)
+                    positions[name], chain_head[name] = record["seq"], record["hash"]
     if os.path.exists(log.path):
         with open(log.path) as f:
             for line in f:
-                e = json.loads(line)
-                if e.get("alert_id"):
-                    sent.add(e["alert_id"])
+                record = json.loads(line)
+                if record.get("alert_id"):
+                    raised_alert_ids.add(record["alert_id"])
 
 
 async def main() -> None:
     restore()
+    boot_policy()
     async with aiohttp.ClientSession(headers=internal.headers()) as http:
-        ing = web.Application(client_max_size=64 * 1024 * 1024)
-        ing["http"] = http
-        ing.router.add_get("/ingest/position", ingest_position)
-        ing.router.add_post("/ingest", ingest)
-        ing.router.add_get("/healthz", lambda r: web.json_response({"ok": True}))
-        adm = web.Application()
-        adm["http"] = http
-        adm.router.add_post("/admin/{cmd}", admin)
-        for app, host, port in ((ing, "0.0.0.0", 9100), (adm, "127.0.0.1", 9101)):
+        ingest_app = web.Application(client_max_size=64 * 1024 * 1024)
+        ingest_app["http"] = http
+        ingest_app.router.add_get("/ingest/position", ingest_position)
+        ingest_app.router.add_post("/ingest", ingest)
+        ingest_app.router.add_get("/healthz", lambda r: web.json_response({"ok": True}))
+        admin_app = web.Application()
+        admin_app["http"] = http
+        admin_app.router.add_post("/admin/{cmd}", admin)
+        for app, host, port in ((ingest_app, "0.0.0.0", 9100), (admin_app, "127.0.0.1", 9101)):
             runner = web.AppRunner(app, access_log=None)
             await runner.setup()
             await web.TCPSite(runner, host, port).start()
-        try:
-            await load_policy(http)
-        except Exception as e:  # noqa: BLE001 - start on the built-in defaults; policy_watch retries
-            out(policy_error=str(e)[:200])
-        out(sentinel="started", positions=positions, known_alerts=len(sent), policy=engine.pol.digest)
+        emit(sentinel="started", positions=positions, known_alerts=len(raised_alert_ids), policy=engine.pol.digest)
         await asyncio.gather(policy_watch(http), hubble_stream(http, "sbx-sessions", on_session_flow),
-                             hubble_stream(http, "sbx-system", on_platform_flow), gc(), reconcile(http))
+                             hubble_stream(http, "sbx-system", on_platform_flow), release_stale_quarantines(),
+                             reconcile(http))
 
 
 if __name__ == "__main__":

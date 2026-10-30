@@ -1,4 +1,11 @@
-"""Session registry (SQLite). Tokens are stored only as sha256 hashes."""
+"""Control-plane state in SQLite: sessions, the spec registry, spec approvals, and a small meta
+table (the fleet-freeze flag).
+
+Tokens are stored only as sha256 hashes and never returned. Session state changes that race
+(stop, containment, freeze, the reconciler) go through `transition`, a compare-and-set, so an
+actor that loses the race sees False instead of overwriting, e.g., 'contained'. One connection is
+shared by the API threadpool and the reconciler thread, guarded by a lock.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -53,6 +60,7 @@ CREATE TABLE IF NOT EXISTS approvals (
 
 
 def token_hash(token: str) -> str:
+    """The stored form of a session token (lookups hash the presented token the same way)."""
     return hashlib.sha256(token.encode()).hexdigest()
 
 
@@ -83,6 +91,7 @@ class Store:
              token_hash(token), json.dumps(policy), json.dumps(canaries), state, time.time()))
 
     def update(self, session_id: str, **fields) -> None:
+        """Unconditional field update; `ended=True` sets ended_at. Use `transition` to change state."""
         if "ended" in fields:
             fields.pop("ended")
             fields["ended_at"] = time.time()
@@ -106,14 +115,15 @@ class Store:
             return cur.rowcount == 1
 
     def get(self, session_id: str) -> dict | None:
+        """The session row with JSON columns decoded, or None."""
         with self.lock:
             row = self.db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
-        return _row(row)
+        return _decode_row(row)
 
     def by_token(self, token: str) -> dict | None:
         with self.lock:
             row = self.db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash(token),)).fetchone()
-        return _row(row)
+        return _decode_row(row)
 
     def add_spec(self, name: str, version: int, digest: str, body: bytes, by: str, warnings: list) -> None:
         self.db.execute("INSERT INTO specs VALUES (?,?,?,?,?,?,?)",
@@ -141,6 +151,7 @@ class Store:
             return [r[0] for r in self.db.execute("SELECT approver FROM approvals WHERE digest=?", (digest,))]
 
     def latest_spec(self, name: str) -> dict | None:
+        """The highest registered version of a spec (raw body and digest), or None."""
         row = self.db.execute("SELECT * FROM specs WHERE name=? ORDER BY version DESC LIMIT 1", (name,)).fetchone()
         return dict(row) if row else None
 
@@ -151,10 +162,11 @@ class Store:
     def list(self) -> list[dict]:
         with self.lock:
             rows = self.db.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall()
-        return [_row(r) for r in rows]
+        return [_decode_row(r) for r in rows]
 
 
-def _row(row) -> dict | None:
+def _decode_row(row) -> dict | None:
+    """sqlite Row -> dict with JSON columns decoded and the token hash dropped."""
     if row is None:
         return None
     d = dict(row)

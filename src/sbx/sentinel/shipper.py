@@ -1,6 +1,11 @@
 """Evidence shipper (sidecar in the gateway pod): tails the platform's hash-chained evidence files
 and pushes every record to the sentinel, which keeps its own verified copy outside the platform's
-trust zone. Resumes from the sentinel's acknowledged position, so nothing is lost across restarts."""
+trust zone. Resumes from the sentinel's acknowledged position, so nothing is lost across restarts.
+
+Input: complete lines of $EVIDENCE_DIR/{gateway,control-plane}.jsonl (read-only mount).
+Output: batches POSTed to $SENTINEL_URL/ingest, authenticated with $SENTINEL_INGEST_KEY.
+It verifies nothing itself: the sentinel checks sequence and hash chain on arrival, so a shipper
+that drops or edits records is detected there (EV)."""
 from __future__ import annotations
 
 import json
@@ -15,7 +20,8 @@ KEY = os.environ.get("SENTINEL_INGEST_KEY", "")
 BATCH = 200
 
 
-def post(path: str, body: dict | None = None) -> dict:
+def sentinel_request(path: str, body: dict | None = None) -> dict:
+    """GET (no body) or POST (JSON body) to the sentinel's ingest API; returns the decoded JSON answer."""
     req = urllib.request.Request(URL + path, method="POST" if body is not None else "GET",
                                  data=json.dumps(body).encode() if body is not None else None,
                                  headers={"X-Sbx-Ingest": KEY, "Content-Type": "application/json"})
@@ -28,7 +34,7 @@ def main() -> None:
     prev_ack: dict[str, int] = {}
     while True:
         try:
-            acked = post("/ingest/position")                    # last seq the sentinel holds, per file
+            acked = sentinel_request("/ingest/position")                    # last seq the sentinel holds, per file
             for name in FILES:
                 path = os.path.join(DIR, name)
                 if not os.path.exists(path):
@@ -44,13 +50,13 @@ def main() -> None:
                         line = f.readline()
                         if not line.endswith("\n"):
                             break
-                        e = json.loads(line)
-                        if e["seq"] <= last:
+                        record = json.loads(line)
+                        if record["seq"] <= last:
                             offsets[name] = f.tell()
                             continue
-                        batch.append(e)
+                        batch.append(record)
                 if batch:
-                    post("/ingest", {"file": name, "events": batch})
+                    sentinel_request("/ingest", {"file": name, "events": batch})
         except Exception as e:  # noqa: BLE001 - keep shipping; the sentinel flags gaps itself
             print(json.dumps({"shipper_error": str(e)[:200]}), flush=True)
             time.sleep(3)

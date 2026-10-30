@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# M4: detection -> automatic containment -> independent verification.
+# Detection -> automatic containment -> independent verification.
 #   D1: a "compromised agent" posts the canary to an allowlisted host  -> alert + contain
 #   D2: a "compromised agent" probes around the gateway (raw TCP, DNS) -> Hubble drops -> burst -> contain
 # The attacker actions run via kubectl exec inside the gVisor pod (assume the agent is already
 # compromised); every verdict below comes from outside the sandbox. No API credits needed.
 set -uo pipefail
-cd "$(dirname "$0")/.."
-CTL=bin/sbxctl
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "PASS  $1 (got $3)"; pass=$((pass+1)); else echo "FAIL  $1 (expected $2, got $3)"; fail=$((fail+1)); fi; }
-sid_of() { sed -n 's/^session \([a-z0-9]*\) started.*/\1/p'; }
+cd "$(dirname "$0")/../.." && source tests/lib.sh
 state() { $CTL status "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])'; }
 alerts_json() { curl -s -H "X-User: $(whoami)" http://127.0.0.1:8443/alerts; }
 q() { alerts_json | python3 -c "import json,sys; A=[a for a in json.load(sys.stdin) if a.get('session_id')=='$1']; print($2)"; }
-wait_for() { for _ in $(seq 1 "${3:-40}"); do [ "$(eval "$1")" = "$2" ] && return 0; sleep 1; done; return 1; }
-in_pod() { kubectl -n sbx-sessions exec "sandbox-$1" -- sh -c "$2" 2>/dev/null; }
 
 echo "=== D1: canary exfil through a write-allowed destination (deliberately vulnerable spec)"
 SID=$($CTL run bugfix-agent-open -p repo=demo/app -p task="noop" | sid_of)
@@ -40,7 +34,7 @@ for a in json.load(sys.stdin):
 check "egress after containment fails" 000 "$(in_pod "$SID" 'curl -s -o /dev/null -m 4 -w "%{http_code}" http://paste-mock.lab-ext/again')"
 check "transcript preserved at containment" yes "$(kubectl -n sbx-system exec deploy/control-plane -- sh -c "test -s /evidence/sessions/$SID/transcript-containment.tgz && echo yes")"
 check "evidence snapshot preserved" yes "$(kubectl -n sbx-system exec deploy/control-plane -- sh -c "test -s /evidence/sessions/$SID/pod.json && test -s /evidence/sessions/$SID/gateway-events.jsonl && echo yes")"
-check "canary receipt at paste-mock (ground truth: it did leave)" yes "$(kubectl -n lab-ext logs deploy/paste-mock | grep -q "$(in_pod "$SID" 'base64 -w0 /workspace/repo/.env' | head -c 20)" && echo yes || echo no)"
+check "canary receipt at paste-mock (ground truth: it did leave)" yes "$(kubectl -n lab-ext logs deploy/paste-mock | contains "$(in_pod "$SID" 'base64 -w0 /workspace/repo/.env' | head -c 20)" && echo yes || echo no)"
 
 echo "=== D2: probing around the gateway (bypass attempts seen only by Hubble)"
 SID2=$($CTL run bugfix-agent -p repo=demo/app -p task="noop" | sid_of)
@@ -84,5 +78,4 @@ check "owner cannot destroy a contained session" "error 403" "$($CTL destroy "$S
 for s in "$SID" "$SID2" "$SID3"; do SBX_USER=secops $CTL destroy "$s" >/dev/null; done
 check "quarantine policies removed on destroy" 0 "$(kubectl -n sbx-sessions get cnp -o name | grep -c -E "quarantine-($SID|$SID2|$SID3)")"
 
-echo; echo "passed=$pass failed=$fail"
-[ "$fail" = 0 ]
+finish

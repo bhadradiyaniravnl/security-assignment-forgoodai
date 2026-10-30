@@ -1,6 +1,13 @@
 """Agent specs: registry (baseline-checked, versioned, immutable), parameter validation and
 compilation into a per-session policy. Runs always use the latest *registered* version, bound
-by digest; nothing reads spec files at run time."""
+by digest; nothing reads spec files at run time.
+
+Trust: spec YAML is author input and is trusted only after baseline.check and, where the spec is
+new or widens what an agent may do, approval of its exact bytes (digest) by a security approver
+other than the author. Run parameters are user input, checked against the spec's declared schema.
+Roles come from env: SBX_SPEC_AUTHORS, SBX_SECURITY_APPROVERS. `system:` callers (bootstrap of the
+shipped specs) skip the author and approval checks but not the baseline.
+"""
 from __future__ import annotations
 
 import fnmatch
@@ -13,19 +20,21 @@ import yaml
 
 from sbx.control_plane import baseline
 
-SPECS_DIR = os.environ.get("SPECS_DIR", "/app/specs")
+SPECS_DIR = os.environ.get("SPECS_DIR", "/app/agent-specs")
 SPEC_AUTHORS = set(filter(None, os.environ.get("SBX_SPEC_AUTHORS", "").split(",")))
 SECURITY_APPROVERS = set(filter(None, os.environ.get("SBX_SECURITY_APPROVERS", "secops").split(",")))
 NAME_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 
 
 class SpecError(ValueError):
+    """Invalid or rejected spec; `details` lists the individual reasons."""
     def __init__(self, msg: str, details: list | None = None):
         super().__init__(msg)
         self.details = details or []
 
 
 def digest_of(raw: bytes) -> str:
+    """Digest of the exact spec bytes; approvals and runs are bound to it."""
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
@@ -76,6 +85,7 @@ def approve(store, raw: bytes, by: str) -> dict:
 
 
 def approval_reasons(spec: dict, prev: dict | None) -> list[str]:
+    """Why registering this spec needs a security approval (empty list: it doesn't)."""
     reasons = []
     if prev is None:
         reasons.append("new spec")
@@ -91,34 +101,38 @@ def approval_reasons(spec: dict, prev: dict | None) -> list[str]:
 
 def widening(old: dict, new: dict) -> list[str]:
     """Everything the new version can do that the old one could not, over the whole compiled policy."""
-    o, n = compile_policy(old), compile_policy(new)
+    old_p, new_p = compile_policy(old), compile_policy(new)
     out = []
     for k in ("egress_allow", "egress_write", "model_allow", "grants", "agent_tools"):
-        added = sorted(set(n[k]) - set(o[k]))
+        added = sorted(set(new_p[k]) - set(old_p[k]))
         if added:
             out.append(f"new {k} {added}")
     for k in ("image", "runtime_class"):
-        if n["runtime"][k] != o["runtime"][k]:
+        if new_p["runtime"][k] != old_p["runtime"][k]:
             out.append(f"runtime.{k} changed")
     for k, conv in (("ttl_s", float), ("idle_s", float), ("cpu", float), ("memory", baseline._mem_gi)):
-        if (conv(n["runtime"][k]) or 0) > (conv(o["runtime"][k]) or 0):
+        if (conv(new_p["runtime"][k]) or 0) > (conv(old_p["runtime"][k]) or 0):
             out.append(f"larger runtime.{k}")
-    if n["max_tokens"] > o["max_tokens"]:
+    if new_p["max_tokens"] > old_p["max_tokens"]:
         out.append("larger token budget")
-    if (n["deny_burst"]["count"] > o["deny_burst"]["count"]
-            or n["deny_burst"]["window_s"] < o["deny_burst"]["window_s"]):
+    # The sentinel's D2 rule (denied-request burst): a higher count or shorter window fires later.
+    if (new_p["deny_burst"]["count"] > old_p["deny_burst"]["count"]
+            or new_p["deny_burst"]["window_s"] < old_p["deny_burst"]["window_s"]):
         out.append("weaker D2 burst threshold")
-    if n["output"]["type"] != o["output"]["type"] or (o["output"]["draft"] and not n["output"]["draft"]):
+    if (new_p["output"]["type"] != old_p["output"]["type"]
+            or (old_p["output"]["draft"] and not new_p["output"]["draft"])):
         out.append("output type/draft changed")
-    removed = sorted(set(o["output"]["protected_paths"]) - set(n["output"]["protected_paths"]))
+    removed = sorted(set(old_p["output"]["protected_paths"]) - set(new_p["output"]["protected_paths"]))
     if removed:
         out.append(f"protected paths removed {removed}")
     if set(new["metadata"].get("owners", [])) - set(old["metadata"].get("owners", [])):
         out.append("new owners")
     if new["spec"].get("mcp") != old["spec"].get("mcp"):
         out.append("mcp changed")
-    if not all(any(fnmatch.fnmatchcase(p, q) for q in old["spec"]["repo"]["allow"])
-               for p in new["spec"]["repo"]["allow"]):
+    # Not in the compiled policy (repo is a run-time parameter): every new pattern must be covered
+    # by an old one.
+    if not all(any(fnmatch.fnmatchcase(pattern, old_pattern) for old_pattern in old["spec"]["repo"]["allow"])
+               for pattern in new["spec"]["repo"]["allow"]):
         out.append("broader repo.allow")
     return out
 
@@ -126,13 +140,13 @@ def widening(old: dict, new: dict) -> list[str]:
 def bootstrap(store) -> list[dict]:
     """Registers the specs shipped with the deployment through the same baseline gate."""
     out = []
-    for f in sorted(os.listdir(SPECS_DIR)):
-        if f.endswith(".yaml"):
-            raw = open(os.path.join(SPECS_DIR, f), "rb").read()
+    for filename in sorted(os.listdir(SPECS_DIR)):
+        if filename.endswith(".yaml"):
+            raw = open(os.path.join(SPECS_DIR, filename), "rb").read()
             try:
                 out.append(register(store, raw, "system:bootstrap"))
             except SpecError as e:
-                out.append({"file": f, "rejected": e.details or str(e)})
+                out.append({"file": filename, "rejected": e.details or str(e)})
     return out
 
 
@@ -147,6 +161,7 @@ def load(store, name: str) -> tuple[dict, str]:
 
 
 def authorize(spec: dict, user: str) -> None:
+    """Only the spec's owners may start runs from it."""
     if user not in spec["metadata"].get("owners", []):
         raise PermissionError(f"user {user} may not trigger {spec['metadata']['name']}")
 
@@ -164,16 +179,17 @@ def validate_params(spec: dict, params: dict) -> None:
         raise SpecError(f"repo {repo} not allowed by spec")
 
 
-def _seconds(ttl: str) -> int:
-    m = re.fullmatch(r"(\d+)([smh])", str(ttl))
+def _duration_s(value: str) -> int:
+    """'90s' / '10m' / '2h' -> seconds; anything else is a SpecError."""
+    m = re.fullmatch(r"(\d+)([smh])", str(value))
     if not m:
-        raise SpecError(f"bad ttl {ttl}")
+        raise SpecError(f"bad ttl {value}")
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
 
 
 def compile_policy(spec: dict) -> dict:
     """Flattens the spec into what the enforcement points need. Frozen per session."""
-    s = spec["spec"]
+    s = spec["spec"]                                    # the YAML `spec:` section
     burst = s.get("detection", {}).get("denyBurst", {"count": 5, "window": "60s"})
     return {
         "egress_allow": list(s.get("egress", {}).get("allow", [])),
@@ -193,13 +209,13 @@ def compile_policy(spec: dict) -> dict:
                    "draft": bool(s["repo"].get("output", {}).get("draft", True)),
                    "branch_prefix": s["repo"].get("output", {}).get("branchPrefix", "agent/"),
                    "protected_paths": list(s["repo"].get("output", {}).get("protectedPaths", [".github/", ".git/"]))},
-        "deny_burst": {"count": int(burst["count"]), "window_s": _seconds(burst["window"])},
+        "deny_burst": {"count": int(burst["count"]), "window_s": _duration_s(burst["window"])},
         "runtime": {
             "image": s["runtime"]["image"],
             "runtime_class": s["runtime"]["runtimeClass"],
             "cpu": str(s["runtime"]["resources"]["cpu"]),
             "memory": str(s["runtime"]["resources"]["memory"]),
-            "ttl_s": _seconds(s["runtime"]["ttl"]),
-            "idle_s": _seconds(s["runtime"].get("idleTimeout", "10m")),
+            "ttl_s": _duration_s(s["runtime"]["ttl"]),
+            "idle_s": _duration_s(s["runtime"].get("idleTimeout", "10m")),
         },
     }

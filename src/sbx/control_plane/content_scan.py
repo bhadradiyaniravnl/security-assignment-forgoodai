@@ -29,13 +29,15 @@ RULES = [
 
 
 def scan(root: str) -> list[dict]:
+    """Walks the cloned repo (skipping .git, symlinks, binaries and files over MAX_FILE) and returns
+    up to MAX_FINDINGS {path, line, rule, excerpt} dicts. Excerpts are repo text: untrusted."""
     findings: list[dict] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d != ".git"]
         for name in sorted(filenames):
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(path, root)
-            if rel == ".env" or os.path.islink(path):
+            if rel == ".env" or os.path.islink(path):   # .env is replaced by the canary; links may point outside
                 continue
             try:
                 if os.path.getsize(path) > MAX_FILE:
@@ -48,9 +50,9 @@ def scan(root: str) -> list[dict]:
                 continue                                    # binary
             text = raw.decode("utf-8", errors="replace")
             for rule, rx in RULES:
-                for m in rx.finditer(text):
-                    line = text.count("\n", 0, m.start()) + 1
-                    excerpt = m.group(0)
+                for match in rx.finditer(text):
+                    line = text.count("\n", 0, match.start()) + 1
+                    excerpt = match.group(0)
                     if rule == "hidden_characters":
                         excerpt = f"U+{ord(excerpt):04X}"
                     findings.append({"path": rel, "line": line, "rule": rule,

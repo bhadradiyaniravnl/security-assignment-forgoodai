@@ -3,6 +3,10 @@
 A spec that fails is rejected, never repaired at run time. Rules are deliberately boring and
 explicit so an auditor can read them; production would express the same in OPA/Rego and run them
 in CI on the spec repo as well as at registration.
+
+Input is an untrusted, parsed spec (schema-checked first, so later rules can index it). Output is
+(errors, warnings): any error rejects the spec; warnings are recorded with the registration.
+The values in BASELINE are the org's catalogue: images, runtimes, models, destinations, secrets.
 """
 from __future__ import annotations
 
@@ -77,12 +81,14 @@ SCHEMA = {
 REPO_PATTERN = re.compile(r"^(github:)?[a-z0-9-]+/(\*|[a-z0-9][a-z0-9._-]*)$")
 
 
-def _ttl_s(v) -> int | None:
+def _duration_s(v) -> int | None:
+    """'90s' / '10m' / '2h' -> seconds, or None if malformed."""
     m = re.fullmatch(r"(\d+)([smh])", str(v))
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)] if m else None
 
 
 def _mem_gi(v) -> float | None:
+    """'512Mi' / '2Gi' -> GiB, or None if malformed."""
     m = re.fullmatch(r"(\d+(?:\.\d+)?)(Mi|Gi)", str(v))
     return float(m.group(1)) / (1024 if m.group(2) == "Mi" else 1) if m else None
 
@@ -97,7 +103,7 @@ def check(spec: dict, previous: dict | None = None) -> tuple[list[str], list[str
         jsonschema.validate(spec, SCHEMA)
     except jsonschema.ValidationError as e:
         return [f"schema: {'/'.join(map(str, e.absolute_path)) or '<root>'}: {e.message}"], []
-    s, meta = spec["spec"], spec["metadata"]
+    s, meta = spec["spec"], spec["metadata"]          # s: the YAML `spec:` section
     ann = meta.get("annotations", {})
     B = BASELINE
 
@@ -113,10 +119,10 @@ def check(spec: dict, previous: dict | None = None) -> tuple[list[str], list[str
             errors.append(f"runtime.image {img}: must be pinned by digest (@sha256:...)")
     if s["runtime"]["runtimeClass"] not in B["runtime_classes"]:
         errors.append(f"runtime.runtimeClass {s['runtime']['runtimeClass']}: must be one of {B['runtime_classes']}")
-    ttl = _ttl_s(s["runtime"]["ttl"])
+    ttl = _duration_s(s["runtime"]["ttl"])
     if ttl is None or ttl > B["max_ttl_s"]:
         errors.append(f"runtime.ttl {s['runtime']['ttl']}: must be <= {B['max_ttl_s'] // 3600}h")
-    idle = _ttl_s(s["runtime"].get("idleTimeout", "10m"))
+    idle = _duration_s(s["runtime"].get("idleTimeout", "10m"))
     if idle is None or not 30 <= idle <= min(B["max_idle_s"], ttl or B["max_idle_s"]):
         errors.append(f"runtime.idleTimeout {s['runtime'].get('idleTimeout')}: must be 30s..{B['max_idle_s'] // 60}m "
                       "and not longer than the ttl (idle sandboxes are stopped and their resources freed)")
@@ -215,6 +221,7 @@ def check(spec: dict, previous: dict | None = None) -> tuple[list[str], list[str
 
 
 def _versioning(spec: dict, previous: dict) -> list[str]:
+    """Registered versions are immutable: a new registration must bump metadata.version."""
     v, pv = spec["metadata"]["version"], previous["metadata"]["version"]
     if v <= pv:
         return [f"metadata.version {v}: must be greater than the registered version {pv} (specs are immutable)"]

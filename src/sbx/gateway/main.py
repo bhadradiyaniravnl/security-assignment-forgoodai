@@ -1,4 +1,9 @@
-"""Gateway process: AI gateway on :8080, egress gateway on :3128."""
+"""Gateway process entry point: AI gateway on :8080 (ai.py), egress forward proxy on :3128 (egress.py).
+
+Both listeners share one process so they share the evidence log, the control-plane cache and the
+per-session token usage (shared.py). Sandboxes can reach only these two ports (Cilium policy);
+the gateway itself holds no upstream secrets and forwards everything through credproxy.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +19,7 @@ async def main() -> None:
     runner = web.AppRunner(ai.build_app(), access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", 8080).start()
+    # auto_decompress=False: response bytes are relayed to the sandbox exactly as credproxy sent them
     http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120), auto_decompress=False)
     await asyncio.start_server(lambda r, w: egress.handle(r, w, http), "0.0.0.0", 3128, limit=egress.MAX_HEADER)
     print(json.dumps({"gateway": "listening", "ports": [8080, 3128]}), flush=True)

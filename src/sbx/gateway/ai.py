@@ -1,14 +1,21 @@
 """AI gateway (:8080): Anthropic API reverse proxy that enforces the spec and records evidence.
 
-- Authenticates the session placeholder (x-api-key / bearer) bound to the pod IP.
+Trusts nothing from the sandbox: every request is authenticated, shape-checked against the
+session's compiled policy (from the control plane) and recorded before it is forwarded to
+credproxy, which adds the real API key. Enforces:
+- Authenticates the session placeholder token (x-api-key / bearer), bound to the pod IP.
 - Allows only POST /v1/messages and /v1/messages/count_tokens, with a top-level model from the spec.
 - Rejects provider-side capabilities that would move data out through Anthropic's infrastructure,
   outside our egress controls: server tools (web_fetch, web_search, code execution, ...), MCP
   connectors (mcp_servers), containers, and URL- or file-sourced content the provider would fetch.
 - Enforces the cumulative token budget.
 - Drops every client-supplied credential; credproxy injects the real one.
-- Parses streamed responses for tool_use blocks: an "agent attempted" signal that does not
-  depend on whether the later network action succeeds (detection D3).
+- Caps concurrent requests per pod IP.
+
+Records (evidence actions): ai_request for every answered request, allowed or denied, with a
+canary scan of the body; ai_tool_use for every tool_use block in the response, an "agent
+attempted" signal that does not depend on whether the later network action succeeds (sentinel
+rule D3). Full request/response bodies go to BODY_DIR, canaries redacted, for investigators.
 """
 from __future__ import annotations
 
@@ -21,15 +28,16 @@ from aiohttp import web
 
 from sbx.common import internal
 from sbx.common.canary import scan
-from sbx.common.policy import host_allowed
-from sbx.gateway.common import cp, evidence, referenced_hosts, session_fields, sha256, usage
+from sbx.common.session_policy import host_allowed
+from sbx.gateway.shared import cp, evidence, referenced_hosts, session_fields, sha256, usage
 
 ALLOWED_PATHS = {"/v1/messages", "/v1/messages/count_tokens"}
 ALLOWED_SOURCE_TYPES = {"base64", "text", "content"}
 FORBIDDEN_FIELDS = {"mcp_servers", "container"}
 
-HOP = {"connection", "keep-alive", "transfer-encoding", "host", "content-length", "authorization", "x-api-key",
-       "accept-encoding"}
+# Never forwarded in either direction: hop-by-hop headers plus any client-supplied credential.
+DROP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "host", "content-length", "authorization",
+                "x-api-key", "accept-encoding"}
 MAX_TOOL_INPUT = 4096
 
 
@@ -68,7 +76,8 @@ def _has_remote_source(node) -> bool:
     return False
 
 
-def _token(request: web.Request) -> str:
+def _presented_token(request: web.Request) -> str:
+    """The session token, from x-api-key or an Authorization: Bearer header."""
     if k := request.headers.get("x-api-key"):
         return k
     auth = request.headers.get("authorization", "")
@@ -76,60 +85,62 @@ def _token(request: web.Request) -> str:
 
 
 async def handle(request: web.Request) -> web.StreamResponse:
+    """Authenticate, apply request_policy and the token budget, record, then stream via credproxy."""
     ip = request.remote or ""
     path = "/" + request.match_info["tail"]
-    status, ctx = await cp.validate(_token(request), ip)
+    status, ctx = await cp.validate(_presented_token(request), ip)
     if status != 200:
         await evidence.write("ai_request", pod_ip=ip, path=path, decision="deny",
                              reason="revoked" if "session" in str(ctx.get("detail", "")) else "invalid_token",
                              detail=ctx.get("detail"))
         return web.json_response({"type": "error", "error": {"type": "authentication_error",
                                   "message": "sbx: session not authorized"}}, status=401)
-    _, pol = await cp.policy(ctx["session_id"])
-    policy, canaries, who = pol["policy"], pol.get("canaries", []), session_fields(ctx)
+    _, lookup = await cp.policy(ctx["session_id"])
+    policy, canaries, who = lookup["policy"], lookup.get("canaries", []), session_fields(ctx)
 
     body = await request.read()
     model, deny = request_policy(request.method, path, body, policy.get("model_allow", []))
     match = scan(body, canaries)
-    base = dict(**who, path=path, method=request.method, model=model, bytes_out=len(body),
-                body_sha256=sha256(body), dest_host="api.anthropic.com", canary_match=match)
+    event_fields = dict(**who, path=path, method=request.method, model=model, bytes_out=len(body),
+                        body_sha256=sha256(body), dest_host="api.anthropic.com", canary_match=match)
 
     if deny:
-        await evidence.write("ai_request", **base, decision="deny", reason=deny)
+        await evidence.write("ai_request", **event_fields, decision="deny", reason=deny)
         return web.json_response({"type": "error", "error": {"type": "permission_error",
                                   "message": f"sbx: request denied by spec ({deny})"}}, status=403)
     if usage.get(ctx["session_id"], 0) >= policy.get("max_tokens", 0):
-        await evidence.write("ai_request", **base, decision="deny", reason="budget")
+        await evidence.write("ai_request", **event_fields, decision="deny", reason="budget")
         return web.json_response({"type": "error", "error": {"type": "rate_limit_error",
                                   "message": "sbx: session token budget exhausted"}}, status=429)
-    req_event = await evidence.write("ai_request", **base, decision="allow", reason="spec_policy")
+    # Recorded before forwarding, so the event exists even if the upstream call fails.
+    req_event = await evidence.write("ai_request", **event_fields, decision="allow", reason="spec_policy")
 
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in DROP_HEADERS}
     headers.update(internal.headers())
     headers["X-Sbx-Session"] = ctx["session_id"]
     http: aiohttp.ClientSession = request.app["http"]
     async with http.request(request.method, f"{internal.CREDPROXY_URL}/anthropic{path}", params=request.query,
-                            headers=headers, data=body) as up:
-        resp = web.StreamResponse(status=up.status, headers={k: v for k, v in up.headers.items()
-                                                             if k.lower() not in HOP})
+                            headers=headers, data=body) as upstream:
+        resp = web.StreamResponse(status=upstream.status, headers={k: v for k, v in upstream.headers.items()
+                                                                   if k.lower() not in DROP_HEADERS})
         await resp.prepare(request)
-        parser = ResponseInspector(ctx, policy, canaries, who)
-        streaming = "text/event-stream" in up.headers.get("content-type", "")
-        buf = b""
-        kept = bytearray()
-        async for chunk in up.content.iter_any():
+        inspector = ResponseInspector(ctx, policy, canaries, who)
+        streaming = "text/event-stream" in upstream.headers.get("content-type", "")
+        json_body = b""
+        kept_response = bytearray()     # capped copy for store_bodies
+        async for chunk in upstream.content.iter_any():
             await resp.write(chunk)
-            if len(kept) < MAX_BODY_KEEP:
-                kept += chunk[:MAX_BODY_KEEP - len(kept)]
+            if len(kept_response) < MAX_BODY_KEEP:
+                kept_response += chunk[:MAX_BODY_KEEP - len(kept_response)]
             if streaming:
-                await parser.feed_sse(chunk)
+                await inspector.feed_sse(chunk)
             else:
-                buf += chunk
-        if not streaming and up.status == 200:
-            await parser.feed_json(buf)
+                json_body += chunk
+        if not streaming and upstream.status == 200:
+            await inspector.feed_json(json_body)
         await resp.write_eof()
-        if req_event.get("seq", -1) > 0:
-            store_bodies(ctx["session_id"], req_event["seq"], body, bytes(kept), canaries, up.status)
+        if req_event.get("seq", -1) > 0:     # seq -1: the event was dropped (fault injection), so nothing to link to
+            store_bodies(ctx["session_id"], req_event["seq"], body, bytes(kept_response), canaries, upstream.status)
         return resp
 
 
@@ -141,37 +152,42 @@ def store_bodies(sid: str, seq: int, request_body: bytes, response_body: bytes, 
     """Full prompt and response per model call, so investigators can audit the reasoning chain.
     Canary values are redacted at rest; the evidence event already records that one was present.
     Linked to the hash-chained `ai_request` event by seq and body_sha256."""
-    def redact(b: bytes) -> bytes:
-        for c in canaries:
-            b = b.replace(c["value"].encode(), f"[CANARY:{c['id']}]".encode())
-        return b
-    d = os.path.join(BODY_DIR, sid)
-    os.makedirs(d, exist_ok=True)
-    with gzip.open(os.path.join(d, f"{seq:08d}.json.gz"), "wt") as f:
+    def redact(data: bytes) -> bytes:
+        for canary in canaries:
+            data = data.replace(canary["value"].encode(), f"[CANARY:{canary['id']}]".encode())
+        return data
+    session_dir = os.path.join(BODY_DIR, sid)
+    os.makedirs(session_dir, exist_ok=True)
+    with gzip.open(os.path.join(session_dir, f"{seq:08d}.json.gz"), "wt") as f:
         json.dump({"seq": seq, "status": status, "request": redact(request_body).decode(errors="replace"),
                    "response": redact(response_body).decode(errors="replace"),
                    "response_truncated": len(response_body) >= MAX_BODY_KEEP}, f)
 
 
 class ResponseInspector:
-    """Extracts tool_use blocks and token usage from Messages API responses."""
+    """Extracts tool_use blocks and token usage from Messages API responses.
+
+    Token usage feeds the session budget; each tool_use is recorded as an ai_tool_use event, with
+    a canary scan and the hosts it mentions that are outside the spec's egress allowlist."""
 
     def __init__(self, ctx, policy, canaries, who):
         self.sid, self.policy, self.canaries, self.who = ctx["session_id"], policy, canaries, who
-        self.pending = b""
-        self.blocks: dict[int, dict] = {}
+        self.pending = b""                    # partial SSE line carried over between chunks
+        self.blocks: dict[int, dict] = {}     # content-block index -> tool_use being streamed
 
     async def feed_sse(self, chunk: bytes) -> None:
+        """Consume a chunk of a text/event-stream response."""
         self.pending += chunk
         while b"\n" in self.pending:
             line, self.pending = self.pending.split(b"\n", 1)
             if line.startswith(b"data:"):
                 try:
-                    await self.event(json.loads(line[5:]))
+                    await self.on_event(json.loads(line[5:]))
                 except ValueError:
                     continue
 
     async def feed_json(self, data: bytes) -> None:
+        """Consume a complete non-streaming response body."""
         try:
             msg = json.loads(data)
         except ValueError:
@@ -181,26 +197,29 @@ class ResponseInspector:
             if block.get("type") == "tool_use":
                 await self.tool_use(block.get("name"), json.dumps(block.get("input", {})))
 
-    async def event(self, ev: dict) -> None:
-        t = ev.get("type")
-        if t == "message_start":
+    async def on_event(self, ev: dict) -> None:
+        """Handle one SSE event: usage from message_start/delta, tool_use input assembled from deltas."""
+        kind = ev.get("type")
+        if kind == "message_start":
             self.add_usage(ev.get("message", {}).get("usage", {}))
-        elif t == "message_delta":
+        elif kind == "message_delta":
             self.add_usage(ev.get("usage", {}))
-        elif t == "content_block_start" and ev.get("content_block", {}).get("type") == "tool_use":
+        elif kind == "content_block_start" and ev.get("content_block", {}).get("type") == "tool_use":
             self.blocks[ev["index"]] = {"name": ev["content_block"].get("name"), "input": ""}
-        elif t == "content_block_delta" and ev.get("delta", {}).get("type") == "input_json_delta":
+        elif kind == "content_block_delta" and ev.get("delta", {}).get("type") == "input_json_delta":
             if ev["index"] in self.blocks:
                 self.blocks[ev["index"]]["input"] += ev["delta"].get("partial_json", "")
-        elif t == "content_block_stop" and ev.get("index") in self.blocks:
-            b = self.blocks.pop(ev["index"])
-            await self.tool_use(b["name"], b["input"])
+        elif kind == "content_block_stop" and ev.get("index") in self.blocks:
+            block = self.blocks.pop(ev["index"])
+            await self.tool_use(block["name"], block["input"])
 
-    def add_usage(self, u: dict) -> None:
-        n = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens"))
-        usage[self.sid] = usage.get(self.sid, 0) + n
+    def add_usage(self, counts: dict) -> None:
+        """Add a response's input and output tokens to the session's running total."""
+        tokens = sum(int(counts.get(k) or 0) for k in ("input_tokens", "output_tokens"))
+        usage[self.sid] = usage.get(self.sid, 0) + tokens
 
     async def tool_use(self, name: str, raw_input: str) -> None:
+        """Record one tool call the model asked for (an attempt, whether or not it later succeeds)."""
         allow = self.policy.get("egress_allow", [])
         hosts = sorted(h for h in referenced_hosts(raw_input) if not host_allowed(h, allow))
         await evidence.write("ai_tool_use", **self.who, tool=name, input=raw_input[:MAX_TOOL_INPUT],
@@ -215,9 +234,10 @@ _inflight: dict[str, int] = {}
 
 @web.middleware
 async def per_ip_limit(request: web.Request, handler):
+    """At most MAX_INFLIGHT_PER_IP concurrent requests per pod, so one sandbox cannot starve the rest."""
     ip = request.remote or ""
     if _inflight.get(ip, 0) >= MAX_INFLIGHT_PER_IP:
-        if request.path != "/healthz":    # every answered request is in evidence (sentinel S1 reconciles counts)
+        if request.path != "/healthz":    # every answered request is in evidence (the sentinel's S1 completeness rule counts them)
             await evidence.write("ai_request", pod_ip=ip, path=request.path, decision="deny", reason="inflight_limit")
         return web.json_response({"type": "error", "error": {"type": "rate_limit_error",
                                   "message": "sbx: too many concurrent requests"}}, status=429)
@@ -229,6 +249,7 @@ async def per_ip_limit(request: web.Request, handler):
 
 
 def build_app() -> web.Application:
+    """The :8080 aiohttp app: /healthz plus a catch-all routed to handle()."""
     app = web.Application(client_max_size=32 * 1024 * 1024, middlewares=[per_ip_limit])
 
     async def startup(a):

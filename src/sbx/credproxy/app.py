@@ -3,10 +3,14 @@
   :9000  HTTP  /anthropic/<path>  -> api.anthropic.com, real x-api-key injected
                /egress            -> plain-HTTP target from X-Sbx-Target (allowlist re-checked)
   :9001  TCP   tunnel for CONNECT (one JSON line handshake, then raw bytes)
+  :9000  HTTP  /github/clone, /github/publish  -> GitHub App operations (github.py)
 
-Callers are authenticated (shared internal key) and must name a session; every grant is
-re-checked against that session's compiled policy, so a confused or compromised gateway
-cannot obtain a credential the spec never granted. Secrets are never returned to callers.
+Trusts neither the sandbox nor the gateway. Gateway calls are authenticated with the gateway's
+own internal key and must name a running session; control-plane calls (GitHub) need a separate
+key (SBX_CP_KEY) the gateway never holds. Every grant, destination and method is re-checked
+against that session's compiled policy from the control plane, so a confused or compromised
+gateway cannot obtain a credential, or reach a destination, the spec never granted. Secrets are
+injected here on the way out and never returned to callers.
 """
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ import aiohttp
 from aiohttp import web
 
 from sbx.common import internal
-from sbx.common.policy import ControlPlane, host_allowed
+from sbx.common.session_policy import ControlPlane, host_allowed
 from sbx.credproxy import github
 
 ANTHROPIC_URL = os.environ.get("ANTHROPIC_UPSTREAM", "https://api.anthropic.com")
@@ -27,6 +31,7 @@ ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_WORKSPACE = os.environ.get("ANTHROPIC_WORKSPACE_ID", "")   # only for keys not scoped to a workspace
 GRANT_ANTHROPIC = "anthropic/default"
 
+# Hop-by-hop headers are dropped on both legs; STRIP also removes any credential the caller sent.
 HOP = {"connection", "keep-alive", "proxy-authorization", "proxy-connection", "te", "trailer",
        "transfer-encoding", "upgrade", "host", "content-length"}
 STRIP = HOP | {"authorization", "x-api-key"}
@@ -34,7 +39,8 @@ STRIP = HOP | {"authorization", "x-api-key"}
 cp = ControlPlane()
 
 
-async def session_policy(request: web.Request) -> dict:
+async def gateway_session(request: web.Request) -> dict:
+    """Require the gateway's key and a running session (X-Sbx-Session); return its policy lookup."""
     if internal.caller(request.headers.get(internal.HEADER)) != "gateway":
         raise web.HTTPUnauthorized(text="gateway key required")
     sid = request.headers.get("X-Sbx-Session", "")
@@ -45,6 +51,7 @@ async def session_policy(request: web.Request) -> dict:
 
 
 def clean_headers(headers) -> dict:
+    """Caller headers minus hop-by-hop, credentials and internal X-Sbx-* headers."""
     out = {k: v for k, v in headers.items()
            if k.lower() not in STRIP | {"accept-encoding"} and not k.lower().startswith("x-sbx-")}
     out["Accept-Encoding"] = "identity"   # the gateway inspects response bodies; keep them uncompressed
@@ -52,6 +59,7 @@ def clean_headers(headers) -> dict:
 
 
 async def relay(request: web.Request, upstream: aiohttp.ClientResponse) -> web.StreamResponse:
+    """Stream the upstream response back to the caller unchanged (minus hop-by-hop headers)."""
     resp = web.StreamResponse(status=upstream.status,
                               headers={k: v for k, v in upstream.headers.items() if k.lower() not in HOP})
     await resp.prepare(request)
@@ -62,39 +70,42 @@ async def relay(request: web.Request, upstream: aiohttp.ClientResponse) -> web.S
 
 
 async def anthropic(request: web.Request) -> web.StreamResponse:
-    ctx = await session_policy(request)
+    """Forward a Messages API call with the real API key, if the spec grants anthropic/default."""
+    ctx = await gateway_session(request)
     if GRANT_ANTHROPIC not in ctx["policy"].get("grants", []):
         raise web.HTTPForbidden(text="credential not granted by spec")
     if request.method != "POST" or request.match_info["tail"] not in ("v1/messages", "v1/messages/count_tokens"):
         raise web.HTTPForbidden(text="endpoint not allowed")       # second layer behind the gateway
     headers = clean_headers(request.headers)
     headers["x-api-key"] = ANTHROPIC_KEY
-    headers.pop("anthropic-workspace-id", None)
+    headers.pop("anthropic-workspace-id", None)     # the caller must not choose the workspace
     if ANTHROPIC_WORKSPACE:
         headers["anthropic-workspace-id"] = ANTHROPIC_WORKSPACE
     url = f"{ANTHROPIC_URL}/{request.match_info['tail']}"
     async with request.app["http"].request(request.method, url, params=request.query, headers=headers,
-                                           data=await request.read()) as up:
-        return await relay(request, up)
+                                           data=await request.read()) as upstream:
+        return await relay(request, upstream)
 
 
 async def egress(request: web.Request) -> web.StreamResponse:
-    ctx = await session_policy(request)
+    """Forward a plain-HTTP request to X-Sbx-Target after re-checking egress_allow / egress_write."""
+    ctx = await gateway_session(request)
     target = request.headers.get("X-Sbx-Target", "")
     parts = urlsplit(target)
     if parts.scheme != "http" or not parts.hostname or not host_allowed(parts.hostname, ctx["policy"].get("egress_allow", [])):
         raise web.HTTPForbidden(text="destination not allowed by spec")
     if request.method not in ("GET", "HEAD") and not host_allowed(parts.hostname, ctx["policy"].get("egress_write", [])):
         raise web.HTTPForbidden(text="destination is read-only for this spec")
+    # No redirects: following one would reach a destination the allowlist never checked.
     async with request.app["http"].request(request.method, target, headers=clean_headers(request.headers),
-                                           data=await request.read(), allow_redirects=False) as up:
-        return await relay(request, up)
+                                           data=await request.read(), allow_redirects=False) as upstream:
+        return await relay(request, upstream)
 
 
 CP_KEY = os.environ.get("SBX_CP_KEY", "")
 
 
-async def cp_session(request: web.Request, sid: str, states: tuple) -> dict:
+async def control_plane_session(request: web.Request, sid: str, states: tuple) -> dict:
     """GitHub operations are reserved for the control plane (separate key: the gateway can't ask
     credproxy to clone or push), and re-checked against the session's compiled policy."""
     import hmac
@@ -106,7 +117,8 @@ async def cp_session(request: web.Request, sid: str, states: tuple) -> dict:
     return ctx
 
 
-def _github_grant(ctx: dict, repo: str) -> None:
+def _require_github_grant(ctx: dict, repo: str) -> None:
+    """The spec must grant github-app/<repo>, and <repo> must be the session's own repo."""
     if f"github-app/{repo}" not in ctx["policy"].get("grants", []):
         raise web.HTTPForbidden(text=f"spec grants no GitHub credential for {repo}")
     if ctx["policy"].get("repo") != f"github:{repo}":
@@ -114,9 +126,10 @@ def _github_grant(ctx: dict, repo: str) -> None:
 
 
 async def github_clone(request: web.Request) -> web.Response:
+    """Clone the session's repo with a read-only token; returns a tarball and the token's metadata."""
     body = await request.json()
-    ctx = await cp_session(request, body["session_id"], ("creating", "running"))
-    _github_grant(ctx, body["repo"])
+    ctx = await control_plane_session(request, body["session_id"], ("creating", "running"))
+    _require_github_grant(ctx, body["repo"])
     try:
         data, meta = await asyncio.to_thread(github.clone, body["repo"], body.get("ref", "main"))
     except github.GitHubError as e:
@@ -125,22 +138,24 @@ async def github_clone(request: web.Request) -> web.Response:
 
 
 async def github_publish(request: web.Request) -> web.Response:
+    """Open the session's PR. Base branch, protected paths and draft flag come from the spec, not the caller."""
     body = await request.json()
-    ctx = await cp_session(request, body["session_id"], ("stopping",))
-    _github_grant(ctx, body["repo"])
-    out = ctx["policy"].get("output", {})
-    if out.get("type") != "pull_request":
+    ctx = await control_plane_session(request, body["session_id"], ("stopping",))
+    _require_github_grant(ctx, body["repo"])
+    output_spec = ctx["policy"].get("output", {})
+    if output_spec.get("type") != "pull_request":
         raise web.HTTPForbidden(text="spec output is not pull_request")
     try:
         result = await asyncio.to_thread(
-            github.publish, body["repo"], out.get("base", "main"), body["branch"], body["diff"], body["title"],
-            body["body"], out.get("protected_paths", [".github/", ".git/"]), bool(out.get("draft", True)))
+            github.publish, body["repo"], output_spec.get("base", "main"), body["branch"], body["diff"], body["title"],
+            body["body"], output_spec.get("protected_paths", [".github/", ".git/"]), bool(output_spec.get("draft", True)))
     except github.GitHubError as e:
         raise web.HTTPUnprocessableEntity(text=str(e)) from None
     return web.json_response(result)
 
 
 async def tunnel(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """:9001 CONNECT tunnel. Handshake line {key, session_id, host, port}; answers OK or ERR, then pipes."""
     try:
         hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
         if internal.caller(hello.get("key")) != "gateway":
@@ -163,6 +178,7 @@ async def tunnel(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
 
 
 async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+    """Copy src to dst until EOF, then close dst."""
     try:
         while data := await src.read(65536):
             dst.write(data)

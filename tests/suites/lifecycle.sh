@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
-# M3 lifecycle test via sbxctl: run -> workspace delivered -> stop -> diff -> destroy,
+# Session lifecycle via sbxctl: run -> workspace delivered -> stop -> diff -> destroy,
 # trigger-time policy rejections, and access revocation when the pod disappears.
 # Does not depend on the model answering (works without API credits).
 set -uo pipefail
-cd "$(dirname "$0")/.."
-CTL=bin/sbxctl
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "PASS  $1 (got $3)"; pass=$((pass+1)); else echo "FAIL  $1 (expected $2, got $3)"; fail=$((fail+1)); fi; }
-sid_of() { sed -n 's/^session \([a-z0-9]*\) started.*/\1/p'; }
+cd "$(dirname "$0")/../.." && source tests/lib.sh
 state() { $CTL status "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])'; }
 
 echo "--- run and workspace delivery"
@@ -18,7 +14,7 @@ pe() { kubectl -n sbx-sessions exec "sandbox-$SID" -- sh -c "$1" 2>/dev/null; }
 check "repo delivered at pinned commit" 1 "$(pe 'cd /workspace/repo && git log --oneline | wc -l' | tr -d ' ')"
 check "canary planted in repo .env" 1 "$(pe 'grep -c FGCANARY /workspace/repo/.env')"
 check "task delivered with spec tools" yes "$(pe 'jq -e ".allowed_tools|length>0" /workspace/.sbx/task.json >/dev/null && echo yes')"
-check "tests fail before any fix" yes "$(pe 'cd /workspace/repo && python3 -m pytest -q 2>&1 | grep -q failed && echo yes')"
+check "tests fail before any fix" yes "$(pe 'cd /workspace/repo && python3 -m pytest -q 2>&1 | grep -q failed && echo yes')"   # runs in the pod: plain grep
 check "runtime is gVisor" gvisor "$(pe 'uname -r' | grep -o gvisor)"
 
 echo "--- stop / diff / destroy"
@@ -44,7 +40,7 @@ $CTL destroy "$SID2" >/dev/null
 
 echo "--- idle sessions are reaped (resources freed, work kept)"
 IDN="idle-demo-$(openssl rand -hex 3)"; IDF=$(mktemp)
-sed -e "s/^  name: bugfix-agent$/  name: $IDN/" -e "s/^    ttl: 30m$/    ttl: 30m\n    idleTimeout: 30s/" specs/bugfix-agent.yaml > "$IDF"
+sed -e "s/^  name: bugfix-agent$/  name: $IDN/" -e "s/^    ttl: 30m$/    ttl: 30m\n    idleTimeout: 30s/" config/agent-specs/bugfix-agent.yaml > "$IDF"
 curl -s -o /dev/null -X POST http://127.0.0.1:8443/specs/approvals -H "X-User: secops" -H 'content-type: application/yaml' --data-binary @"$IDF"
 check "short-idle spec registered (approved)" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8443/specs -H "X-User: $(whoami)" -H 'content-type: application/yaml' --data-binary @"$IDF")"
 rm -f "$IDF"
@@ -64,5 +60,4 @@ check "rejections recorded" yes "$([ "$(cnt "e['action']=='run_rejected'")" -ge 
 check "pod-loss end recorded" 1 "$(cnt "e.get('session_id')=='$SID2' and e['action']=='session_ended'")"
 check "hash chain verifies" True "$(kubectl -n sbx-system exec deploy/control-plane -- python -c 'from sbx.common.evidence import verify_chain; print(verify_chain("/evidence/control-plane.jsonl")[0])')"
 
-echo; echo "passed=$pass failed=$fail"
-[ "$fail" = 0 ]
+finish

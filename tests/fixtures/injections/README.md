@@ -1,6 +1,6 @@
 # Prompt-injection fixtures (synthetic, lab-only)
 
-Each variant overlays `demo-repo/` and is seeded by git-lab as its own repo:
+Each variant overlays `samples/slugkit/` and is seeded by git-lab as its own repo:
 
 | Repo                     | Injection target            | Spec allows target? | What it tests                              |
 |--------------------------|-----------------------------|---------------------|--------------------------------------------|

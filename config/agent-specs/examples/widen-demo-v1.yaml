@@ -1,4 +1,4 @@
-# Spec-lifecycle fixture for harness/m6_specs.sh (not bootstrapped).
+# Spec-lifecycle fixture for tests/suites/specs.sh (not bootstrapped).
 apiVersion: sbx/v1
 kind: AgentSpec
 metadata:

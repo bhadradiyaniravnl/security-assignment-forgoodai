@@ -50,7 +50,6 @@ kubectl label node "$CLUSTER-control-plane" sbx/pool=security --overwrite >/dev/
 
 log "Manifests"
 kubectl apply -k deploy/k8s >/dev/null
-kubectl -n sbx-system delete deploy/detector cnp/detector --ignore-not-found >/dev/null   # replaced by the sentinel
 # One key per component (gateway, credproxy, sentinel), the control-plane key for GitHub ops, and the
 # evidence-shipper -> sentinel ingest key.
 # Generated into a file and passed with --from-env-file, so keys never appear on a command line.
@@ -72,7 +71,7 @@ kubectl -n sbx-system rollout restart deploy >/dev/null   # pick up rebuilt imag
 kubectl -n sbx-system rollout status deploy --timeout=180s >/dev/null
 kubectl -n sbx-security rollout restart deploy/sentinel >/dev/null
 kubectl -n sbx-security rollout status deploy/sentinel --timeout=180s >/dev/null
-deploy/sentinel-policy.sh >/dev/null       # detection rules + response actions (policies/sentinel/)
+deploy/sentinel-policy.sh >/dev/null       # detection rules + response actions (config/sentinel/)
 
 log "Ready"
 kubectl get pods -A -o wide 2>/dev/null | grep -E "NAMESPACE|sbx-system|lab-ext" || true

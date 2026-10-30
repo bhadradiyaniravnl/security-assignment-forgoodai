@@ -1,9 +1,9 @@
 # Architecture
 
 This document describes the sandboxed coding-agent platform as built: what each part does, how
-requests flow through it, where every credential lives, and why it is shaped this way. For the
-chronological build log and spike results see [DESIGN.md](DESIGN.md). Threats, findings and
-evidence are in [THREAT_MODEL.md](THREAT_MODEL.md) and [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
+requests flow through it, where every credential lives, and why it is shaped this way. Threats, findings
+and evidence are in [THREAT_MODEL.md](THREAT_MODEL.md) and [SECURITY_REVIEW.md](SECURITY_REVIEW.md); what
+broke along the way is in [BUILD_LOG.md](BUILD_LOG.md); how to run it is in [AGENTS.md](../AGENTS.md).
 
 ## 1. What the system does
 
@@ -252,9 +252,9 @@ use an **uncached** policy lookup.
 - **Platform claims:** shipped gateway and control-plane evidence (model calls, tool calls, egress decisions, lifecycle). It can't be edited or dropped after the fact without an EV alert, but it could be incomplete.
 - **Not seen yet:**
   - processes and files inside gVisor;
-  - Kubernetes API actions (S-P3, audit webhook);
-  - platform-pod processes (S-P4, Tetragon).
-- **Completeness check (S-P2):** Cilium's L7 proxy parses every sandbox request to the AI gateway
+  - Kubernetes API actions (next step: an audit webhook);
+  - platform-pod processes (next step: Tetragon).
+- **Completeness check (S1):** Cilium's L7 proxy parses every sandbox request to the AI gateway
   (method, path, session labels; credentials redacted by Hubble), and every connection to the egress
   proxy is a SYN. The sentinel counts both per session and reconciles them with the shipped gateway
   evidence, so a gateway that silently stops logging is caught (S1).
@@ -274,7 +274,7 @@ evidence shipper's push.
 - **Hubble, from session pods and from platform pods.** This comes from the kernel datapath, so no
   platform pod can fake it.
 
-**Built-in rules** (`rules.py`, pure functions; the actions shown are the default policy's):
+**Built-in rules** (`rules.py`, pure functions; the actions shown are those set in `config/sentinel/detection.yaml`):
 
 | Rule | Signal (source) | Action |
 |---|---|---|
@@ -289,12 +289,15 @@ evidence shipper's push.
 The control plane still raises D1 itself for a canary in a PR diff or agent summary, and INJ for the
 content scan.
 
-**Detection policy: rules and response actions as configuration** (`policies/sentinel/detection.yaml`,
-`policy.py`). It works like agent specs, but for the security plane:
+**Detection policy: rules and response actions as configuration** (`config/sentinel/detection.yaml`,
+`detection_policy.py`). It works like agent specs, but for the security plane. **The file is the only source of values:**
+the code implements the detectors and knows which parameters each one takes, but holds no severities, responses,
+thresholds or allowlists. A policy that leaves out a built-in rule, a parameter or the response actions is rejected
+rather than run on a hidden default.
 - **Response actions** are named lists of steps: `quarantine` (the sentinel's own deny policy), `verify` (Hubble check),
   `freeze` (fleet-wide deny) and `notify-control-plane` (revoke the token, snapshot evidence). Every alert is always written
-  to the sentinel's own log. The defaults are `record`, `contain` and `freeze-fleet`.
-- **Built-in rules** (above) keep their logic in code. The policy sets `enabled`, `mode`, `severity`, `response`, per-stage
+  to the sentinel's own log. The shipped file defines `record`, `contain` and `freeze-fleet`.
+- **Built-in rules** (above, plus POL for a rejected policy) must all be listed. The policy sets `enabled`, `mode`, `severity`, `response`, per-stage
   overrides (D2's first denial vs burst) and `params`: thresholds and allowlists such as D2's deny reasons and default burst,
   D3's acting tools, the S1 window and deficit, the S2 world allowlist and the S6 grace period.
 - **Custom match rules** add a detection without a code change. Each has a `source` (`gateway`, `control-plane`,
@@ -304,7 +307,7 @@ content scan.
 - **`mode: monitor`** records the alert and the steps it *would* have run, and does nothing else, so a new rule can be tuned
   before it is enforced.
 - **The floor** is compiled into the image and cannot be configured away:
-  - D1, EV and S6 always stay enabled in enforce mode;
+  - D1, EV, S6 and POL always stay enabled in enforce mode;
   - D1 and S6 must quarantine or freeze;
   - thresholds are bounded (e.g. an S1 deficit of 1–20, a D2 burst of 1–50);
   - only high-severity rules may freeze;
@@ -316,7 +319,8 @@ content scan.
   3. hot-reload it (the sentinel also polls every 10 s);
   4. confirm the sentinel now runs exactly that file's digest.
 - **A broken policy cannot blind the sentinel.** If one is applied by hand, the sentinel rejects it, raises a **POL** alert and
-  keeps its last good policy. Every load and every rejection is in its hash-chained log, with the digest and the rules disabled
+  keeps its last good policy. On first boot with no ConfigMap it starts on the copy of the same file baked into the image;
+  if no valid policy is available at all it exits (CrashLoopBackOff) rather than run blind. Every load and every rejection is in its hash-chained log, with the digest and the rules disabled
   or in monitor mode.
 - **Who can change it:** the sentinel's service account can only *read* that one ConfigMap. Writing it needs cluster access to
   `sbx-security`, which the platform's identities don't have. There is no second-person review yet; that was a deliberate
@@ -379,7 +383,7 @@ flowchart LR
   c --> cc[Claude Code allowedTools<br/>defence in depth]
 ```
 
-**AgentSpec** (`specs/*.yaml`) declares:
+**AgentSpec** (`config/agent-specs/*.yaml`) declares:
 - runtime (image, RuntimeClass, resources, TTL) and models (allowlist, defaults, token budget);
 - repo (allowed repos, read-only access, output: branch or **draft** PR with protected paths);
 - agent tools, egress allowlist, secret grants, detection threshold;
@@ -552,20 +556,8 @@ and SHA-256, not the text. `attach` replays history and streams live.
 
 ## 10. Testing architecture
 
-| Suite | Proves | Count |
-|---|---|---|
-| `make smoke` | L3/L4 boundary, gVisor, lab ingress, quarantine | 12 |
-| `make e2e` | Gateways, credproxy, evidence, real Claude Code call | 19 |
-| `make lifecycle` | `sbxctl` lifecycle, trigger rejections, reconciler | 21 |
-| `make containment` | D1/D2 → auto-containment → two-source verification | 17 |
-| `make specs` | Baseline, authors, two-person approval, immutability, admission | 35 |
-| `make github` | Scoped tokens, clone via credproxy, forged-diff/workflow/canary PR refusals | 14 |
-| `make sentinel` | Independent detection and response, containment with the control plane down, S2, S6 | 24 |
-| `make sentinel-s1` | S1 gateway completeness via lab fault injection | 7 |
-| `make sentinel-policy-test` | Detection policy: deploy and digest, floor (pre-apply and in the sentinel), custom rules, contain vs record, monitor mode | 16 |
-| **`make security-test`** | **Phase B** 22 deterministic compromised-agent cases · **Phase A** agent under prompt injection, outcomes classified · **Phase C** utility | → `out/report.md` |
-
-Harness rules:
+The one-command harness (`make security-test`: phases A, B, C) and nine feature suites (`make test`) are listed,
+with what each proves and costs, in [AGENTS.md](../AGENTS.md#5-test-it). Harness rules:
 - Verdicts come only from outside the sandbox.
 - Nondeterministic agent outcomes are kept separate from enforcement results.
 - Task success is re-checked by applying the recomputed diff in a fresh `--network none` container.
@@ -597,28 +589,9 @@ Harness rules:
 | Supply chain | Pinned versions, checksums | Digest-pinned and signed images, SBOM, verified at admission |
 | Resume | Follow-ups resume the conversation in the same pod | Resume after `stop` (snapshot workspace + transcript) |
 
-## 13. Repository map
+## 13. Repository map and versions
 
-```
-src/sbx/
-  cli/sbxctl.py              host CLI
-  control_plane/             app, sessions, specs, baseline, k8s, store
-  gateway/                   ai (AI gateway), egress (forward proxy), common, main
-  credproxy/                 app (inference/egress/tunnel/GitHub routes), github (App tokens, clone, publish)
-  sentinel/                  rules (D1-D3, EV, S1, S2, S6), policy (detection policy + floor + custom rules), main, actions, shipper, ctl
-  common/                    canary, evidence (hash chain), internal (component keys), policy
-  lab/                       sink (paste-mock / attacker-sink), git_lab
-images/                      sandbox, sandbox-pyweb, services
-deploy/                      up.sh, down.sh, images.sh, runsc-install.sh, secrets.sh, kind.yaml, k8s/
-policies/sentinel/           detection.yaml: the sentinel's rules and response actions
-specs/                       bugfix-agent(.yaml|-open), testwriter-agent, bad/ (12), examples/
-fixtures/injections/         prompt-injection variants
-demo-repo/, samples/         task repos (slugkit; items-api-sample)
-harness/                     security_test.py + milestone suites (m1-m8)
-docs/                        ARCHITECTURE, THREAT_MODEL, SECURITY_REVIEW, SETUP, DESIGN, results/
-```
-
-**Pinned versions:**
+The repository map is in [AGENTS.md](../AGENTS.md#repo-map). **Pinned versions:**
 - kind v0.33 (Kubernetes 1.37), Cilium 1.20.1, gVisor release-20261019, Hubble CLI 1.20.2;
 - Claude Code 2.1.1;
 - Python 3.12 services: aiohttp, FastAPI, the kubernetes client, PyJWT.
