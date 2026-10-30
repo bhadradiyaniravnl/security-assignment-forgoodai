@@ -19,19 +19,49 @@ A small internal platform that runs Claude Code in disposable, gVisor-isolated K
 | [docs/SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md) · [docs/BUILD_LOG.md](docs/BUILD_LOG.md) | Review findings at a point in time (high and medium fixed) · what broke along the way |
 
 ```mermaid
-flowchart LR
-  user([engineer]) -->|sbxctl| cp[control plane<br/>spec registry · sessions]
-  cp -->|create| pod
-  subgraph sessions [sbx-sessions · gVisor · Cilium default-deny]
-    pod[sandbox pod<br/>Claude Code · repo copy + canary<br/>session token only]
+flowchart TB
+  user([engineer<br/>sbxctl, X-User]) -->|127.0.0.1:8443| cp
+  sec([security<br/>kubectl exec → ctl]) -.-> sen
+  cfg[/agent specs · detection policy<br/>config/, reviewed, versioned/] -.-> cp
+  cfg -.-> sen
+
+  subgraph platform [platform node · sbx-system]
+    cp[control plane<br/>spec registry + baseline · sessions<br/>token checks · trusted diff · reaper]
+    gw[gateway<br/>AI :8080 · egress proxy :3128<br/>spec policy on every request]
+    cred[credproxy<br/>the only real secrets<br/>Anthropic key · GitHub App]
+    ship[evidence shipper<br/>hash-chained records]
+    ev[(evidence<br/>gateway · control plane · alerts)]
+    gitlab[(git-lab<br/>lab repos)]
   end
-  pod -->|:8080 model · :3128 egress| gw[gateway<br/>spec enforcement]
-  pod -. "anything else: dropped" .-> hub((Hubble))
-  gw --> cred[credproxy<br/>the only real secrets]
-  cred --> out[(Anthropic · GitHub · lab hosts)]
-  gw -->|hash-chained evidence| sen[sentinel<br/>own namespace + node]
+
+  subgraph sandbox [sandbox node · sbx-sessions · gVisor · Cilium default-deny]
+    pod[sandbox-SID<br/>Claude Code · repo copy + canary<br/>session token only, no SA token]
+  end
+
+  subgraph security [security node · sbx-security]
+    sen[sentinel<br/>D1–D3 · EV · S1 · S2 · S6<br/>own deny policies · own log]
+  end
+
+  k8s{{kube-apiserver<br/>RBAC · admission policy}}
+  hub((Hubble<br/>kernel flow log))
+
+  cp -->|create pod · quarantine CNP| k8s --> pod
+  cp -->|clone via credproxy, workspace via exec| pod
+  cp --> gitlab
+  pod -->|model calls| gw
+  pod -->|allowed hosts| gw
+  pod -. "anything else: dropped" .-> hub
+  gw -->|validate token| cp
+  gw --> cred
+  cred -->|real key injected| anth[(api.anthropic.com)]
+  cred -->|repo-scoped token,<br/>revoked after use| gh[(GitHub<br/>draft PR)]
+  cred --> lab[(lab hosts<br/>paste-mock · attacker-sink)]
+  gw --> ev
+  cp --> ev
+  ev --> ship -->|verified on arrival| sen
   hub --> sen
-  sen -->|own deny policy| pod
+  sen -->|sentinel-q-SID, sentinel-freeze| k8s
+  sen -.->|revoke · snapshot · alert| cp
 ```
 
 ## Results at a glance
