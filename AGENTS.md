@@ -131,8 +131,8 @@ bin/sbxctl spec register config/agent-specs/examples/widen-demo-v1.yaml         
 | `make lifecycle` | `sbxctl` lifecycle, trigger-time rejections, reconciler, idle reaping | cents |
 | `make containment` | Detection → automatic containment → independent verification, fleet freeze | cents |
 | `make specs` | Spec governance: org baseline, authors, two-person approval, admission backstop | cents |
-| `make sentinel` | Sentinel isolation, verified evidence shipping, containment with the control plane down, S2, S6 | cents |
-| `make sentinel-completeness` | S1: a gateway that under-reports (fault-injected for the test only) is caught | ~$0 |
+| `make sentinel` | Sentinel isolation, verified evidence shipping, containment with the control plane down, platform-pod-egress, traffic-after-containment | cents |
+| `make sentinel-completeness` | gateway-underreporting: a gateway that under-reports (fault-injected for the test only) is caught | ~$0 |
 | `make sentinel-policy-test` | Detection policy: deploy and digest, floor, custom rules, monitor mode | cents |
 | `make github` | Scoped GitHub App tokens, clone via credproxy, PR refusals (`AGENT=1` opens a real PR) | needs the App |
 

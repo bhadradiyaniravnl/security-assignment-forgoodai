@@ -24,7 +24,7 @@ class _Evidence:
     """The gateway's evidence log. With SBX_FAULT_INJECTION=1 (test deployments only) it silently drops
     records for sessions listed in /tmp/sbx-fault/drop-sessions: exactly what a compromised gateway could
     do anyway, so the switch adds no capability. It exists to prove that the sentinel's gateway
-    completeness rule (S1: Hubble saw more requests than the gateway logged) catches it."""
+    completeness rule (gateway-underreporting: Hubble saw more requests than the gateway logged) catches it."""
 
     def __init__(self, log: EvidenceLog):
         self.log, self._drop_list_read_at, self._drop_sessions = log, 0.0, set()

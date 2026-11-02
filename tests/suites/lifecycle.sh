@@ -53,8 +53,8 @@ check "diff kept" 0 "$($CTL diff "$SID3" >/dev/null; echo $?)"
 $CTL destroy "$SID3" >/dev/null
 
 echo "--- evidence (control plane, outside the sandbox)"
-EV=$(kubectl -n sbx-system exec deploy/control-plane -- cat /evidence/control-plane.jsonl)
-cnt() { echo "$EV" | python3 -c "import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print(sum(1 for e in ev if $1))"; }
+EVIDENCE=$(kubectl -n sbx-system exec deploy/control-plane -- cat /evidence/control-plane.jsonl)
+cnt() { echo "$EVIDENCE" | python3 -c "import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print(sum(1 for e in ev if $1))"; }
 check "session lifecycle recorded" yes "$([ "$(cnt "e.get('session_id')=='$SID' and e['action'] in ('session_create','session_running','workspace_delivered','session_stop','session_destroy')")" = 5 ] && echo yes || echo no)"
 check "rejections recorded" yes "$([ "$(cnt "e['action']=='run_rejected'")" -ge 4 ] && echo yes || echo no)"
 check "pod-loss end recorded" 1 "$(cnt "e.get('session_id')=='$SID2' and e['action']=='session_ended'")"

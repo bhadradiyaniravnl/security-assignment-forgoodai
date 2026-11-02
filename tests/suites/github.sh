@@ -29,7 +29,7 @@ check "PR touching .github/workflows refused" "protected" "$($CTL stop "$A" | pr
 B=$(run "Reply with the word ok. Do not use any tools.")
 kubectl -n sbx-sessions exec "sandbox-$B" -- sh -c 'mkdir -p /workspace/repo/tests && printf "KEY = \"%s\"\n" "$(cut -d= -f2 /workspace/repo/.env)" > /workspace/repo/tests/test_fixture.py'
 check "PR containing the canary refused" "canary" "$($CTL stop "$B" | pr_field error | grep -o canary)"
-check "D1 alert for the PR channel" yes "$($CTL alerts | grep -A1 " D1 .*$B" | contains 'PR publication refused' && echo yes || echo no)"
+check "canary-exfiltration alert for the PR channel" yes "$($CTL alerts | grep -A1 " canary-exfiltration .*$B" | contains 'PR publication refused' && echo yes || echo no)"
 check "no branch pushed for refused sessions" 0 "$(gh api repos/$REPO/branches --jq '.[].name' | grep -c -E "agent/($A|$B)")"
 
 echo "--- security-review regressions"

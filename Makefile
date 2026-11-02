@@ -57,10 +57,10 @@ specs:     ## Spec governance: baseline, authors, immutability, two-person appro
 github:    ## Scoped GitHub App tokens, clone via credproxy, PR refusals (AGENT=1 opens a real PR)
 	tests/suites/github.sh
 
-sentinel:  ## Sentinel: isolation, verified shipping, containment with the control plane down, S2, S6
+sentinel:  ## Sentinel: isolation, verified shipping, containment with the control plane down, platform-pod-egress, traffic-after-containment
 	tests/suites/sentinel.sh
 
-sentinel-completeness: ## Sentinel S1: datapath request counts vs gateway evidence (fault-injected gateway)
+sentinel-completeness: ## Sentinel gateway-underreporting: datapath request counts vs gateway evidence (fault-injected gateway)
 	tests/suites/sentinel_completeness.sh
 
 sentinel-policy-test: ## Detection policy: deploy, floor, custom rules, contain vs record, monitor mode

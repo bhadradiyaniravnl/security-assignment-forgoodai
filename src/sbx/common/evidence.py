@@ -2,10 +2,10 @@
 
 Each component writes its own file (<dir>/<component>.jsonl, dir from EVIDENCE_DIR). Every
 event carries seq, prev_hash and hash = sha256(prev_hash + canonical event), so truncation or
-edits are detectable by re-walking the chain (verify_chain here, and the sentinel's EV rule).
+edits are detectable by re-walking the chain (verify_chain here, and the sentinel's evidence-tampering rule).
 
 Trust: the chain detects tampering after the fact; it does not stop a compromised writer from
-omitting events. Omission is caught elsewhere (the sentinel's S1 rule compares the gateway's
+omitting events. Omission is caught elsewhere (the sentinel's gateway-underreporting rule compares the gateway's
 log against Hubble flows). Sandboxes never mount this volume.
 """
 from __future__ import annotations

@@ -83,9 +83,9 @@ check "unlabelled pod denied" "sbx/session"     "$(weak nolabel 'app: x' gvisor 
 check "compliant pod admitted" admitted          "$(r=$(weak ok 'sbx/session: x' gvisor false); [ -z "$r" ] && echo admitted || echo "$r")"
 
 echo "--- evidence"
-EV=$(kubectl -n sbx-system exec deploy/control-plane -- cat /evidence/control-plane.jsonl)
-check "rejections recorded with reasons" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_rejected" and e.get("reasons"))>=15 else "no")')"
-check "approvals recorded" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_approved" and e.get("approved_by")=="secops")>=2 else "no")')"
-check "registrations recorded" yes "$(echo "$EV" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if any(e["action"]=="spec_registered" and e.get("name","").startswith("widen-demo") and e.get("version")==2 for e in ev) else "no")')"
+EVIDENCE=$(kubectl -n sbx-system exec deploy/control-plane -- cat /evidence/control-plane.jsonl)
+check "rejections recorded with reasons" yes "$(echo "$EVIDENCE" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_rejected" and e.get("reasons"))>=15 else "no")')"
+check "approvals recorded" yes "$(echo "$EVIDENCE" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if sum(1 for e in ev if e["action"]=="spec_approved" and e.get("approved_by")=="secops")>=2 else "no")')"
+check "registrations recorded" yes "$(echo "$EVIDENCE" | python3 -c 'import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print("yes" if any(e["action"]=="spec_registered" and e.get("name","").startswith("widen-demo") and e.get("version")==2 for e in ev) else "no")')"
 rm -rf "$LAST" "$TMP"
 finish

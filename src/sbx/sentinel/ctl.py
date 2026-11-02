@@ -30,7 +30,7 @@ def main(argv: list[str]) -> None:
     if cmd == "alerts":
         for e in call("alerts", {"n": int(rest[0]) if rest else 30}):
             what = e.get("summary") or e.get("action")
-            print(f"{e['seq']:>5} {e.get('rule', ''):<3} {e.get('severity', ''):<6} {e.get('session_id') or '-':<10} "
+            print(f"{e['seq']:>5} {e.get('rule', ''):<26} {e.get('severity', ''):<6} {e.get('session_id') or '-':<10} "
                   f"{what}" + (f"  verified={e['verified']}" if "verified" in e else "")
                   + (f"  [monitor: would {'+'.join(e.get('would_run') or [])}]" if e.get("mode") == "monitor" else ""))
     elif cmd == "freeze":

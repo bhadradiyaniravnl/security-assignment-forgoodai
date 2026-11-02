@@ -2,8 +2,8 @@
 # Sentinel: the separate, continuously running detection and response plane.
 # Proves: it runs on its own node with least privilege; shipped evidence is verified on arrival;
 # it contains a session with the CONTROL PLANE DOWN; nobody else can delete its deny policies;
-# S2 catches platform pod egress; S6 re-contains a session whose containment a compromised
-# control plane lifted; containment memory survives a sentinel restart; HB alerts when the
+# platform-pod-egress catches platform pod egress; traffic-after-containment re-contains a session whose containment a compromised
+# control plane lifted; containment memory survives a sentinel restart; telemetry-feed-silent alerts when the
 # sentinel's own Hubble feed goes quiet; and its own fleet freeze works.
 set -uo pipefail
 cd "$(dirname "$0")/../.." && source tests/lib.sh
@@ -52,34 +52,34 @@ check "cluster admin cannot delete it" denied "$(denied kubectl -n sbx-sessions 
 check "control-plane identity cannot delete it" denied "$(denied kubectl -n sbx-sessions delete cnp "sentinel-q-$A" --as=system:serviceaccount:sbx-system:sbx-controller)"
 check "quarantine still in place" yes "$(has_cnp sentinel-q-$A)"
 
-echo "--- S2: a platform pod misbehaving (gateway tries to reach the attacker sink)"
+echo "--- platform-pod-egress: a platform pod misbehaving (gateway tries to reach the attacker sink)"
 kubectl -n sbx-system exec deploy/gateway -c gateway -- curl -s -o /dev/null -m 3 http://attacker-sink.lab-ext/ >/dev/null 2>&1
-wait_for "SC alerts 400 | contains 'S2 .*platform pod gateway' && echo y" y 30
-check "S2 alert raised from Hubble (independent of the gateway's own logs)" yes "$(SC alerts 400 | contains 'S2 .*platform pod gateway' && echo yes || echo no)"
+wait_for "SC alerts 400 | contains 'platform-pod-egress .*platform pod gateway' && echo y" y 30
+check "platform-pod-egress alert raised from Hubble (independent of the gateway's own logs)" yes "$(SC alerts 400 | contains 'platform-pod-egress .*platform pod gateway' && echo yes || echo no)"
 
-echo "--- S6: a compromised control plane lifts its own containment"
+echo "--- traffic-after-containment: a compromised control plane lifts its own containment"
 B=$(start_session)
 $CTL contain "$B" >/dev/null
 wait_for "SC status | python3 -c \"import json,sys; print('y' if '$B' in json.load(sys.stdin)['contained'] else 'n')\"" y 20
 kubectl -n sbx-sessions delete cnp "quarantine-$B" >/dev/null                  # the platform's own quarantine...
 kubectl -n sbx-sessions label pod "sandbox-$B" sbx/state=running --overwrite >/dev/null   # ...and its relabel, undone
 for _ in $(seq 1 45); do gw_code "$B" >/dev/null; [ "$(has_cnp sentinel-q-$B)" = yes ] && break; sleep 2; done
-check "S6 detected traffic after containment" yes "$(alerts_for "$B" | contains 'S6' && echo yes || echo no)"
+check "traffic-after-containment detected traffic after containment" yes "$(alerts_for "$B" | contains 'traffic-after-containment' && echo yes || echo no)"
 check "sentinel re-quarantined the session" yes "$(has_cnp sentinel-q-$B)"
 sleep 2
 check "session cut off again" 000 "$(gw_code "$B")"
 
-echo "--- restart: containment memory survives (S6 keeps watching quarantined sessions)"
+echo "--- restart: containment memory survives (traffic-after-containment keeps watching quarantined sessions)"
 kubectl -n sbx-security rollout restart deploy/sentinel >/dev/null
 kubectl -n sbx-security rollout status deploy/sentinel --timeout=120s >/dev/null
 wait_for "SC status 2>/dev/null | python3 -c \"import json,sys; print('y' if '$B' in json.load(sys.stdin)['contained'] else 'n')\"" y 30
 check "quarantined session remembered after restart" yes "$(SC status | python3 -c "import json,sys; print('yes' if '$B' in json.load(sys.stdin)['contained'] else 'no')")"
 check "quarantine policy still in place" yes "$(has_cnp sentinel-q-$B)"
 
-echo "--- HB: the sentinel notices when its own datapath feed goes quiet"
+echo "--- telemetry-feed-silent: the sentinel notices when its own datapath feed goes quiet"
 kubectl -n kube-system scale deploy/hubble-relay --replicas=0 >/dev/null
-wait_for "SC alerts 50 | contains 'HB .*datapath feed silent' && echo y" y 110
-check "HB alert raised with Hubble relay down" yes "$(SC alerts 50 | contains 'HB .*datapath feed silent' && echo yes || echo no)"
+wait_for "SC alerts 50 | contains 'telemetry-feed-silent .*datapath feed silent' && echo y" y 110
+check "telemetry-feed-silent alert raised with Hubble relay down" yes "$(SC alerts 50 | contains 'telemetry-feed-silent .*datapath feed silent' && echo yes || echo no)"
 kubectl -n kube-system scale deploy/hubble-relay --replicas=1 >/dev/null
 kubectl -n kube-system rollout status deploy/hubble-relay --timeout=120s >/dev/null
 wait_for "kubectl -n sbx-security logs deploy/sentinel --since=30s | contains '\"hubble\": \"connected\"' && echo y" y 40

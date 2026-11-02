@@ -50,9 +50,14 @@ def _app_jwt() -> str:
 def _github_api(method: str, path: str, token: str, bearer: bool = True, **kw) -> httpx.Response:
     """Call the GitHub REST API: Bearer for the App JWT, `token` scheme for installation tokens."""
     auth = f"Bearer {token}" if bearer else f"token {token}"
-    return httpx.request(method, API + path, timeout=30, **kw,
-                         headers={"Authorization": auth, "Accept": "application/vnd.github+json",
-                                  "X-GitHub-Api-Version": "2022-11-28"})
+    headers = {"Authorization": auth, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    try:
+        return httpx.request(method, API + path, timeout=30, headers=headers, **kw)
+    except httpx.ConnectError:
+        # Egress is an FQDN policy: just after this pod starts, Cilium may not yet have learned
+        # api.github.com's addresses, and the first connect is dropped. One retry, nothing broader.
+        time.sleep(2)
+        return httpx.request(method, API + path, timeout=30, headers=headers, **kw)
 
 
 class Token:

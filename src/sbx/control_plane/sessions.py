@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -97,7 +98,7 @@ def run(store: Store, user: str, spec_name: str, params: dict) -> dict:
         f.write("\n.env\n")                                          # local-only ignore; never committed
     if findings:
         evidence.write_sync("untrusted_content_scan", **who, count=len(findings), findings=findings[:20])
-        alerts.write_sync("alert", alert_id=f"al_inj_{sid}", rule="INJ", severity="low", **who,
+        alerts.write_sync("alert", alert_id=f"al_inj_{sid}", rule="injection-in-repo", severity="low", **who,
                           summary=f"{len(findings)} instruction-like passage(s) in repo content "
                                   f"({', '.join(sorted({f['rule'] for f in findings}))})",
                           observed={"findings": findings[:5]}, evidence=[{"source": "control-plane"}])
@@ -138,6 +139,10 @@ def stop(store: Store, sid: str, user: str, reason: str = "stopped by user", sys
     os.makedirs(RESULTS, exist_ok=True)
     with open(os.path.join(RESULTS, f"{sid}.diff"), "w") as f:
         f.write(diff)
+    if diff.strip():          # what the agent changed, by path: the sentinel alerts on dependency/CI files
+        paths = _diff_paths(diff)
+        evidence.write_sync("diff_collected", session_id=sid, user=session["user"], spec=session["spec_name"],
+                            paths=paths[:200], path_count=len(paths), diff_bytes=len(diff))
     pr = None
     if (not was_contained and store.get(sid)["state"] == "stopping"
             and session["policy"].get("output", {}).get("type") == "pull_request" and diff.strip()):
@@ -340,6 +345,17 @@ GIT_ISOLATED = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "G
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
 
+def _diff_paths(diff: str) -> list[str]:
+    """Paths named in a diff's `diff --git` headers, quoted or not. A detection input only: the
+    authoritative protected-path check runs on staged files at publish (credproxy)."""
+    paths = set()
+    for line in diff.splitlines():
+        m = re.match(r'^diff --git "?a/(.+?)"? "?b/(.+?)"?$', line)
+        if m:
+            paths.update(m.groups())
+    return sorted(paths)
+
+
 def collect_diff(sid: str) -> tuple[str, int]:
     """The diff is computed HERE, not by git in the pod: the agent controls the pod's git binary,
     config (diff.external, textconv, aliases) and output. We copy out the working-tree files only,
@@ -394,8 +410,8 @@ def _open_draft_pr(sid: str, session: dict, diff: str) -> dict:
     if hit or len(diff) > MAX_PR_DIFF:
         reason = f"canary {hit['id']} ({hit['encoding']}) in {where}" if hit else f"diff too large ({len(diff)} bytes)"
         evidence.write_sync("pr_refused", **who, error=reason)
-        if hit:   # same rule as the sentinel's D1 (canary in an outbound request), raised by the control plane
-            alerts.write_sync("alert", alert_id=f"al_pr_{sid}", rule="D1", severity="high", **who,
+        if hit:   # same rule as the sentinel's canary-exfiltration (canary in an outbound request), raised by the control plane
+            alerts.write_sync("alert", alert_id=f"al_pr_{sid}", rule="canary-exfiltration", severity="high", **who,
                               summary=f"{reason}: PR publication refused", observed={"channel": "pull_request"},
                               evidence=[{"source": "control-plane", "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}],
                               pod=session["pod_name"], pod_ip=session["pod_ip"])

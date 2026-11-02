@@ -5,12 +5,12 @@ What it trusts:
     (platform or sandbox) can fake them. Treated as ground truth for where traffic went.
   - Shipped platform evidence (gateway.jsonl, control-plane.jsonl): claims made by the platform.
     Verified on arrival (sequence continuity + hash chain) and copied to the sentinel's own volume,
-    so a gap or an edit raises EV; it may still be incomplete, which S1 checks.
+    so a gap or an edit raises evidence-tampering; it may still be incomplete, which gateway-underreporting checks.
   - The control plane only for per-session policy lookups (cached; built-in defaults if it is down).
 
 What it does:
-  detect    D1-D3, EV (evidence integrity), HB (own inputs alive), S1 (gateway completeness: Cilium L7/L4 request counts vs
-            shipped gateway evidence), S2 (platform pod egress), S6 (traffic after containment),
+  detect    canary-exfiltration, denied-requests, risky-tool-call, evidence-tampering (evidence integrity), telemetry-feed-silent (own inputs alive), gateway-underreporting (gateway completeness: Cilium L7/L4 request counts vs
+            shipped gateway evidence), platform-pod-egress (platform pod egress), traffic-after-containment (traffic after containment),
             plus the detection policy's custom match rules
   policy    detection policy (rules, tuning, response actions) from the ConfigMap sentinel-detection,
             hot-reloaded, validated against a compiled-in floor; every load or rejection is recorded
@@ -57,20 +57,20 @@ contained: dict[str, float] = {}                             # sid -> time conta
 forwarded: dict[str, list] = {}                              # sid -> times Cilium forwarded egress after containment
 custom_rules = detpol.CustomRules()
 policy_resource_version: str | None = None                   # ConfigMap resourceVersion last seen
-# S1 (gateway completeness): what the kernel saw vs what the gateway logged, per session
+# gateway-underreporting (gateway completeness): what the kernel saw vs what the gateway logged, per session
 seen_ai: dict[str, list] = {}       # Cilium L7: HTTP requests to the AI gateway (excl. /healthz)
 seen_egress: dict[str, list] = {}   # Cilium L4: new TCP connections to the egress proxy (1 connection = 1 request)
 logged_ai: dict[str, list] = {}     # shipped gateway evidence: ai_request events
 logged_egress: dict[str, list] = {}  # shipped gateway evidence: egress events (excl. connect_close)
 ip_to_sid: dict[str, str] = {}
-datapath_dedup: dict[tuple, float] = {}                      # S1 counting: flow key -> last time counted
+datapath_dedup: dict[tuple, float] = {}                      # gateway-underreporting counting: flow key -> last time counted
 session_policies: dict[str, dict] = {}                       # sid -> last policy the control plane returned
 positions: dict[str, int] = {}                              # file -> last verified seq
 chain_head: dict[str, str] = {}                             # file -> hash of the last verified record
 broken_files: set[str] = set()                              # files that ever had a gap or chain break
-last_ev: dict[str, float] = {}                               # file -> time of its last EV alert (cooldown)
-last_flow_at = 0.0                                           # HB: last Hubble flow seen, any namespace
-last_ingest_at = 0.0                                         # HB: last shipped batch with records
+last_ev: dict[str, float] = {}                               # file -> time of its last evidence-tampering alert (cooldown)
+last_flow_at = 0.0                                           # telemetry-feed-silent: last Hubble flow seen, any namespace
+last_ingest_at = 0.0                                         # telemetry-feed-silent: last shipped batch with records
 
 
 def emit(**kw) -> None:
@@ -178,8 +178,8 @@ async def ingest_position(request: web.Request) -> web.Response:
 
 async def ingest(request: web.Request) -> web.Response:
     """POST /ingest {file, events}: verify each new record (sequence continuity, hash chain), keep a
-    copy, then run detection on it. Every gap or chain break raises EV, at most once per file per
-    EV.params.cooldown_s so a flood of broken records is one incident, not one alert each."""
+    copy, then run detection on it. Every gap or chain break raises evidence-tampering, at most once per file per
+    evidence-tampering.params.cooldown_s so a flood of broken records is one incident, not one alert each."""
     if request.headers.get("X-Sbx-Ingest") != INGEST_KEY or not INGEST_KEY:
         raise web.HTTPUnauthorized()
     body = await request.json()
@@ -209,20 +209,20 @@ async def ingest(request: web.Request) -> web.Response:
 
 
 async def evidence_incident(http: aiohttp.ClientSession, name: str, seq: int, what: str) -> None:
-    """EV bookkeeping: remember the file as broken (for `ctl status`), alert unless the last EV for
+    """evidence-tampering bookkeeping: remember the file as broken (for `ctl status`), alert unless the last evidence-tampering for
     this file is within the policy's cooldown."""
     broken_files.add(name)
     now = time.time()
-    if now - last_ev.get(name, 0) < float(engine.pol.param("EV", "cooldown_s")):
+    if now - last_ev.get(name, 0) < float(engine.pol.param("evidence-tampering", "cooldown_s")):
         return
     last_ev[name] = now
-    await respond(http, alert("EV", None, f"{name}: {what}", {"file": name, "seq": seq},
+    await respond(http, alert("evidence-tampering", None, f"{name}: {what}", {"file": name, "seq": seq},
                               [{"source": "shipper", "seq": seq}], key=f"{name}|{seq}"))
 
 
 def grace_s() -> float:
-    """S6 grace period: traffic this soon after containment is not yet a leak."""
-    return float(engine.pol.param("S6", "grace_s"))
+    """traffic-after-containment grace period: traffic this soon after containment is not yet a leak."""
+    return float(engine.pol.param("traffic-after-containment", "grace_s"))
 
 
 async def run_custom_rules(http: aiohttp.ClientSession, source: str, event: dict, sid: str | None) -> None:
@@ -234,7 +234,7 @@ async def run_custom_rules(http: aiohttp.ClientSession, source: str, event: dict
 
 async def handle_event(http: aiohttp.ClientSession, name: str, event: dict) -> None:
     """Detection on one verified shipped record: custom rules, containment bookkeeping (control
-    plane), S1 logged-request counts and the built-in gateway rules (gateway)."""
+    plane), gateway-underreporting logged-request counts and the built-in gateway rules (gateway)."""
     if event.get("ts", 0) >= started - REPLAY_GRACE_S:
         await run_custom_rules(http, name.removesuffix(".jsonl"), event, event.get("session_id"))
     if name == "control-plane.jsonl":
@@ -279,7 +279,7 @@ async def hubble_stream(http: aiohttp.ClientSession, namespace: str, handler) ->
 
 
 async def on_session_flow(http: aiohttp.ClientSession, flow: dict) -> None:
-    """A flow from a sandbox pod: S1 counting, custom rules, D2 (drops) and S6 (traffic after containment)."""
+    """A flow from a sandbox pod: gateway-underreporting counting, custom rules, denied-requests (drops) and traffic-after-containment (traffic after containment)."""
     sid = next((l.split("=", 1)[1] for l in flow.get("source", {}).get("labels", [])
                 if l.startswith("k8s:sbx/session=")), None)
     if not sid:
@@ -304,7 +304,7 @@ async def on_session_flow(http: aiohttp.ClientSession, flow: dict) -> None:
 
 
 def _count_datapath_requests(sid: str, flow: dict) -> None:
-    """S1: independent request counts from the datapath. Hubble may report one packet at several
+    """gateway-underreporting: independent request counts from the datapath. Hubble may report one packet at several
     observation points (source and destination node), so de-duplicate by source port."""
     ts = parse_time(flow.get("time"))
     if ts < started:
@@ -330,13 +330,13 @@ def _count_datapath_requests(sid: str, flow: dict) -> None:
 
 
 async def reconcile(http: aiohttp.ClientSession) -> None:
-    """S1: if the kernel saw materially more requests from a session than the gateway logged, the
+    """gateway-underreporting: if the kernel saw materially more requests from a session than the gateway logged, the
     gateway's account of that session is incomplete (compromised, buggy or tampered): contain it.
     Only requests older than the horizon are compared, so shipping lag is not a deficit."""
     while True:
-        params = engine.pol.rules["S1"]["params"]
+        params = engine.pol.rules["gateway-underreporting"]["params"]
         await asyncio.sleep(params["interval_s"])
-        if not engine.pol.enabled("S1"):
+        if not engine.pol.enabled("gateway-underreporting"):
             continue
         horizon = time.time() - params["horizon_s"]
         for channel, seen, logged in (("AI", seen_ai, logged_ai), ("egress", seen_egress, logged_egress)):
@@ -346,7 +346,7 @@ async def reconcile(http: aiohttp.ClientSession) -> None:
                 deficit = n_seen - n_logged
                 if deficit >= params["min_deficit"] and deficit >= params["min_ratio"] * n_seen:
                     await respond(http, alert(
-                        "S1", sid, f"gateway evidence incomplete ({channel}): the datapath saw {n_seen} "
+                        "gateway-underreporting", sid, f"gateway evidence incomplete ({channel}): the datapath saw {n_seen} "
                         f"requests, the gateway logged {n_logged}",
                         {"action": "evidence_reconciliation", "channel": channel, "seen": n_seen, "logged": n_logged},
                         [{"source": "hubble"}, {"source": "shipped-gateway-evidence"}], key=channel))
@@ -356,8 +356,8 @@ async def reconcile(http: aiohttp.ClientSession) -> None:
 
 
 async def on_platform_flow(http: aiohttp.ClientSession, flow: dict) -> None:
-    """A flow from a platform pod (sbx-system): S2 and custom rules on platform flows."""
-    found = platform_flow_alert(flow, engine.pol.param("S2", "world_allowlist") or {})
+    """A flow from a platform pod (sbx-system): platform-pod-egress and custom rules on platform flows."""
+    found = platform_flow_alert(flow, engine.pol.param("platform-pod-egress", "world_allowlist") or {})
     if found:
         await respond(http, found)
     await run_custom_rules(http, "hubble-platform", flow, None)
@@ -380,7 +380,7 @@ async def load_policy(http: aiohttp.ClientSession, force: bool = False) -> dict:
     except detpol.PolicyError as e:
         rejected = "sha256:" + __import__("hashlib").sha256(text.encode()).hexdigest()
         log.write_sync("detection_policy_rejected", digest=rejected, errors=e.errors, kept=engine.pol.digest)
-        await respond(http, alert("POL", None, f"detection policy {rejected[:19]} rejected: {e.errors[0]}",
+        await respond(http, alert("policy-rejected", None, f"detection policy {rejected[:19]} rejected: {e.errors[0]}",
                                   {"action": "detection_policy_rejected", "errors": e.errors[:10]}, [],
                                   key=f"{rejected}|{rv}"))    # every apply re-alerts (ids are deduped across restarts)
         return {"loaded": False, "errors": e.errors, "active": engine.pol.digest}
@@ -412,7 +412,7 @@ def boot_policy() -> None:
         try:
             engine.pol = detpol.load(text, source=f"configmap@{rv}")
             policy_resource_version = rv
-        except detpol.PolicyError as e:      # policy_watch re-reads it and raises POL under the image copy
+        except detpol.PolicyError as e:      # policy_watch re-reads it and raises policy-rejected under the image copy
             emit(policy_error=f"boot: ConfigMap policy rejected: {e.errors[0]}")
     if engine.pol is None:
         try:
@@ -437,27 +437,27 @@ async def policy_watch(http: aiohttp.ClientSession) -> None:
 
 # ------------------------------------------------------------------------------ housekeeping, admin
 async def heartbeat(http: aiohttp.ClientSession) -> None:
-    """HB: the sentinel must notice when it has gone blind. The shipper polls every second and that
+    """telemetry-feed-silent: the sentinel must notice when it has gone blind. The shipper polls every second and that
     alone produces platform flows, so a quiet Hubble feed means the feed is down, not the cluster.
     Shipped evidence is expected whenever the datapath shows sessions talking to the gateway."""
     global last_flow_at, last_ingest_at
     last_flow_at = last_ingest_at = time.time()
     while True:
-        params = engine.pol.rules["HB"]["params"]
+        params = engine.pol.rules["telemetry-feed-silent"]["params"]
         await asyncio.sleep(params["interval_s"])
-        if not engine.pol.enabled("HB"):
+        if not engine.pol.enabled("telemetry-feed-silent"):
             continue
         now = time.time()
         bucket = int(now) // int(params["hubble_stale_s"])
         if now - last_flow_at > params["hubble_stale_s"]:
-            await respond(http, alert("HB", None, f"datapath feed silent for {int(now - last_flow_at)}s: "
+            await respond(http, alert("telemetry-feed-silent", None, f"datapath feed silent for {int(now - last_flow_at)}s: "
                                       "the sentinel is blind to bypass attempts and cannot verify containment",
                                       {"action": "feed_stalled", "feed": "hubble", "silent_s": int(now - last_flow_at)},
                                       [{"source": "sentinel"}], key=f"hubble|{bucket}"))
         recent_datapath = any(t > now - params["evidence_stale_s"]
                               for seen in (seen_ai, seen_egress) for ts in seen.values() for t in ts[-1:])
         if recent_datapath and now - last_ingest_at > params["evidence_stale_s"]:
-            await respond(http, alert("HB", None, f"no shipped evidence for {int(now - last_ingest_at)}s while "
+            await respond(http, alert("telemetry-feed-silent", None, f"no shipped evidence for {int(now - last_ingest_at)}s while "
                                       "sessions are talking to the gateway: shipper or gateway logging stalled",
                                       {"action": "feed_stalled", "feed": "evidence", "silent_s": int(now - last_ingest_at)},
                                       [{"source": "sentinel"}, {"source": "hubble"}], key=f"evidence|{bucket}"))
@@ -544,7 +544,7 @@ def restore() -> None:
 
 def adopt_live_quarantines() -> None:
     """Whatever sentinel-q-* policies exist right now are containment, even if our log never said so
-    (lost volume, edited log): S6 must watch them from the first second after a restart."""
+    (lost volume, edited log): traffic-after-containment must watch them from the first second after a restart."""
     try:
         for sid in actions.quarantined_sessions():
             contained.setdefault(sid, time.time())

@@ -208,7 +208,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "alerts":
         for alert in call("GET", "/alerts"):
             containment = alert.get("containment") or {}
-            print(safe(f"{alert['seq']:>4} {alert['rule']:<3} {alert['severity']:<6} {alert.get('session_id') or '-':<10} "
+            print(safe(f"{alert['seq']:>4} {alert['rule']:<26} {alert['severity']:<6} {alert.get('session_id') or '-':<10} "
                        f"user={alert.get('user')} spec={alert.get('spec')}") + f"\n     {safe(alert['summary'])}"
                   + (f"\n     contained in {containment.get('elapsed_s')}s probe_blocked={containment.get('probe_blocked')}"
                      if containment.get('quarantined_at') else ""))

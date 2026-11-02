@@ -24,7 +24,7 @@ spec:
             app: gateway
       toPorts:
         # AI gateway: through Cilium's Envoy for L7 HTTP visibility (allow-all HTTP rule). Hubble then reports
-        # every request/response per session, independent of the gateway's own log (sentinel S1).
+        # every request/response per session, independent of the gateway's own log (sentinel gateway-underreporting).
         - ports:
             - { port: "8080", protocol: TCP }
           rules:

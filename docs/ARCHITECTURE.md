@@ -161,7 +161,7 @@ There is deliberately **no internal way to create a session**.
 
 **Fleet kill switch:** `POST /admin/freeze` (security admins only) moves every live session to `contained` with compare-and-set, applies one namespace-wide Cilium deny policy (`freeze-all-sessions`), and refuses new runs. `unfreeze` lifts the network policy, but frozen sessions stay contained until an admin releases them.
 
-**Untrusted-content scan** (`content_scan.py`): at clone time, repo text is scanned for instruction-like content aimed at agents (directives, override phrases, concealment cues, secret-sending commands, hidden Unicode). Findings go to evidence, a low `INJ` alert and the PR body, because agents rarely tell the user what they saw.
+**Untrusted-content scan** (`content_scan.py`): at clone time, repo text is scanned for instruction-like content aimed at agents (directives, override phrases, concealment cues, secret-sending commands, hidden Unicode). Findings go to evidence, a low `injection-in-repo` alert and the PR body, because agents rarely tell the user what they saw.
 
 **Idle and lifetime reaper:** resources are freed without waiting for the hard TTL.
 - **Activity** means gateway token validations (every model or egress call) plus follow-up messages. These are signals the agent can't fake from inside the pod.
@@ -220,7 +220,7 @@ One Python process (`src/sbx/gateway/`) with two listeners. Each request:
   This blocks provider-side egress: server tools such as `web_fetch`, and URL or file sources the provider would fetch.
 - **Budget:** cumulative token budget per session.
 - **Credentials:** client-supplied credentials are stripped.
-- **Inspection:** streamed responses are parsed for `tool_use` blocks, so evidence shows what the model *asked to do*, independent of whether it happened (input to D3).
+- **Inspection:** streamed responses are parsed for `tool_use` blocks, so evidence shows what the model *asked to do*, independent of whether it happened (input to risky-tool-call).
 
 **Egress gateway (`:3128`)**, a hand-written authenticated forward proxy:
 - **Plain HTTP:** the full request is visible. URL, headers and body are canary-scanned, the host is checked against `egress.allow`, and the request is forwarded via credproxy `/egress`. **Write-capable destinations** (marked `accepts_writes` in the baseline catalogue) accept only GET/HEAD unless the spec lists them in `egress.writeAllowed`.
@@ -249,15 +249,15 @@ use an **uncached** policy lookup.
 
 **What it can see**, and how far to trust each part:
 - **Kernel truth:** Hubble flows from session **and** platform pods, i.e. where every connection went and whether it was dropped. No pod can fake these.
-- **Platform claims:** shipped gateway and control-plane evidence (model calls, tool calls, egress decisions, lifecycle). It can't be edited or dropped after the fact without an EV alert, but it could be incomplete.
+- **Platform claims:** shipped gateway and control-plane evidence (model calls, tool calls, egress decisions, lifecycle). It can't be edited or dropped after the fact without an evidence-tampering alert, but it could be incomplete.
 - **Not seen yet:**
   - processes and files inside gVisor;
   - Kubernetes API actions (next step: an audit webhook);
   - platform-pod processes (next step: Tetragon).
-- **Completeness check (S1):** Cilium's L7 proxy parses every sandbox request to the AI gateway
+- **Completeness check (gateway-underreporting):** Cilium's L7 proxy parses every sandbox request to the AI gateway
   (method, path, session labels; credentials redacted by Hubble), and every connection to the egress
   proxy is a SYN. The sentinel counts both per session and reconciles them with the shipped gateway
-  evidence, so a gateway that silently stops logging is caught (S1).
+  evidence, so a gateway that silently stops logging is caught (gateway-underreporting).
   It checks counts, not content: a gateway that logs one benign-looking record per request is not
   caught. The test stands in for a compromised gateway with a fault-injection switch (`SBX_FAULT_INJECTION=1`,
   `gateway/shared.py`: drop evidence for the sessions listed in `/tmp/sbx-fault/drop-sessions`) that the
@@ -270,7 +270,7 @@ evidence shipper's push.
 **Sources:**
 - **Shipped platform evidence.** A sidecar in the gateway pod (`shipper.py`) pushes every record of
   `gateway.jsonl` and `control-plane.jsonl`. The sentinel checks **sequence continuity and the hash
-  chain on arrival** and keeps its own copy, so a gap or edit raises EV.
+  chain on arrival** and keeps its own copy, so a gap or edit raises evidence-tampering.
 - **Hubble, from session pods and from platform pods.** This comes from the kernel datapath, so no
   platform pod can fake it.
 
@@ -278,16 +278,16 @@ evidence shipper's push.
 
 | Rule | Signal (source) | Action |
 |---|---|---|
-| **D1** | Canary (plain, base64 at any alignment, hex, URL-encoded) in egress (shipped gateway evidence) | High; **auto-quarantine** |
-| **D2** | Spec denial (gateway) or DROPPED flow from a session pod (Hubble); first one, then the spec's burst threshold | Medium, then high; **auto-quarantine** at the burst |
-| **D3** | Model `tool_use` with the canary, or an *acting* tool (Bash, WebFetch, MCP) referencing `.env` or a non-allowed host | Medium alert |
-| **EV** | Shipped evidence: sequence gap or hash-chain break; every incident, with a per-file cooldown | High alert |
-| **HB** | The sentinel's own inputs went quiet: no Hubble flow for 60 s (the shipper's polling alone produces flows), or no shipped evidence for 120 s while the datapath shows sessions talking to the gateway | High alert: the sentinel is blind |
-| **S2** | **Platform pod** (gateway, credproxy, control plane…) has a policy-dropped connection, or reaches the outside world when it isn't credproxy, or credproxy reaches a name outside its allowlist | High alert (isolating platform pods needs approval) |
-| **S1** | Gateway evidence incomplete: the datapath (Hubble L7 for the AI gateway, L4 connections for the egress proxy) saw at least 3 more requests than the gateway logged, and at least 25% of them, over a window that ended 20 s ago | High; **quarantine** the session |
-| **S6** | Traffic still forwarded from a session after its containment took effect (e.g. a compromised control plane lifted its own quarantine) | High; **re-quarantine** |
+| **canary-exfiltration** | Canary (plain, base64 at any alignment, hex, URL-encoded) in egress (shipped gateway evidence) | High; **auto-quarantine** |
+| **denied-requests** | Spec denial (gateway) or DROPPED flow from a session pod (Hubble); first one, then the spec's burst threshold | Medium, then high; **auto-quarantine** at the burst |
+| **risky-tool-call** | Model `tool_use` with the canary, or an *acting* tool (Bash, WebFetch, MCP) referencing `.env` or a non-allowed host | Medium alert |
+| **evidence-tampering** | Shipped evidence: sequence gap or hash-chain break; every incident, with a per-file cooldown | High alert |
+| **telemetry-feed-silent** | The sentinel's own inputs went quiet: no Hubble flow for 60 s (the shipper's polling alone produces flows), or no shipped evidence for 120 s while the datapath shows sessions talking to the gateway | High alert: the sentinel is blind |
+| **platform-pod-egress** | **Platform pod** (gateway, credproxy, control plane…) has a policy-dropped connection, or reaches the outside world when it isn't credproxy, or credproxy reaches a name outside its allowlist | High alert (isolating platform pods needs approval) |
+| **gateway-underreporting** | Gateway evidence incomplete: the datapath (Hubble L7 for the AI gateway, L4 connections for the egress proxy) saw at least 3 more requests than the gateway logged, and at least 25% of them, over a window that ended 20 s ago | High; **quarantine** the session |
+| **traffic-after-containment** | Traffic still forwarded from a session after its containment took effect (e.g. a compromised control plane lifted its own quarantine) | High; **re-quarantine** |
 
-The control plane still raises D1 itself for a canary in a PR diff or agent summary, and INJ for the
+The control plane still raises canary-exfiltration itself for a canary in a PR diff or agent summary, and injection-in-repo for the
 content scan.
 
 **Detection policy: rules and response actions as configuration** (`config/sentinel/detection.yaml`,
@@ -298,19 +298,19 @@ rather than run on a hidden default.
 - **Response actions** are named lists of steps: `quarantine` (the sentinel's own deny policy), `verify` (Hubble check),
   `freeze` (fleet-wide deny) and `notify-control-plane` (revoke the token, snapshot evidence). Every alert is always written
   to the sentinel's own log. The shipped file defines `record`, `contain` and `freeze-fleet`.
-- **Built-in rules** (above, plus POL for a rejected policy) must all be listed. The policy sets `enabled`, `mode`, `severity`, `response`, per-stage
-  overrides (D2's first denial vs burst) and `params`: thresholds and allowlists such as D2's deny reasons and default burst,
-  D3's acting tools, the S1 window and deficit, the S2 world allowlist and the S6 grace period.
+- **Built-in rules** (above, plus policy-rejected for a rejected policy) must all be listed. The policy sets `enabled`, `mode`, `severity`, `response`, per-stage
+  overrides (the denied-requests rule's first denial vs burst) and `params`: thresholds and allowlists such as the denied-requests rule's deny reasons and default burst,
+  the risky-tool-call rule's acting tools, the gateway-underreporting window and deficit, the platform-pod-egress world allowlist and the traffic-after-containment grace period.
 - **Custom match rules** add a detection without a code change. Each has a `source` (`gateway`, `control-plane`,
   `hubble-sessions` or `hubble-platform`), field matchers (equals, `in`, `regex`, numeric comparisons, `exists`, `contains`),
   an optional `threshold` of a count within a window per session, pod or globally, a severity, a response and a summary
-  template. Examples shipped: `GH-WRITE-ATTEMPT`, `MODEL-PROBING`, and `SANDBOX-DNS-EXFIL` (in monitor mode).
+  template. Examples shipped: `github-write-attempt`, `model-probing`, and `sandbox-dns-burst` (in monitor mode).
 - **`mode: monitor`** records the alert and the steps it *would* have run, and does nothing else, so a new rule can be tuned
   before it is enforced.
 - **The floor** is compiled into the image and cannot be configured away:
-  - D1, EV, HB, S6 and POL always stay enabled in enforce mode;
-  - D1 and S6 must quarantine or freeze;
-  - thresholds are bounded (e.g. an S1 deficit of 1–20, a D2 burst of 1–50);
+  - canary-exfiltration, evidence-tampering, telemetry-feed-silent, traffic-after-containment and policy-rejected always stay enabled in enforce mode;
+  - canary-exfiltration and traffic-after-containment must quarantine or freeze;
+  - thresholds are bounded (e.g. a gateway-underreporting deficit of 1–20, a denied-requests burst of 1–50);
   - only high-severity rules may freeze;
   - platform-flow rules cannot quarantine, because there is no session;
   - unknown fields, steps, params and bad regexes are rejected.
@@ -319,7 +319,7 @@ rather than run on a hidden default.
   2. apply it as the ConfigMap `sentinel-detection` in `sbx-security`;
   3. hot-reload it (the sentinel also polls every 10 s);
   4. confirm the sentinel now runs exactly that file's digest.
-- **A broken policy cannot blind the sentinel.** If one is applied by hand, the sentinel rejects it, raises a **POL** alert and
+- **A broken policy cannot blind the sentinel.** If one is applied by hand, the sentinel rejects it, raises a **policy-rejected** alert and
   keeps its last good policy. On first boot with no ConfigMap it starts on the copy of the same file baked into the image;
   if no valid policy is available at all it exits (CrashLoopBackOff) rather than run blind. Every load and every rejection is in its hash-chained log, with the digest and the rules disabled
   or in monitor mode.
@@ -343,7 +343,7 @@ can lift a sentinel quarantine or freeze.
 - with no traffic at all, the result is recorded as *inconclusive* rather than claimed.
 
 **Restart:** positions, chain heads, known alerts and **containment memory** are rebuilt from its own
-log and evidence copy, and any `sentinel-q-*` policy that exists at boot is adopted, so S6 watches
+log and evidence copy, and any `sentinel-q-*` policy that exists at boot is adopted, so traffic-after-containment watches
 quarantined sessions from the first second.
 
 **Record:** its own hash-chained log (`/data/sentinel.jsonl`, on its own volume) of alerts, actions
@@ -384,7 +384,7 @@ flowchart LR
   c --> pod[pod manifest: image, gVisor, limits, TTL]
   c --> g[gateway: models, budget, egress.allow]
   c --> cp2[credproxy: grants, repo, output]
-  c --> d[sentinel: D2 burst threshold]
+  c --> d[sentinel: denied-requests burst threshold]
   c --> cc[Claude Code allowedTools<br/>defence in depth]
 ```
 
@@ -525,7 +525,7 @@ sequenceDiagram
   CP->>CP: CAS running→stopping (gateway rejects from now)
   CP->>P: exec: tar working tree (no .git)
   CP->>CP: lay files over OUR pristine .git, diff with isolated git config
-  CP->>CP: canary scan of diff + agent summary (hit → refuse + D1)
+  CP->>CP: canary scan of diff + agent summary (hit → refuse + canary-exfiltration)
   CP->>CR: /github/publish (cp-key, diff, inert body)
   CR->>CR: mint contents+PR write token, apply, check STAGED paths/modes
   CR->>GH: push agent/<sid>, open draft PR, revoke token
@@ -543,7 +543,7 @@ sequenceDiagram
   participant CP as control plane
   participant K as Cilium
   G->>D: evidence event / DROPPED flow
-  D->>D: rules D1 / D2 / D3
+  D->>D: rules canary-exfiltration / denied-requests / risky-tool-call
   D->>K: create sentinel-q-<sid> deny policy with its OWN identity (≤ 1 s, no control plane needed)
   D->>D: record alert + action in its own hash chain
   D->>CP: best effort: POST /internal/alerts {contain: true} (sentinel key)

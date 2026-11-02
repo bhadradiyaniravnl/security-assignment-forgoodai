@@ -18,7 +18,7 @@ one is rejected instead of silently running on a value nobody can see. A policy 
                 freeze                the sentinel's fleet-wide deny policy (sentinel-freeze)
                 notify-control-plane  best effort: control plane revokes the token, snapshots evidence
               Every alert is always recorded in the sentinel's own hash-chained log.
-  rules       every built-in rule (D1-D3, EV, HB, S1, S2, S6, POL): severity, response, all its params,
+  rules       every built-in rule (canary-exfiltration, denied-requests, risky-tool-call, evidence-tampering, telemetry-feed-silent, gateway-underreporting, platform-pod-egress, traffic-after-containment, policy-rejected): severity, response, all its params,
               optional stages, enabled (default true) and mode (default enforce)
               custom match rules: a source, field matchers, an optional count/window threshold
 
@@ -40,38 +40,38 @@ import yaml
 STEPS = {"quarantine", "verify", "freeze", "notify-control-plane"}
 SEVERITIES = ("low", "medium", "high")
 MODES = ("enforce", "monitor")
-SOURCES = ("gateway", "control-plane", "hubble-sessions", "hubble-platform")
+SOURCES = ("gateway", "control-plane", "hubble-sessions", "hubble-platform", "k8s-audit")
 OPS = {"eq", "ne", "in", "not_in", "regex", "gt", "gte", "lt", "lte", "exists", "contains"}
 
 NUMBER = (int, float)
 # The built-in detectors implemented in code and the SHAPE of their configuration: parameter name ->
 # expected type, and the alert stages a rule emits. No values: those all come from the policy file.
 BUILTIN_RULES: dict[str, dict] = {
-    "D1": {"params": {}, "stages": ()},
-    "D2": {"params": {"default_burst": dict, "deny_reasons": list}, "stages": ("first",)},
-    "D3": {"params": {"acting_tools": list, "acting_tool_prefixes": list}, "stages": ()},
-    "EV": {"params": {"cooldown_s": NUMBER}, "stages": ()},
-    "HB": {"params": {"hubble_stale_s": NUMBER, "evidence_stale_s": NUMBER, "interval_s": NUMBER}, "stages": ()},
-    "S1": {"params": {"horizon_s": NUMBER, "min_deficit": NUMBER, "min_ratio": NUMBER, "interval_s": NUMBER},
+    "canary-exfiltration": {"params": {}, "stages": ()},
+    "denied-requests": {"params": {"default_burst": dict, "deny_reasons": list}, "stages": ("first",)},
+    "risky-tool-call": {"params": {"acting_tools": list, "acting_tool_prefixes": list}, "stages": ()},
+    "evidence-tampering": {"params": {"cooldown_s": NUMBER}, "stages": ()},
+    "telemetry-feed-silent": {"params": {"hubble_stale_s": NUMBER, "evidence_stale_s": NUMBER, "interval_s": NUMBER}, "stages": ()},
+    "gateway-underreporting": {"params": {"horizon_s": NUMBER, "min_deficit": NUMBER, "min_ratio": NUMBER, "interval_s": NUMBER},
            "stages": ()},
-    "S2": {"params": {"world_allowlist": dict}, "stages": ()},
-    "S6": {"params": {"grace_s": NUMBER}, "stages": ()},
-    "POL": {"params": {}, "stages": ()},           # a rejected policy (raised under the last good one)
+    "platform-pod-egress": {"params": {"world_allowlist": dict}, "stages": ()},
+    "traffic-after-containment": {"params": {"grace_s": NUMBER}, "stages": ()},
+    "policy-rejected": {"params": {}, "stages": ()},           # a rejected policy (raised under the last good one)
 }
 
 # ------------------------------------------------------------------------------------------- floor
-ALWAYS_ON = {"D1", "EV", "HB", "S6", "POL"}    # cannot be disabled or set to monitor
-MUST_CONTAIN = {"D1", "S6"}                    # response must quarantine or freeze
+ALWAYS_ON = {"canary-exfiltration", "evidence-tampering", "telemetry-feed-silent", "traffic-after-containment", "policy-rejected"}    # cannot be disabled or set to monitor
+MUST_CONTAIN = {"canary-exfiltration", "traffic-after-containment"}                    # response must quarantine or freeze
 PARAM_BOUNDS = {                               # rule -> param path -> (min, max)
-    "D2": {"default_burst.count": (1, 50), "default_burst.window_s": (5, 600)},
-    "S1": {"horizon_s": (5, 120), "min_deficit": (1, 20), "min_ratio": (0.0, 1.0), "interval_s": (2, 60)},
-    "S6": {"grace_s": (1, 10)},
-    "EV": {"cooldown_s": (1, 600)},
-    "HB": {"hubble_stale_s": (15, 600), "evidence_stale_s": (15, 600), "interval_s": (2, 60)},
+    "denied-requests": {"default_burst.count": (1, 50), "default_burst.window_s": (5, 600)},
+    "gateway-underreporting": {"horizon_s": (5, 120), "min_deficit": (1, 20), "min_ratio": (0.0, 1.0), "interval_s": (2, 60)},
+    "traffic-after-containment": {"grace_s": (1, 10)},
+    "evidence-tampering": {"cooldown_s": (1, 600)},
+    "telemetry-feed-silent": {"hubble_stale_s": (15, 600), "evidence_stale_s": (15, 600), "interval_s": (2, 60)},
 }
 RULE_KEYS = {"id", "enabled", "mode", "severity", "response", "params", "stages", "description",
-             "type", "source", "match", "threshold", "groupBy", "summary"}
-CUSTOM_ID = re.compile(r"^[A-Z][A-Z0-9_-]{1,31}$")
+             "type", "source", "match", "threshold", "groupBy", "cooldown_s", "summary"}
+CUSTOM_ID = re.compile(r"^[a-z][a-z0-9-]{1,47}$")
 MAX_CUSTOM = 100
 
 
@@ -118,7 +118,7 @@ class Policy:
         return bool(r and r["enabled"])
 
     def param(self, rule: str, path: str):
-        """A built-in rule's parameter by dotted path, e.g. param("D2", "default_burst.count")."""
+        """A built-in rule's parameter by dotted path, e.g. param("denied-requests", "default_burst.count")."""
         return _lookup_path(self.rules[rule].get("params", {}), path)
 
     def decide(self, rule: str, stage: str | None) -> dict:
@@ -146,7 +146,7 @@ def load(text: str, source: str = "configmap") -> Policy:
         doc = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise PolicyError([f"not valid YAML: {e}"]) from None
-    try:                     # a malformed value must surface as a rejection (POL alert), not a crash
+    try:                     # a malformed value must surface as a rejection (policy-rejected alert), not a crash
         errs = validate(doc)
         if errs:
             raise PolicyError(errs)
@@ -252,7 +252,7 @@ def _validate_custom(r: dict, where: str) -> list[str]:
     """Schema check of one custom match rule."""
     e = []
     if not CUSTOM_ID.match(str(r["id"])):
-        e.append(f"{where}: custom ids are UPPER-kebab, 2-32 chars, and must not reuse a built-in id")
+        e.append(f"{where}: custom rule names are lowercase-kebab, 2-48 chars, and must not reuse a built-in name")
     if r.get("type") != "match":
         e.append(f"{where}: custom rules need type: match")
     if r.get("source") not in SOURCES:
@@ -275,8 +275,11 @@ def _validate_custom(r: dict, where: str) -> list[str]:
             e.append(f"{where}: threshold takes count and window_s")
         elif not (1 <= int(t.get("count", 1)) <= 1000 and 1 <= int(t.get("window_s", 60)) <= 3600):
             e.append(f"{where}: threshold count 1-1000, window_s 1-3600")
-    if r.get("groupBy", "session") not in ("session", "pod", "global"):
-        e.append(f"{where}: groupBy must be session, pod or global")
+    group_by = str(r.get("groupBy", "session"))
+    if group_by not in ("session", "pod", "global") and not re.match(r"^field:[\w.]{1,64}$", group_by):
+        e.append(f"{where}: groupBy must be session, pod, global or field:<name>")
+    if "cooldown_s" in r and not (isinstance(r["cooldown_s"], (int, float)) and 0 <= r["cooldown_s"] <= 86400):
+        e.append(f"{where}: cooldown_s must be a number of seconds, 0-86400")
     return e
 
 
@@ -373,6 +376,21 @@ def flow_fields(f: dict) -> dict:
             "l7_type": (f.get("l7") or {}).get("type")}
 
 
+def _value(fields: dict, event: dict, name: str):
+    """A field by name: a friendly/flat field first, else a dotted path into the raw event."""
+    return fields[name] if name in fields else _lookup_path(event, name)
+
+
+def _render(template: str, fields: dict, event: dict, count: int) -> str:
+    """Fill {name} and {dotted.path} placeholders; unknown ones render as '?'."""
+    def one(m):
+        if m.group(1) == "count":
+            return str(count)
+        value = _value(fields, event, m.group(1))
+        return "?" if value is None else str(value)
+    return re.sub(r"\{([\w.]+)\}", one, template)
+
+
 class _BlankFormat(dict):
     """format_map() mapping that renders unknown {fields} in a summary template as "?"."""
 
@@ -385,6 +403,7 @@ class CustomRules:
 
     def __init__(self):
         self.windows: dict[tuple, deque] = defaultdict(deque)
+        self.last_fired: dict[tuple, float] = {}
 
     def evaluate(self, pol: Policy, source: str, event: dict, sid: str | None) -> list[dict]:
         """Matches for one event from `source` (a shipped evidence record or a Hubble flow), as dicts
@@ -398,7 +417,9 @@ class CustomRules:
                 continue
             t = r.get("threshold") or {}
             count, window = int(t.get("count", 1)), int(t.get("window_s", 60))
-            group = {"session": sid, "pod": fields.get("src_pod") or event.get("pod_ip"), "global": "*"}[r.get("groupBy", "session")]
+            group_by = str(r.get("groupBy", "session"))
+            group = (str(_value(fields, event, group_by[6:])) if group_by.startswith("field:") else
+                     {"session": sid, "pod": fields.get("src_pod") or event.get("pod_ip"), "global": "*"}[group_by])
             now = time.time()
             q = self.windows[(r["id"], group)]
             q.append(now)
@@ -407,8 +428,11 @@ class CustomRules:
             if len(q) < count:
                 continue
             q.clear()
-            observed = {k: fields.get(k) for k in r["match"] if k in fields}
-            summary = (r.get("summary") or f"{r['id']} matched").format_map(_BlankFormat({**fields, "count": count}))
+            if now - self.last_fired.get((r["id"], group), 0) < float(r.get("cooldown_s", 0)):
+                continue                                        # one alert per group per cooldown
+            self.last_fired[(r["id"], group)] = now
+            observed = {k: _value(fields, event, k) for k in r["match"]}
+            summary = _render(r.get("summary") or f"{r['id']} matched", fields, event, count)
             if count > 1:
                 summary += f" ({count} within {window}s)"
             out.append({"rule": r["id"], "session_id": sid, "summary": summary,

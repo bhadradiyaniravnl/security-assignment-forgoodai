@@ -15,7 +15,7 @@ credproxy, which adds the real API key. Enforces:
 Records (evidence actions): ai_request for every answered request, allowed or denied, with a
 canary scan of the body; ai_tool_use for every tool_use block in the response, an "agent
 attempted" signal that does not depend on whether the later network action succeeds (sentinel
-rule D3). Full request/response bodies go to BODY_DIR, canaries redacted, for investigators.
+rule risky-tool-call). Full request/response bodies go to BODY_DIR, canaries redacted, for investigators.
 """
 from __future__ import annotations
 
@@ -237,7 +237,7 @@ async def per_ip_limit(request: web.Request, handler):
     """At most MAX_INFLIGHT_PER_IP concurrent requests per pod, so one sandbox cannot starve the rest."""
     ip = request.remote or ""
     if _inflight.get(ip, 0) >= MAX_INFLIGHT_PER_IP:
-        if request.path != "/healthz":    # every answered request is in evidence (the sentinel's S1 completeness rule counts them)
+        if request.path != "/healthz":    # every answered request is in evidence (the sentinel's gateway-underreporting completeness rule counts them)
             await evidence.write("ai_request", pod_ip=ip, path=request.path, decision="deny", reason="inflight_limit")
         return web.json_response({"type": "error", "error": {"type": "rate_limit_error",
                                   "message": "sbx: too many concurrent requests"}}, status=429)

@@ -40,7 +40,7 @@ flowchart TB
   end
 
   subgraph security [security node · sbx-security]
-    sen[sentinel<br/>D1–D3 · EV · S1 · S2 · S6<br/>own deny policies · own log]
+    sen[sentinel<br/>config-driven detection rules<br/>on evidence + kernel flows<br/>own deny policies · own log]
   end
 
   k8s{{kube-apiserver<br/>RBAC · admission policy}}

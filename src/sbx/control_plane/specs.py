@@ -115,10 +115,10 @@ def widening(old: dict, new: dict) -> list[str]:
             out.append(f"larger runtime.{k}")
     if new_p["max_tokens"] > old_p["max_tokens"]:
         out.append("larger token budget")
-    # The sentinel's D2 rule (denied-request burst): a higher count or shorter window fires later.
+    # The sentinel's denied-requests rule (denied-request burst): a higher count or shorter window fires later.
     if (new_p["deny_burst"]["count"] > old_p["deny_burst"]["count"]
             or new_p["deny_burst"]["window_s"] < old_p["deny_burst"]["window_s"]):
-        out.append("weaker D2 burst threshold")
+        out.append("weaker denied-requests burst threshold")
     if (new_p["output"]["type"] != old_p["output"]["type"]
             or (old_p["output"]["draft"] and not new_p["output"]["draft"])):
         out.append("output type/draft changed")

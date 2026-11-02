@@ -7,7 +7,7 @@
 # The image carries a copy of this file, used only if the ConfigMap is missing on first boot.
 #
 # Floor (compiled into the sentinel, a policy that breaks it is rejected and the last good one stays):
-#   D1, EV, HB, S6, POL always enabled in enforce mode; D1 and S6 must quarantine or freeze; thresholds bounded;
+#   canary-exfiltration, evidence-tampering, telemetry-feed-silent, traffic-after-containment, policy-rejected always enabled in enforce mode; canary-exfiltration and traffic-after-containment must quarantine or freeze; thresholds bounded;
 #   only high-severity rules may freeze; platform-flow rules can't quarantine (no session).
 apiVersion: sbx.forgood.ai/v1
 kind: DetectionPolicy
@@ -30,12 +30,12 @@ spec:
 
   rules:
     # ---- built-in rules (logic in code; tuned here) -------------------------------------
-    - id: D1
+    - id: canary-exfiltration
       description: canary (any supported encoding) in an outbound request
       severity: high
       response: contain
 
-    - id: D2
+    - id: denied-requests
       description: denied request or dropped flow from a session; first one, then a burst
       severity: high
       response: contain
@@ -47,7 +47,7 @@ spec:
                        provider_side_capability, provider_side_tool, remote_content_source,
                        malformed_request, write_not_allowed]
 
-    - id: D3
+    - id: risky-tool-call
       description: model tool_use carrying the canary, or an acting tool referencing .env or a non-allowed host
       severity: medium
       response: record
@@ -55,25 +55,25 @@ spec:
         acting_tools: [Bash, WebFetch, WebSearch, BashOutput, Task]
         acting_tool_prefixes: [mcp__]
 
-    - id: EV
+    - id: evidence-tampering
       description: shipped evidence has a sequence gap or a broken hash chain
       severity: high
       response: record
       params: { cooldown_s: 60 }                          # one alert per file per incident window
 
-    - id: HB
+    - id: telemetry-feed-silent
       description: the sentinel's own inputs went quiet (Hubble feed, or no shipped evidence while sessions are active)
       severity: high
       response: record
       params: { hubble_stale_s: 60, evidence_stale_s: 120, interval_s: 10 }
 
-    - id: S1
+    - id: gateway-underreporting
       description: the datapath saw materially more requests than the gateway logged
       severity: high
       response: contain
       params: { horizon_s: 20, min_deficit: 3, min_ratio: 0.25, interval_s: 10 }
 
-    - id: S2
+    - id: platform-pod-egress
       description: platform pod with a policy-dropped connection or unexpected world egress
       severity: high
       response: record                                   # isolating platform pods needs a human
@@ -81,13 +81,13 @@ spec:
         world_allowlist:
           credproxy: [api.anthropic.com, github.com, api.github.com]
 
-    - id: S6
+    - id: traffic-after-containment
       description: traffic forwarded from a session after its containment took effect
       severity: high
       response: contain
       params: { grace_s: 3 }
 
-    - id: POL
+    - id: policy-rejected
       description: a detection policy was rejected (raised under the last good policy, which stays active)
       severity: high
       response: record
@@ -99,7 +99,7 @@ spec:
     #         Hubble fields: verdict, direction, proto, dest_port, dest_ip, dest_names, dest_namespace, dest_pod,
     #         dest_world, drop_reason, src_pod, src_app, session, http_method, http_url, http_code, l7_type
     # threshold (optional): count within window_s, per groupBy (session | pod | global)
-    - id: GH-WRITE-ATTEMPT
+    - id: github-write-attempt
       description: a session tries to write to GitHub through the egress proxy (agents must publish via the control plane)
       type: match
       source: gateway
@@ -111,7 +111,7 @@ spec:
       response: record
       summary: "{method} to {dest_host} from the sandbox"
 
-    - id: MODEL-PROBING
+    - id: model-probing
       description: repeated requests for models outside the spec (probing for a stronger or cheaper model)
       type: match
       source: gateway
@@ -123,7 +123,7 @@ spec:
       response: record
       summary: "model probing: {model}"
 
-    - id: SANDBOX-DNS-EXFIL
+    - id: sandbox-dns-burst
       description: many DNS lookups from one session (DNS tunnelling shape); sandboxes only resolve a handful of names
       type: match
       source: hubble-sessions

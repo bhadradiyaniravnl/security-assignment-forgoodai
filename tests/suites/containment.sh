@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Detection -> automatic containment -> independent verification.
-#   D1: a "compromised agent" posts the canary to an allowlisted host  -> alert + contain
-#   D2: a "compromised agent" probes around the gateway (raw TCP, DNS) -> Hubble drops -> burst -> contain
+#   canary-exfiltration: a "compromised agent" posts the canary to an allowlisted host  -> alert + contain
+#   denied-requests: a "compromised agent" probes around the gateway (raw TCP, DNS) -> Hubble drops -> burst -> contain
 # The attacker actions run via kubectl exec inside the gVisor pod (assume the agent is already
 # compromised); every verdict below comes from outside the sandbox. No API credits needed.
 set -uo pipefail
@@ -10,7 +10,7 @@ state() { $CTL status "$1" | python3 -c 'import json,sys; print(json.load(sys.st
 alerts_json() { curl -s -H "X-User: ${SBX_USER:-dev}" http://127.0.0.1:8443/alerts; }
 q() { alerts_json | python3 -c "import json,sys; A=[a for a in json.load(sys.stdin) if a.get('session_id')=='$1']; print($2)"; }
 
-echo "=== D1: canary exfil through a write-allowed destination (deliberately vulnerable spec)"
+echo "=== canary-exfiltration: canary exfil through a write-allowed destination (deliberately vulnerable spec)"
 SID=$($CTL run bugfix-agent-open -p repo=demo/app -p task="noop" | sid_of)
 sleep 3
 T0=$(date +%s)
@@ -19,8 +19,8 @@ check "exfil request allowed by spec (detected, not prevented)" 200 "$code"
 wait_for "q $SID \"'yes' if any(a.get('containment') for a in A) else 'no'\"" yes 40
 check "session auto-contained" contained "$(state "$SID")"
 echo "      exfil -> containment record complete (incl. snapshot + probes): $(( $(date +%s) - T0 ))s"
-check "D1 alert raised (high)" "D1 high" "$(q "$SID" "' '.join(next(((a['rule'],a['severity']) for a in A if a['rule']=='D1'),('','')))")"
-check "alert links user -> session -> spec -> action" yes "$(q "$SID" "'yes' if any(a['rule']=='D1' and a['user'] and a['spec'] and a['observed'].get('dest_host')=='paste-mock.lab-ext' and a['evidence'][0]['source']=='gateway' for a in A) else 'no'")"
+check "canary-exfiltration alert raised (high)" "canary-exfiltration high" "$(q "$SID" "' '.join(next(((a['rule'],a['severity']) for a in A if a['rule']=='canary-exfiltration'),('','')))")"
+check "alert links user -> session -> spec -> action" yes "$(q "$SID" "'yes' if any(a['rule']=='canary-exfiltration' and a['user'] and a['spec'] and a['observed'].get('dest_host')=='paste-mock.lab-ext' and a['evidence'][0]['source']=='gateway' for a in A) else 'no'")"
 check "quarantine policy applied" present "$(kubectl -n sbx-sessions get cnp "quarantine-$SID" >/dev/null 2>&1 && echo present || echo absent)"
 check "in-pod probe blocked" True "$(q "$SID" "next((a['containment']['probe_blocked'] for a in A if a.get('containment')), None)")"
 wait_for "q $SID \"next((str(a['verification']['verified']) for a in A if a.get('verification')), 'pending')\"" True 30
@@ -36,7 +36,7 @@ check "transcript preserved at containment" yes "$(kubectl -n sbx-system exec de
 check "evidence snapshot preserved" yes "$(kubectl -n sbx-system exec deploy/control-plane -- sh -c "test -s /evidence/sessions/$SID/pod.json && test -s /evidence/sessions/$SID/gateway-events.jsonl && echo yes")"
 check "canary receipt at paste-mock (ground truth: it did leave)" yes "$(kubectl -n lab-ext logs deploy/paste-mock | contains "$(in_pod "$SID" 'base64 -w0 /workspace/repo/.env' | head -c 20)" && echo yes || echo no)"
 
-echo "=== D2: probing around the gateway (bypass attempts seen only by Hubble)"
+echo "=== denied-requests: probing around the gateway (bypass attempts seen only by Hubble)"
 SID2=$($CTL run bugfix-agent -p repo=demo/app -p task="noop" | sid_of)
 sleep 3
 SINK=$(kubectl -n lab-ext get svc attacker-sink -o jsonpath='{.spec.clusterIP}')
@@ -48,7 +48,7 @@ for target in "$SINK:80" "$SINK:443" "$API:443" "$DNS:53" "$CREDPROXY:9000" "$CR
 done
 wait_for "q $SID2 \"'yes' if any(a.get('containment') for a in A) else 'no'\"" yes 60
 check "session auto-contained on deny burst" contained "$(state "$SID2")"
-check "D2 burst alert from Hubble flows" yes "$(q "$SID2" "'yes' if any(a['rule']=='D2' and a['severity']=='high' and a['evidence'][0]['source']=='hubble' for a in A) else 'no'")"
+check "denied-requests burst alert from Hubble flows" yes "$(q "$SID2" "'yes' if any(a['rule']=='denied-requests' and a['severity']=='high' and a['evidence'][0]['source']=='hubble' for a in A) else 'no'")"
 wait_for "q $SID2 \"next((str(a['verification']['verified']) for a in A if a.get('verification')), 'pending')\"" True 30
 check "containment verified" True "$(q "$SID2" "next((str(a['verification']['verified']) for a in A if a.get('verification')), 'pending')")"
 

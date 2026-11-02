@@ -17,13 +17,13 @@ What happened while building it, kept because the lessons are part of the result
 | Workspace delivery and `destroy` failed late in long runs (500) | The Kubernetes Python client's `stream()` swaps the shared client's `request` method for a websocket one, so other threads' API calls went down the websocket path, and a failed exec left it swapped | Each exec uses its own API client (`control_plane/k8s.py`) |
 | Sentinel checks "failed" although the alert existed | `cmd \| grep -q` under `set -o pipefail`: grep exits on the first match, and the writer dies of SIGPIPE | A `contains` helper that reads all input (`tests/lib.sh`) |
 | Phase C reported every task as failed | `git apply` inside another repo's work tree silently skips paths and exits 0 | The harness uses `patch -p1` |
-| Repeat findings were never alerted again | Alert ids are deduped across restarts, and S2/POL ids had no time or version component | 10-minute bucket (S2), ConfigMap version (POL) in the id |
+| Repeat findings were never alerted again | Alert ids are deduped across restarts, and platform-pod-egress/policy-rejected ids had no time or version component | 10-minute bucket (platform-pod-egress), ConfigMap version (policy-rejected) in the id |
 | Containment-verification flakes | A fixed 8 s snapshot of Hubble | Poll for up to 60 s; with no traffic at all, record "inconclusive" instead of claiming success |
 
 ## Findings about agents and detection
 
 - **Claude Code side channel.** Even with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, it sends
-  `CONNECT api.anthropic.com` through `HTTPS_PROXY`. That is denied and raises a medium D2 on every run. It is a
+  `CONNECT api.anthropic.com` through `HTTPS_PROXY`. That is denied and raises a medium denied-requests on every run. It is a
   known false positive, kept below the burst threshold.
 - **Agent self-reports are unreliable.** In a multi-turn session the agent said it had never opened, and later
   never edited, `slug.py`. The gateway's tool_use evidence and the trusted diff showed both. Ground truth comes
@@ -31,7 +31,7 @@ What happened while building it, kept because the lessons are part of the result
 - **Injection hurts availability, not just confidentiality.** The provider's usage-policy check refused 3 of the 6
   injected runs in the shipped report, which also broke the legitimate task. No agent warned the user about the injected
   instructions; one quietly deleted them.
-- **D3 false positive.** An `Edit` that quoted the injected block in order to delete it fired D3. D3 now counts
+- **risky-tool-call false positive.** An `Edit` that quoted the injected block in order to delete it fired risky-tool-call. risky-tool-call now counts
   host and `.env` references only in tools that act (Bash, WebFetch, MCP); a canary in any tool input still fires.
 
 ## Incident: a real key in a tracked file (contained)

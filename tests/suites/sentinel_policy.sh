@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sentinel detection policy: rules and response actions as configuration.
 # Proves: deploy path (validate + diff, apply, hot reload, digest confirmed), the compiled-in floor
-# (rejected before apply, and again by the sentinel if applied by hand: POL alert, last good policy
+# (rejected before apply, and again by the sentinel if applied by hand: policy-rejected alert, last good policy
 # kept), custom match rules on shipped evidence and on Hubble flows, response actions chosen by the
 # policy (contain vs record), and monitor mode (alert recorded, nothing done).
 set -uo pipefail
@@ -22,20 +22,20 @@ python3 - "$POLICY" > "$TMP/bad.yaml" <<'EOF'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))
 for r in d["spec"]["rules"]:
-    if r["id"] == "D1": r["enabled"] = False
-    if r["id"] == "S6": r["response"] = "record"
+    if r["id"] == "canary-exfiltration": r["enabled"] = False
+    if r["id"] == "traffic-after-containment": r["response"] = "record"
 print(yaml.safe_dump(d, sort_keys=False))
 EOF
 OUT=$(CHECK_ONLY=1 deploy/sentinel-policy.sh "$TMP/bad.yaml" 2>&1); RC=$?
 check "rejected before it reaches the cluster" 1 "$RC"
-check "reason names the floor" yes "$(echo "$OUT" | contains 'floor: D1 must stay enabled' && echo yes || echo no)"
+check "reason names the floor" yes "$(echo "$OUT" | contains 'floor: canary-exfiltration must stay enabled' && echo yes || echo no)"
 GOOD=$(active)
 kubectl -n sbx-security create configmap sentinel-detection --from-file=detection.yaml="$TMP/bad.yaml" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null                      # bypass the script
 SC reload >/dev/null
 check "applied by hand: sentinel keeps its last good policy" "$GOOD" "$(active)"
-wait_for "SC alerts 30 | contains 'POL .*rejected' && echo y" y 15
-check "POL alert raised for the rejected policy" yes "$(SC alerts 30 | contains 'POL .*rejected' && echo yes || echo no)"
+wait_for "SC alerts 30 | contains 'policy-rejected .*rejected' && echo y" y 15
+check "policy-rejected alert raised for the rejected policy" yes "$(SC alerts 30 | contains 'policy-rejected .*rejected' && echo yes || echo no)"
 
 echo "--- custom rules + response actions, enforce vs monitor"
 python3 - "$POLICY" "$MARK" > "$TMP/custom.yaml" <<'EOF'
@@ -43,13 +43,13 @@ import sys, yaml
 d = yaml.safe_load(open(sys.argv[1])); mark = sys.argv[2]
 d["metadata"]["version"] = 2
 d["spec"]["rules"] += [
-    {"id": "LAB-CONTAIN", "type": "match", "source": "gateway", "severity": "high", "response": "contain",
+    {"id": "lab-contain", "type": "match", "source": "gateway", "severity": "high", "response": "contain",
      "match": {"action": "egress_http", "dest_host": "paste-mock.lab-ext", "path": {"contains": f"/{mark}-contain"}},
      "summary": "lab marker read: {path}"},
-    {"id": "LAB-MONITOR", "type": "match", "source": "gateway", "severity": "high", "response": "contain",
+    {"id": "lab-monitor", "type": "match", "source": "gateway", "severity": "high", "response": "contain",
      "mode": "monitor", "match": {"action": "egress_http", "path": {"contains": f"/{mark}-monitor"}},
      "summary": "lab marker read: {path}"},
-    {"id": "LAB-SINK-DIRECT", "type": "match", "source": "hubble-sessions", "severity": "medium", "response": "record",
+    {"id": "lab-sink-direct", "type": "match", "source": "hubble-sessions", "severity": "medium", "response": "record",
      "match": {"verdict": "DROPPED", "dest_namespace": "lab-ext", "dest_port": {"in": [8080, 80]}},
      "summary": "direct connection to {dest_namespace}/{dest_pod}:{dest_port} dropped"},
 ]
@@ -64,11 +64,11 @@ in_pod "$B" "curl -s -o /dev/null -m 2 --noproxy '*' http://$SINK/" >/dev/null
 wait_for "has_cnp sentinel-q-$A" yes 30
 check "evidence rule, response 'contain': sentinel quarantined the session" yes "$(has_cnp sentinel-q-$A)"
 check "  ...and cut it off" 000 "$(sleep 2; gw_code "$A")"
-wait_for "SC alerts 60 | contains 'LAB-MONITOR.*$B' && echo y" y 30
-check "monitor mode: alert recorded with the steps it would run" yes "$(SC alerts 60 | grep "LAB-MONITOR" | contains 'monitor: would quarantine+verify' && echo yes || echo no)"
+wait_for "SC alerts 60 | contains 'lab-monitor.*$B' && echo y" y 30
+check "monitor mode: alert recorded with the steps it would run" yes "$(SC alerts 60 | grep "lab-monitor" | contains 'monitor: would quarantine+verify' && echo yes || echo no)"
 check "monitor mode: nothing done" no "$(has_cnp sentinel-q-$B)"
-wait_for "SC alerts 60 | contains 'LAB-SINK-DIRECT .*$B' && echo y" y 30
-check "Hubble flow rule, response 'record': alert raised" yes "$(SC alerts 60 | contains "LAB-SINK-DIRECT .*$B" && echo yes || echo no)"
+wait_for "SC alerts 60 | contains 'lab-sink-direct .*$B' && echo y" y 30
+check "Hubble flow rule, response 'record': alert raised" yes "$(SC alerts 60 | contains "lab-sink-direct .*$B" && echo yes || echo no)"
 check "  ...and the session keeps running" 200 "$(gw_code "$B")"
 
 echo "--- restore"

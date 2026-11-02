@@ -2,7 +2,7 @@
 # Deploy a sentinel detection policy: validate + diff it inside the sentinel (same code that will load
 # it), apply it as the ConfigMap sentinel-detection, hot-reload, and confirm the sentinel runs exactly
 # this file (digest match). An invalid file never reaches the cluster; if one does (applied by hand),
-# the sentinel rejects it, raises a POL alert and keeps its last good policy.
+# the sentinel rejects it, raises a policy-rejected alert and keeps its last good policy.
 #   deploy/sentinel-policy.sh [FILE]      default config/sentinel/detection.yaml
 #   CHECK_ONLY=1 deploy/sentinel-policy.sh FILE    validate + diff only
 set -euo pipefail

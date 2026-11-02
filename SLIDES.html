@@ -189,13 +189,14 @@ html,body{margin:0;height:100%;background:#0b1118;color:#F4F2EC;font-family:'IBM
 </div>
 <div style="display:flex;flex-direction:column;gap:14px;background:#1E2F42;padding:40px;border-radius:12px">
 <h3 style="font-size:36px;font-weight:600;color:#E9945F">Detects</h3>
-<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>D1</b> canary leaves, any encoding</p>
-<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>D2</b> burst of denials or drops</p>
-<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>S1</b> gateway logged less than the kernel saw</p>
-<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>S2</b> a platform pod reaching out</p>
-<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>S6</b> traffic after containment</p>
-<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>EV</b> evidence gap or tampering</p>
-<p style="font-size:28px;line-height:1.35;color:#D5DEE7"><b>HB</b> its own feeds went quiet</p>
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;line-height:1.3;color:#D5DEE7">canary-exfiltration</p>
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;line-height:1.3;color:#D5DEE7">denied-requests</p>
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;line-height:1.3;color:#D5DEE7">risky-tool-call</p>
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;line-height:1.3;color:#D5DEE7">gateway-underreporting</p>
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;line-height:1.3;color:#D5DEE7">platform-pod-egress</p>
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;line-height:1.3;color:#D5DEE7">traffic-after-containment</p>
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;line-height:1.3;color:#D5DEE7">evidence-tampering</p>
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;line-height:1.3;color:#D5DEE7">telemetry-feed-silent</p>
 </div>
 <div style="display:flex;flex-direction:column;gap:20px;background:#1E2F42;padding:40px;border-radius:12px">
 <h3 style="font-size:36px;font-weight:600;color:#E9945F">Responds</h3>
@@ -205,7 +206,7 @@ html,body{margin:0;height:100%;background:#0b1118;color:#F4F2EC;font-family:'IBM
 </div>
 </div>
 <p style="font-size:28px;line-height:1.4;color:#B9C6D3">Rules and responses are configuration (<span style="font-family:'JetBrains Mono', monospace">config/sentinel/detection.yaml</span>), validated against a compiled floor.</p>
-<aside>The sentinel is a separate security plane: its own namespace, its own node, its own service account that can only write Cilium policies, and nothing on the platform can reach it except the evidence shipper. It has two kinds of input with different trust: the gateway’s evidence, which is a claim, so it verifies the sequence and hash chain on arrival; and Hubble flows from the kernel datapath, which no pod can fake. S1 is the interesting one: it counts each session’s requests from the datapath and compares them with what the gateway logged, so a gateway that quietly stops logging is caught; we proved it by fault-injecting the gateway. On a high finding it writes its own deny policy (an admission policy stops the control plane or an admin from removing it), and calls containment verified only when Hubble shows the pod’s traffic being dropped. We tested containment with the control plane scaled to zero. Detection rules and response actions are a validated, hot-reloaded YAML policy with monitor mode for tuning; a compiled floor stops anyone from switching off D1, EV or S6.</aside>
+<aside>The sentinel is a separate security plane: its own namespace, its own node, its own service account that can only write Cilium policies, and nothing on the platform can reach it except the evidence shipper. It has two kinds of input with different trust: the gateway’s evidence, which is a claim, so it verifies the sequence and hash chain on arrival; and Hubble flows from the kernel datapath, which no pod can fake. gateway-underreporting is the interesting one: it counts each session’s requests from the datapath and compares them with what the gateway logged, so a gateway that quietly stops logging is caught; we proved it by fault-injecting the gateway. On a high finding it writes its own deny policy (an admission policy stops the control plane or an admin from removing it), and calls containment verified only when Hubble shows the pod’s traffic being dropped. We tested containment with the control plane scaled to zero. Detection rules and response actions are a validated, hot-reloaded YAML policy with monitor mode for tuning; a compiled floor stops anyone from switching off canary-exfiltration, evidence-tampering, telemetry-feed-silent or traffic-after-containment. Rule names are the alert names, so an alert reads as what happened.</aside>
 </section>
 <section id="containment" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:48px">
 <h2 style="font-size:64px;font-weight:600;line-height:1.15">Detect, contain, verify: about one second</h2>
@@ -233,9 +234,9 @@ html,body{margin:0;height:100%;background:#0b1118;color:#F4F2EC;font-family:'IBM
 </div>
 <div style="display:flex;gap:40px">
 <p style="flex:1;font-size:28px;line-height:1.4;color:#4A5568"><b>Two independent sources agree</b> before containment counts: the gateway’s records and the kernel’s flow log.</p>
-<p style="flex:1;font-size:28px;line-height:1.4;color:#4A5568"><b>Nobody else can lift it.</b> An admission policy lets only the sentinel’s identity remove its quarantine; traffic after containment re-quarantines (S6).</p>
+<p style="flex:1;font-size:28px;line-height:1.4;color:#4A5568"><b>Nobody else can lift it.</b> An admission policy lets only the sentinel’s identity remove its quarantine; traffic after containment re-quarantines.</p>
 </div>
-<aside>This is the response path, measured in the tests. The attempt is either a canary leaving in a request (D1) or a burst of connections Cilium dropped (D2). Detection has two inputs: the gateway ships its hash-chained evidence to the sentinel within a second or so, and the sentinel reads Hubble directly, so bypass attempts that never reach the gateway are still seen. Containment is the sentinel’s own Cilium deny policy on the session, about a second from detection; the control plane revokes the token and snapshots pod spec, transcript and the session’s evidence in parallel, best effort. Verification polls Hubble for up to a minute: it needs to see the pod’s traffic being dropped after the quarantine and nothing forwarded; with no traffic at all it records “inconclusive” rather than claiming success. The quarantine is protected by an admission policy so that a compromised control plane, or an admin with kubectl, can’t remove it; and if traffic is seen after containment anyway, S6 re-quarantines.</aside>
+<aside>This is the response path, measured in the tests. The attempt is either a canary leaving in a request (canary-exfiltration) or a burst of connections Cilium dropped (denied-requests). Detection has two inputs: the gateway ships its hash-chained evidence to the sentinel within a second or so, and the sentinel reads Hubble directly, so bypass attempts that never reach the gateway are still seen. Containment is the sentinel’s own Cilium deny policy on the session, about a second from detection; the control plane revokes the token and snapshots pod spec, transcript and the session’s evidence in parallel, best effort. Verification polls Hubble for up to a minute: it needs to see the pod’s traffic being dropped after the quarantine and nothing forwarded; with no traffic at all it records “inconclusive” rather than claiming success. The quarantine is protected by an admission policy so that a compromised control plane, or an admin with kubectl, can’t remove it; and if traffic is seen after containment anyway, traffic-after-containment re-quarantines.</aside>
 </section>
 <section id="results" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:56px">
 <div style="display:flex;flex-direction:column;gap:16px">
@@ -266,11 +267,11 @@ html,body{margin:0;height:100%;background:#0b1118;color:#F4F2EC;font-family:'IBM
 <h2 style="font-size:64px;font-weight:600;line-height:1.15">What still gets through, and how I’d close it</h2>
 <table style="font-size:28px;color:#13202E">
 <tr><th style="width:33%;text-align:left">Gap</th><th style="width:30%;text-align:left">Why</th><th style="width:37%;text-align:left">Production fix</th></tr>
-<tr><td>Canary in a read URL to an allowed host</td><td>One request leaves; D1 contains in ~1 s</td><td>Smallest allowlists; DLP on query strings</td></tr>
+<tr><td>Canary in a read URL to an allowed host</td><td>One request leaves; contained in ~1 s</td><td>Smallest allowlists; DLP on query strings</td></tr>
 <tr style="background:#FFFFFF"><td>TLS to a host a spec lets agents write to</td><td>CONNECT payload is opaque</td><td>Writes denied by default; TLS inspection + DLP where granted</td></tr>
 <tr><td>CLI identity is an <span style="font-family:'JetBrains Mono', monospace">X-User</span> header</td><td>Local prototype</td><td>OIDC or mTLS on the control-plane API</td></tr>
 <tr style="background:#FFFFFF"><td>gVisor, three nodes in one VM</td><td>No nested virtualisation on a laptop</td><td>MicroVMs (Kata, Firecracker) on separate hosts</td></tr>
-<tr><td>Claude Code side-channel CONNECT</td><td>A medium D2 on every run</td><td>Route through the AI gateway</td></tr>
+<tr><td>Claude Code side-channel CONNECT</td><td>A medium denied-requests alert on every run</td><td>Route through the AI gateway</td></tr>
 </table>
 <p style="font-size:30px;line-height:1.4;color:#4A5568">The harness keeps a deliberately vulnerable spec, so each of these stays reproducible rather than asserted.</p>
 <aside>I want to be explicit about what doesn’t hold. The main residual is B20: data can ride out in the URL of a read to any reachable host; we see it in plain HTTP and contain within about a second, but one request has left. If a spec explicitly grants writes to a host, TLS to it is opaque to the proxy, which is why writes are off by default and need a risk acceptance and a second approval. Identity on the CLI is a header in this prototype, which is fine on localhost but would be OIDC or mTLS in production. gVisor is a large surface reduction but not a hardware boundary, and all three nodes share one VM here. And Claude Code’s own side traffic produces a known false positive that I chose to document rather than allowlist, because allowlisting it would open a channel to the model provider. Each of these is a test case in the harness, not just a sentence in the write-up.</aside>

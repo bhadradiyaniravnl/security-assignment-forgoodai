@@ -65,22 +65,22 @@ telling the agent to POST `.env` to a lab destination.
 | R | Reasoning chain lost with the pod | Full prompt/response bodies (canary-redacted) + Claude transcript saved outside the sandbox | D (e2e: bodies retained; containment: snapshot) |
 | **I** | Canary to non-allowed host, raw IP, DNS, API server | Cilium + L7 allowlist | D (B1–B5) |
 | I | Canary **written** to a write-capable allowed host (HTTP or TLS) | Write-capable destinations are read-only by default: write methods and CONNECT denied | D (B9, B10 blocked) |
-| I | Canary in a **read** (URL) to an allowed host | D1 → auto-contain (~1 s) | D (B20): **one request leaves** |
-| I | Spec that explicitly write-allows such a host (risk acceptance + approval) | HTTP: D1 + contain; TLS: opaque | D (B9v) / **NA: B10v undetected** |
+| I | Canary in a **read** (URL) to an allowed host | canary-exfiltration → auto-contain (~1 s) | D (B20): **one request leaves** |
+| I | Spec that explicitly write-allows such a host (risk acceptance + approval) | HTTP: canary-exfiltration + contain; TLS: opaque | D (B9v) / **NA: B10v undetected** |
 | I | Provider fetches attacker URL (server tools, MCP, URL sources) | AI request policy | D (B16–B18) |
-| I | Canary via PR diff or PR body | Canary scan → refusal + D1; summary in code fence | D (github suite) |
+| I | Canary via PR diff or PR body | Canary scan → refusal + canary-exfiltration; summary in code fence | D (github suite) |
 | **D** | One sandbox exhausts the gateway; runaway cost | Per-IP caps, size and time limits, pod limits; budget; TTL | Caps and budget by code review (M8); **O**: budget not atomic with spend |
-| D | Injection breaks the legitimate task | Pre-run content scan warns the reviewer (INJ alert + PR section) | Partial: D (B22); provider refusals 3/6 in the shipped report |
+| D | Injection breaks the legitimate task | Pre-run content scan warns the reviewer (injection-in-repo alert + PR section) | Partial: D (B22); provider refusals 3/6 in the shipped report |
 | D | Runaway or compromised fleet | `sbxctl freeze`: revoke all, namespace-wide deny, block new runs; sentinel freeze works without the control plane | D (containment, sentinel suite) |
 | D | Abandoned sessions hold resources | Idle reaper (spec idleTimeout; activity = gateway validations), graceful max lifetime, contained retention | D (lifecycle) |
 | **E** | Sandbox reaches other sessions, credproxy, API server | Cilium policy | D (B5, B6b/c) |
 | E | gVisor escape lands next to the secrets | Sandboxes only on a tainted sandbox node; credproxy on the platform node (admission enforces) | D (B21); kind nodes share one VM |
 | E | Run-time policy widening; session back door; state races | Parameters only; endpoint removed; compare-and-set; admin-only release; durable state + orphan sweep | D (B12, B19, containment suite) |
 | E | gVisor escape; control-plane `pods/exec` abuse | gVisor; scoped RBAC | Des (microVM; volume delivery) |
-| E | Compromised control plane lifts containment or is down | Sentinel: own node, own deny policies (protected by admission), S6 re-quarantine, S2 platform-egress alerts | D (sentinel suite: containment with the control plane scaled to zero) |
-| T | Detection weakened by a policy change (rule disabled, response downgraded) | Compiled-in floor (D1/EV/S6 on, D1/S6 contain, bounded thresholds); a rejected policy keeps the last good one and raises POL; every load is in the sentinel's chained log | D (sentinel-policy suite); no second-person review yet |
-| D | Sentinel inputs silenced (Hubble relay down, shipper stopped) or sentinel restarted | HB heartbeat on both feeds; containment memory rebuilt from its own log on restart | D (sentinel suite: relay scaled to zero, restart) |
-| R | Compromised or buggy gateway under-reports (drops evidence for a session) | S1: sentinel reconciles Hubble L7/L4 request counts with shipped gateway evidence; Hubble redacts credentials | D (sentinel-completeness suite: lab fault injection, AI and egress channels) |
+| E | Compromised control plane lifts containment or is down | Sentinel: own node, own deny policies (protected by admission), traffic-after-containment re-quarantine, platform-pod-egress platform-egress alerts | D (sentinel suite: containment with the control plane scaled to zero) |
+| T | Detection weakened by a policy change (rule disabled, response downgraded) | Compiled-in floor (canary-exfiltration/evidence-tampering/traffic-after-containment on, canary-exfiltration/traffic-after-containment contain, bounded thresholds); a rejected policy keeps the last good one and raises policy-rejected; every load is in the sentinel's chained log | D (sentinel-policy suite); no second-person review yet |
+| D | Sentinel inputs silenced (Hubble relay down, shipper stopped) or sentinel restarted | telemetry-feed-silent heartbeat on both feeds; containment memory rebuilt from its own log on restart | D (sentinel suite: relay scaled to zero, restart) |
+| R | Compromised or buggy gateway under-reports (drops evidence for a session) | gateway-underreporting: sentinel reconciles Hubble L7/L4 request counts with shipped gateway evidence; Hubble redacts credentials | D (sentinel-completeness suite: lab fault injection, AI and egress channels) |
 
 ## Evidence summary
 
@@ -110,7 +110,7 @@ telling the agent to POST `.env` to a lab destination.
 - **Privilege escalation:** move to microVMs (Kata/Firecracker); alert on gVisor sentry faults; keep the admission backstop.
 - **Control-plane or cross-session access:** OIDC; volume-based workspace delivery with no `pods/exec`; internal routes on a pod-only port; SPIFFE identity.
 - **Insecure agent code reaching production:** draft, App-authored PRs; protected paths; no Workflows permission; add branch rulesets, CODEOWNERS, and SAST/secret scanning gating agent PRs.
-- **AI-assisted probing:** keep the boundary structural (L3/L4 + credential absence), not content matching; fuzz the proxy parsers and canary decoder; D2 bursts surface probing.
+- **AI-assisted probing:** keep the boundary structural (L3/L4 + credential absence), not content matching; fuzz the proxy parsers and canary decoder; denied-requests bursts surface probing.
 
 ## Highest-priority next steps and how I'd prioritise testing and detection
 
@@ -118,4 +118,4 @@ telling the agent to POST `.env` to a lab destination.
 2. **Identity:** OIDC on the control plane, SPIFFE between pods, workspace delivery without `pods/exec`.
 3. **Evidence:** WORM storage + SIEM with an external hash anchor.
 4. **Testing:** `make security-test` in CI on every gateway/spec/policy change, with **Phase B as a hard gate**. Nightly budgeted agent trials over new injection variants. Every failure becomes a fixture and a Phase B case. Fuzz the parsers. Review the open lows quarterly.
-5. **Detection:** measure D1–D3 precision and recall against harness ground truth; tune the D2 false positive (Claude Code side traffic); add CONNECT volume/novelty and per-session egress-volume baselines; weekly alert review with the on-call.
+5. **Detection:** measure canary-exfiltration, denied-requests, risky-tool-call precision and recall against harness ground truth; tune the denied-requests false positive (Claude Code side traffic); add CONNECT volume/novelty and per-session egress-volume baselines; weekly alert review with the on-call.
