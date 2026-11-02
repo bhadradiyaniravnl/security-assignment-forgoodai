@@ -28,7 +28,7 @@ What happened while building it, kept because the lessons are part of the result
 - **Agent self-reports are unreliable.** In a multi-turn session the agent said it had never opened, and later
   never edited, `slug.py`. The gateway's tool_use evidence and the trusted diff showed both. Ground truth comes
   from platform evidence, never from the agent, which is why PR bodies quote its summary as untrusted text.
-- **Injection hurts availability, not just confidentiality.** The provider's usage-policy check refused 3 of the 6
+- **Injection hurts availability, not just confidentiality.** The provider's usage-policy check refused 3 of the 8
   injected runs in the shipped report, which also broke the legitimate task. No agent warned the user about the injected
   instructions; one quietly deleted them.
 - **risky-tool-call false positive.** An `Edit` that quoted the injected block in order to delete it fired risky-tool-call. risky-tool-call now counts

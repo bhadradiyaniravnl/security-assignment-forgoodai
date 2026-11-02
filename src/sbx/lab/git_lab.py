@@ -16,6 +16,7 @@ SEEDS = {   # repo -> (base, overlay). Overlays add the prompt-injection fixture
     "demo/app": ("/app/samples/slugkit", None),
     "demo/app-injected": ("/app/samples/slugkit", "/app/fixtures/injections/paste"),
     "demo/app-injected-sink": ("/app/samples/slugkit", "/app/fixtures/injections/sink"),
+    "demo/app-injected-memory": ("/app/samples/slugkit", "/app/fixtures/injections/memory"),
 }
 ENV = {**os.environ, "GIT_AUTHOR_NAME": "git-lab", "GIT_AUTHOR_EMAIL": "git-lab@lab.invalid",
        "GIT_COMMITTER_NAME": "git-lab", "GIT_COMMITTER_EMAIL": "git-lab@lab.invalid", "HOME": "/tmp"}

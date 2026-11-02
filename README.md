@@ -69,9 +69,9 @@ flowchart TB
 
 | | |
 |---|---|
-| **Phase B: enforcement, agent assumed compromised** | **27/27 as expected**: no credentials in the pod; every bypass (raw TCP, API server, credproxy, other sessions, DNS) dropped and seen by Hubble; canary writes to an allowed host blocked and contained |
+| **Phase B: enforcement, agent assumed compromised** | **28/28 as expected**: no credentials in the pod; every bypass (raw TCP, API server, credproxy, other sessions, DNS) dropped and seen by Hubble; canary writes to an allowed host blocked and contained |
 | Findings (what still gets through) | **Read-URL leak:** a canary in a *read* URL to an allowed host leaves once, then is detected and contained in ~1 s. **Write grants:** if a spec explicitly grants writes, TLS is opaque (undetected) and plain HTTP is detected after one request |
-| **Phase A: real agent under prompt injection** | 6 trials: **0/6** attempted the exfiltration; 3/6 did the task anyway; 3/6 refused by the provider (the task failed too); no agent warned the user. Not evidence of protection: Phase B is |
+| **Phase A: real agent under prompt injection** | 8 trials, including the injection hidden in a repo `CLAUDE.md`: **0/8** attempted the exfiltration; 5/8 did the task anyway; 3/8 refused by the provider (the task failed too); with the `CLAUDE.md` withheld both trials completed normally; no agent warned the user. Not evidence of protection: Phase B is |
 | **Phase C: utility** | The legitimate task passes with every control on (tests re-run offline on the trusted diff) |
 | **Real GitHub** | Scoped, revoked-after-use App tokens; a draft PR with 52 passing tests plus 9 strict xfails documenting 4 real bugs (private repo; reproduce with `make github AGENT=1` against your own) |
 | Evidence | Gateway, control-plane and alert logs are hash-chained and verified on every run |

@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import shutil
 import re
 import subprocess
 import tarfile
@@ -47,17 +48,23 @@ def _app_jwt() -> str:
     return jwt.encode({"iat": now - 60, "exp": now + 540, "iss": APP_ID}, open(KEY_PATH).read(), algorithm="RS256")
 
 
+CONNECT_ATTEMPTS = 3
+
+
 def _github_api(method: str, path: str, token: str, bearer: bool = True, **kw) -> httpx.Response:
     """Call the GitHub REST API: Bearer for the App JWT, `token` scheme for installation tokens."""
     auth = f"Bearer {token}" if bearer else f"token {token}"
     headers = {"Authorization": auth, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    try:
-        return httpx.request(method, API + path, timeout=30, headers=headers, **kw)
-    except httpx.ConnectError:
-        # Egress is an FQDN policy: just after this pod starts, Cilium may not yet have learned
-        # api.github.com's addresses, and the first connect is dropped. One retry, nothing broader.
-        time.sleep(2)
-        return httpx.request(method, API + path, timeout=30, headers=headers, **kw)
+    # Only failures to *connect* are retried: nothing was sent, so a retry can't repeat an action.
+    # Seen in the lab: the first connect after a pod start (Cilium still learning the FQDN's
+    # addresses) and intermittent connect timeouts from the cluster network to GitHub.
+    for attempt in range(CONNECT_ATTEMPTS):
+        try:
+            return httpx.request(method, API + path, timeout=httpx.Timeout(30, connect=10), headers=headers, **kw)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            if attempt == CONNECT_ATTEMPTS - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
 
 
 class Token:
@@ -99,9 +106,18 @@ class Token:
 
 
 def _git(args: list[str], cwd: str | None = None, token: Token | None = None, stdin: str | None = None) -> str:
-    """Run git with an isolated config; returns stdout, raises GitHubError with the token redacted."""
+    """Run git with an isolated config; returns stdout, raises GitHubError with the token redacted.
+    A clone or fetch that failed to *connect* is retried (nothing was transferred); a push never is."""
     cmd = ["git"] + (["-c", token.git_header()] if token else []) + args
-    proc = subprocess.run(cmd, cwd=cwd, env=GIT_ENV, input=stdin, capture_output=True, text=True, timeout=120)
+    for attempt in range(CONNECT_ATTEMPTS):
+        proc = subprocess.run(cmd, cwd=cwd, env=GIT_ENV, input=stdin, capture_output=True, text=True, timeout=120)
+        connect_failed = "Failed to connect" in proc.stderr or "Connection timed out" in proc.stderr
+        if proc.returncode == 0 or not connect_failed or args[0] not in ("clone", "fetch") \
+                or attempt == CONNECT_ATTEMPTS - 1:
+            break
+        if args[0] == "clone" and cwd is None and len(args) > 1:
+            shutil.rmtree(args[-1], ignore_errors=True)   # git may leave a partial destination
+        time.sleep(2 * (attempt + 1))
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout).replace(token.value, "***") if token and token.value else (proc.stderr or proc.stdout)
         raise GitHubError(f"git {args[0]} failed: {msg.strip()[:300]}")

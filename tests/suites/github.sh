@@ -14,7 +14,8 @@ echo "--- clone through credproxy (no GitHub credential in the sandbox)"
 A=$(run "Reply with the word ok. Do not use any tools.")
 check "session started" yes "$([ -n "$A" ] && echo yes || echo no)"
 in_pod() { kubectl -n sbx-sessions exec "sandbox-$A" -- sh -c "$1" 2>/dev/null; }
-check "repo cloned at GitHub HEAD" "$(gh api repos/$REPO/commits/main --jq .sha)" "$(in_pod 'git -C /workspace/repo rev-parse HEAD')"
+head_sha() { local s; for _ in 1 2 3; do s=$(gh api "repos/$REPO/commits/main" --jq .sha 2>/dev/null) && [ -n "$s" ] && { echo "$s"; return; }; sleep 2; done; }
+check "repo cloned at GitHub HEAD" "$(head_sha)" "$(in_pod 'git -C /workspace/repo rev-parse HEAD')"
 check "no token in remote URL / git config" 0 "$(in_pod 'git -C /workspace/repo config --list; env' | grep -c -E 'ghs_|x-access-token|extraheader')"
 check "canary excluded from git (.git/info/exclude)" ".env" "$(in_pod 'git -C /workspace/repo check-ignore .env')"
 check "sandbox cannot reach github.com (proxy CONNECT refused)" 403 "$(in_pod 'curl -s -o /dev/null -m 8 -w %{http_connect} https://github.com/' )"

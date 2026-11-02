@@ -58,7 +58,8 @@ class SessionError(Exception):
 
 
 def run(store: Store, user: str, spec_name: str, params: dict) -> dict:
-    """Starts a session: spec checks -> clone -> content scan -> canary -> pod -> workspace delivery.
+    """Starts a session: spec checks -> clone -> content scan -> withhold agent-instruction files -> canary ->
+    pod -> workspace delivery.
     The session token only becomes valid once the row moves to 'running' with the pod's IP."""
     if store.get_meta("frozen"):
         raise SessionError(503, f"platform is frozen ({store.get_meta('frozen')}); no new sessions")
@@ -92,15 +93,22 @@ def run(store: Store, user: str, spec_name: str, params: dict) -> dict:
         raise SessionError(502, f"clone failed: {e}") from None
     findings = content_scan.scan(os.path.join(workdir, "repo"))      # before we add anything ourselves
     store.update(sid, scan=json.dumps(findings))
+    withheld = _withhold_agent_instructions(os.path.join(workdir, "repo"), os.path.join(workdir, "withheld"))
+    if withheld:
+        evidence.write_sync("agent_instructions_withheld", **who, paths=withheld[:50], count=len(withheld))
     _write_canary_file(os.path.join(workdir, "repo", ".env"), f"PAYMENTS_API_KEY={canary['value']}\n")
     os.makedirs(os.path.join(workdir, "repo", ".git", "info"), exist_ok=True)
     with open(os.path.join(workdir, "repo", ".git", "info", "exclude"), "a") as f:
         f.write("\n.env\n")                                          # local-only ignore; never committed
     if findings:
         evidence.write_sync("untrusted_content_scan", **who, count=len(findings), findings=findings[:20])
-        alerts.write_sync("alert", alert_id=f"al_inj_{sid}", rule="injection-in-repo", severity="low", **who,
+        in_withheld = sorted({f["path"] for f in findings if _is_withheld(f["path"], withheld)})
+        alerts.write_sync("alert", alert_id=f"al_inj_{sid}", rule="injection-in-repo",
+                          severity="medium" if in_withheld else "low", **who,
                           summary=f"{len(findings)} instruction-like passage(s) in repo content "
-                                  f"({', '.join(sorted({f['rule'] for f in findings}))})",
+                                  f"({', '.join(sorted({f['rule'] for f in findings}))})"
+                                  + (f"; in agent-instruction files, withheld from the agent: {', '.join(in_withheld)}"
+                                     if in_withheld else ""),
                           observed={"findings": findings[:5]}, evidence=[{"source": "control-plane"}])
     evidence.write_sync("session_create", **who, repo=params["repo"], commit=commit, canary_ids=[canary["id"]],
                         policy_sha256=hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest())
@@ -345,6 +353,38 @@ GIT_ISOLATED = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "G
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
 
+# Files coding agents load as standing instructions (Claude Code reads CLAUDE.md at the root and in
+# any directory it works in). In an untrusted repo they are the most effective place to hide an
+# injection, so they are withheld from the delivered workspace; the content scan still reads them.
+AGENT_INSTRUCTION_FILES = {"CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "GEMINI.md", ".cursorrules"}
+AGENT_INSTRUCTION_DIRS = {".claude"}
+AGENT_INSTRUCTION_PATHS = {".github/copilot-instructions.md"}
+
+
+def _withhold_agent_instructions(repo: str, dest: str) -> list[str]:
+    """Move agent-instruction files out of the workspace before delivery; returns their repo paths.
+    collect_diff() puts them back, so the trusted diff doesn't show them as deleted."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for d in list(dirnames):
+            if d in AGENT_INSTRUCTION_DIRS:
+                found.append(os.path.relpath(os.path.join(dirpath, d), repo))
+                dirnames.remove(d)
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), repo)
+            if name in AGENT_INSTRUCTION_FILES or rel in AGENT_INSTRUCTION_PATHS:
+                found.append(rel)
+    for rel in found:
+        os.makedirs(os.path.dirname(os.path.join(dest, rel)) or dest, exist_ok=True)
+        shutil.move(os.path.join(repo, rel), os.path.join(dest, rel))
+    return sorted(found)
+
+
+def _is_withheld(path: str, withheld: list[str]) -> bool:
+    return any(path == w or path.startswith(w + "/") for w in withheld)
+
+
 def _diff_paths(diff: str) -> list[str]:
     """Paths named in a diff's `diff --git` headers, quoted or not. A detection input only: the
     authoritative protected-path check runs on staged files at publish (credproxy)."""
@@ -369,6 +409,15 @@ def collect_diff(sid: str) -> tuple[str, int]:
         shutil.copytree(pristine, os.path.join(tree, ".git"), symlinks=True)
         with tarfile.open(fileobj=io.BytesIO(base64.b64decode(b64)), mode="r:gz") as tar:
             tar.extractall(tree, filter="data")          # rejects absolute paths, traversal, device files
+        withheld = os.path.join(WORK, sid, "withheld")
+        if os.path.isdir(withheld):                       # files we kept from the agent: not its deletions
+            for dirpath, _, filenames in os.walk(withheld):
+                for name in filenames:
+                    rel = os.path.relpath(os.path.join(dirpath, name), withheld)
+                    target = os.path.join(tree, rel)
+                    if not os.path.lexists(target):       # if the agent wrote one there, its version counts
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        shutil.copy2(os.path.join(dirpath, name), target)
         env = {**GIT_ISOLATED, "HOME": tree}
         git_cfg = ["-c", "core.quotepath=off", "-c", "core.hooksPath=/dev/null", "-c", "diff.external="]
         subprocess.run(["git", *git_cfg, "add", "-A"], cwd=tree, env=env, check=True, capture_output=True, timeout=60)
