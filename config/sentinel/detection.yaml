@@ -7,7 +7,7 @@
 # The image carries a copy of this file, used only if the ConfigMap is missing on first boot.
 #
 # Floor (compiled into the sentinel, a policy that breaks it is rejected and the last good one stays):
-#   D1, EV, S6, POL always enabled in enforce mode; D1 and S6 must quarantine or freeze; thresholds bounded;
+#   D1, EV, HB, S6, POL always enabled in enforce mode; D1 and S6 must quarantine or freeze; thresholds bounded;
 #   only high-severity rules may freeze; platform-flow rules can't quarantine (no session).
 apiVersion: sbx.forgood.ai/v1
 kind: DetectionPolicy
@@ -59,6 +59,13 @@ spec:
       description: shipped evidence has a sequence gap or a broken hash chain
       severity: high
       response: record
+      params: { cooldown_s: 60 }                          # one alert per file per incident window
+
+    - id: HB
+      description: the sentinel's own inputs went quiet (Hubble feed, or no shipped evidence while sessions are active)
+      severity: high
+      response: record
+      params: { hubble_stale_s: 60, evidence_stale_s: 120, interval_s: 10 }
 
     - id: S1
       description: the datapath saw materially more requests than the gateway logged

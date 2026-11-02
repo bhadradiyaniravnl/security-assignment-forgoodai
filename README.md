@@ -92,7 +92,7 @@ flowchart TB
 - the credentials proxy (including GitHub App tokens);
 - the control plane: spec registry with org baseline and two-person approval, session lifecycle,
   trusted diff and PRs, containment;
-- the sentinel: detection rules, the configurable detection policy, independent response;
+- the sentinel: detection rules (incl. a heartbeat on its own inputs), the configurable detection policy, independent response;
 - the evidence chain, the canary matcher and `sbxctl`;
 - the manifests;
 - the harness and suites.

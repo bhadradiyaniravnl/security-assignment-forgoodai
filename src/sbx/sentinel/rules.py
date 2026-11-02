@@ -16,7 +16,8 @@ platform pod.
   D2  spec denial (gateway) or dropped flow (Hubble) from a session         medium  first per session
       ... reaching the spec's denyBurst threshold within its window         high    contain
   D3  model tool_use referencing the canary, or an acting tool referencing .env / a non-allowed host
-  EV  shipped evidence chain broken or a sequence gap                       high    alert only
+  EV  shipped evidence chain broken or a sequence gap                       high    alert (per incident, cooldown)
+  HB  the sentinel's own inputs went quiet (Hubble feed, shipped evidence)  high    alert     (main.py)
   S1  datapath saw materially more requests than the gateway logged         high    contain   (main.py)
   S2  platform pod: policy-dropped connection, or world egress by anything other than credproxy, or
       credproxy reaching a name outside its allowlist                       high    alert (isolation needs approval)

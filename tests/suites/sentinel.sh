@@ -3,7 +3,8 @@
 # Proves: it runs on its own node with least privilege; shipped evidence is verified on arrival;
 # it contains a session with the CONTROL PLANE DOWN; nobody else can delete its deny policies;
 # S2 catches platform pod egress; S6 re-contains a session whose containment a compromised
-# control plane lifted; and its own fleet freeze works.
+# control plane lifted; containment memory survives a sentinel restart; HB alerts when the
+# sentinel's own Hubble feed goes quiet; and its own fleet freeze works.
 set -uo pipefail
 cd "$(dirname "$0")/../.." && source tests/lib.sh
 alerts_for() { SC alerts 400 | grep -E " $1 " ; }
@@ -67,6 +68,22 @@ check "S6 detected traffic after containment" yes "$(alerts_for "$B" | contains 
 check "sentinel re-quarantined the session" yes "$(has_cnp sentinel-q-$B)"
 sleep 2
 check "session cut off again" 000 "$(gw_code "$B")"
+
+echo "--- restart: containment memory survives (S6 keeps watching quarantined sessions)"
+kubectl -n sbx-security rollout restart deploy/sentinel >/dev/null
+kubectl -n sbx-security rollout status deploy/sentinel --timeout=120s >/dev/null
+wait_for "SC status 2>/dev/null | python3 -c \"import json,sys; print('y' if '$B' in json.load(sys.stdin)['contained'] else 'n')\"" y 30
+check "quarantined session remembered after restart" yes "$(SC status | python3 -c "import json,sys; print('yes' if '$B' in json.load(sys.stdin)['contained'] else 'no')")"
+check "quarantine policy still in place" yes "$(has_cnp sentinel-q-$B)"
+
+echo "--- HB: the sentinel notices when its own datapath feed goes quiet"
+kubectl -n kube-system scale deploy/hubble-relay --replicas=0 >/dev/null
+wait_for "SC alerts 50 | contains 'HB .*datapath feed silent' && echo y" y 110
+check "HB alert raised with Hubble relay down" yes "$(SC alerts 50 | contains 'HB .*datapath feed silent' && echo yes || echo no)"
+kubectl -n kube-system scale deploy/hubble-relay --replicas=1 >/dev/null
+kubectl -n kube-system rollout status deploy/hubble-relay --timeout=120s >/dev/null
+wait_for "kubectl -n sbx-security logs deploy/sentinel --since=30s | contains '\"hubble\": \"connected\"' && echo y" y 40
+check "feed resumed" yes "$(kubectl -n sbx-security logs deploy/sentinel --since=60s | contains '"hubble": "connected"' && echo yes || echo no)"
 
 echo "--- sentinel fleet freeze (works without the control plane)"
 C=$(start_session)

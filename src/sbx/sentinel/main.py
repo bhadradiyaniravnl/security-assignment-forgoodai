@@ -9,7 +9,7 @@ What it trusts:
   - The control plane only for per-session policy lookups (cached; built-in defaults if it is down).
 
 What it does:
-  detect    D1-D3, EV (evidence integrity), S1 (gateway completeness: Cilium L7/L4 request counts vs
+  detect    D1-D3, EV (evidence integrity), HB (own inputs alive), S1 (gateway completeness: Cilium L7/L4 request counts vs
             shipped gateway evidence), S2 (platform pod egress), S6 (traffic after containment),
             plus the detection policy's custom match rules
   policy    detection policy (rules, tuning, response actions) from the ConfigMap sentinel-detection,
@@ -67,7 +67,10 @@ datapath_dedup: dict[tuple, float] = {}                      # S1 counting: flow
 session_policies: dict[str, dict] = {}                       # sid -> last policy the control plane returned
 positions: dict[str, int] = {}                              # file -> last verified seq
 chain_head: dict[str, str] = {}                             # file -> hash of the last verified record
-broken_files: set[str] = set()                              # files with a gap or chain break (alerted once)
+broken_files: set[str] = set()                              # files that ever had a gap or chain break
+last_ev: dict[str, float] = {}                               # file -> time of its last EV alert (cooldown)
+last_flow_at = 0.0                                           # HB: last Hubble flow seen, any namespace
+last_ingest_at = 0.0                                         # HB: last shipped batch with records
 
 
 def emit(**kw) -> None:
@@ -175,7 +178,8 @@ async def ingest_position(request: web.Request) -> web.Response:
 
 async def ingest(request: web.Request) -> web.Response:
     """POST /ingest {file, events}: verify each new record (sequence continuity, hash chain), keep a
-    copy, then run detection on it. The first gap or break per file raises one EV alert."""
+    copy, then run detection on it. Every gap or chain break raises EV, at most once per file per
+    EV.params.cooldown_s so a flood of broken records is one incident, not one alert each."""
     if request.headers.get("X-Sbx-Ingest") != INGEST_KEY or not INGEST_KEY:
         raise web.HTTPUnauthorized()
     body = await request.json()
@@ -183,26 +187,37 @@ async def ingest(request: web.Request) -> web.Response:
     if name not in ("gateway.jsonl", "control-plane.jsonl"):
         raise web.HTTPBadRequest()
     http = request.app["http"]
+    global last_ingest_at
+    if body["events"]:
+        last_ingest_at = time.time()
     with open(os.path.join(DATA, "copy", name), "a") as copy:
         for event in body["events"]:
             last = positions.get(name, 0)
             if event["seq"] <= last:
                 continue
-            if event["seq"] != last + 1 and name not in broken_files:     # a hole: something was never shipped
-                broken_files.add(name)
-                await respond(http, alert("EV", None, f"{name}: sequence gap {last} -> {event['seq']}",
-                                          {"file": name}, [{"source": "shipper", "seq": event["seq"]}]))
+            if event["seq"] != last + 1:                                  # a hole: something was never shipped
+                await evidence_incident(http, name, event["seq"], f"sequence gap {last} -> {event['seq']}")
             claimed = event.get("hash")
             unhashed = {k: v for k, v in event.items() if k != "hash"}
             prev = chain_head.get(name, GENESIS)
-            if (unhashed.get("prev_hash") != prev or _digest(prev, unhashed) != claimed) and name not in broken_files:
-                broken_files.add(name)
-                await respond(http, alert("EV", None, f"{name}: hash chain broken at seq {event['seq']}",
-                                          {"file": name}, [{"source": "shipper", "seq": event["seq"]}]))
+            if unhashed.get("prev_hash") != prev or _digest(prev, unhashed) != claimed:
+                await evidence_incident(http, name, event["seq"], f"hash chain broken at seq {event['seq']}")
             copy.write(json.dumps(event, sort_keys=True) + "\n")
             positions[name], chain_head[name] = event["seq"], claimed
             await handle_event(http, name, event)
     return web.json_response({"ok": True, "position": positions.get(name, 0)})
+
+
+async def evidence_incident(http: aiohttp.ClientSession, name: str, seq: int, what: str) -> None:
+    """EV bookkeeping: remember the file as broken (for `ctl status`), alert unless the last EV for
+    this file is within the policy's cooldown."""
+    broken_files.add(name)
+    now = time.time()
+    if now - last_ev.get(name, 0) < float(engine.pol.param("EV", "cooldown_s")):
+        return
+    last_ev[name] = now
+    await respond(http, alert("EV", None, f"{name}: {what}", {"file": name, "seq": seq},
+                              [{"source": "shipper", "seq": seq}], key=f"{name}|{seq}"))
 
 
 def grace_s() -> float:
@@ -256,6 +271,8 @@ async def hubble_stream(http: aiohttp.ClientSession, namespace: str, handler) ->
                 flow = json.loads(raw).get("flow", {})
             except ValueError:
                 continue
+            global last_flow_at
+            last_flow_at = time.time()
             await handler(http, flow)
         emit(hubble="disconnected", namespace=namespace, rc=await proc.wait())
         await asyncio.sleep(3)
@@ -419,6 +436,33 @@ async def policy_watch(http: aiohttp.ClientSession) -> None:
 
 
 # ------------------------------------------------------------------------------ housekeeping, admin
+async def heartbeat(http: aiohttp.ClientSession) -> None:
+    """HB: the sentinel must notice when it has gone blind. The shipper polls every second and that
+    alone produces platform flows, so a quiet Hubble feed means the feed is down, not the cluster.
+    Shipped evidence is expected whenever the datapath shows sessions talking to the gateway."""
+    global last_flow_at, last_ingest_at
+    last_flow_at = last_ingest_at = time.time()
+    while True:
+        params = engine.pol.rules["HB"]["params"]
+        await asyncio.sleep(params["interval_s"])
+        if not engine.pol.enabled("HB"):
+            continue
+        now = time.time()
+        bucket = int(now) // int(params["hubble_stale_s"])
+        if now - last_flow_at > params["hubble_stale_s"]:
+            await respond(http, alert("HB", None, f"datapath feed silent for {int(now - last_flow_at)}s: "
+                                      "the sentinel is blind to bypass attempts and cannot verify containment",
+                                      {"action": "feed_stalled", "feed": "hubble", "silent_s": int(now - last_flow_at)},
+                                      [{"source": "sentinel"}], key=f"hubble|{bucket}"))
+        recent_datapath = any(t > now - params["evidence_stale_s"]
+                              for seen in (seen_ai, seen_egress) for ts in seen.values() for t in ts[-1:])
+        if recent_datapath and now - last_ingest_at > params["evidence_stale_s"]:
+            await respond(http, alert("HB", None, f"no shipped evidence for {int(now - last_ingest_at)}s while "
+                                      "sessions are talking to the gateway: shipper or gateway logging stalled",
+                                      {"action": "feed_stalled", "feed": "evidence", "silent_s": int(now - last_ingest_at)},
+                                      [{"source": "sentinel"}, {"source": "hubble"}], key=f"evidence|{bucket}"))
+
+
 async def release_stale_quarantines() -> None:
     """Remove sentinel quarantines whose session pod no longer exists."""
     while True:
@@ -475,17 +519,44 @@ def restore() -> None:
                 for line in f:
                     record = json.loads(line)
                     positions[name], chain_head[name] = record["seq"], record["hash"]
-    if os.path.exists(log.path):
+    path = os.path.join(DATA, "copy", "control-plane.jsonl")
+    if os.path.exists(path):                                   # containment the platform recorded
+        with open(path) as f:
+            for line in f:
+                record = json.loads(line)
+                if record.get("action") == "session_contain" and record.get("session_id"):
+                    contained.setdefault(record["session_id"], record.get("quarantined_at") or record["ts"])
+                elif record.get("action") == "fleet_freeze":
+                    for sid in record.get("frozen_sessions", []):
+                        contained.setdefault(sid, record["ts"])
+    if os.path.exists(log.path):                               # containment and releases we did ourselves
         with open(log.path) as f:
             for line in f:
                 record = json.loads(line)
                 if record.get("alert_id"):
                     raised_alert_ids.add(record["alert_id"])
+                acted = record.get("sentinel_action") or {}
+                if record.get("action") == "alert" and acted.get("policy") and record.get("session_id"):
+                    contained.setdefault(record["session_id"], acted.get("at") or record["ts"])
+                elif record.get("action") == "quarantine_released" and record.get("session_id"):
+                    contained.pop(record["session_id"], None)
+
+
+def adopt_live_quarantines() -> None:
+    """Whatever sentinel-q-* policies exist right now are containment, even if our log never said so
+    (lost volume, edited log): S6 must watch them from the first second after a restart."""
+    try:
+        for sid in actions.quarantined_sessions():
+            contained.setdefault(sid, time.time())
+    except Exception as e:  # noqa: BLE001 - API server not reachable yet; the gc loop retries listing
+        emit(restore_error=str(e)[:200])
 
 
 async def main() -> None:
     restore()
     boot_policy()
+    adopt_live_quarantines()
+    emit(restored=dict(contained=len(contained), alerts=len(raised_alert_ids)))
     async with aiohttp.ClientSession(headers=internal.headers()) as http:
         ingest_app = web.Application(client_max_size=64 * 1024 * 1024)
         ingest_app["http"] = http
@@ -500,7 +571,7 @@ async def main() -> None:
             await runner.setup()
             await web.TCPSite(runner, host, port).start()
         emit(sentinel="started", positions=positions, known_alerts=len(raised_alert_ids), policy=engine.pol.digest)
-        await asyncio.gather(policy_watch(http), hubble_stream(http, "sbx-sessions", on_session_flow),
+        await asyncio.gather(policy_watch(http), heartbeat(http), hubble_stream(http, "sbx-sessions", on_session_flow),
                              hubble_stream(http, "sbx-system", on_platform_flow), release_stale_quarantines(),
                              reconcile(http))
 

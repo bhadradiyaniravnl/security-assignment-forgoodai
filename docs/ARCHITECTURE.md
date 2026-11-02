@@ -281,7 +281,8 @@ evidence shipper's push.
 | **D1** | Canary (plain, base64 at any alignment, hex, URL-encoded) in egress (shipped gateway evidence) | High; **auto-quarantine** |
 | **D2** | Spec denial (gateway) or DROPPED flow from a session pod (Hubble); first one, then the spec's burst threshold | Medium, then high; **auto-quarantine** at the burst |
 | **D3** | Model `tool_use` with the canary, or an *acting* tool (Bash, WebFetch, MCP) referencing `.env` or a non-allowed host | Medium alert |
-| **EV** | Shipped evidence: sequence gap or hash-chain break | High alert |
+| **EV** | Shipped evidence: sequence gap or hash-chain break; every incident, with a per-file cooldown | High alert |
+| **HB** | The sentinel's own inputs went quiet: no Hubble flow for 60 s (the shipper's polling alone produces flows), or no shipped evidence for 120 s while the datapath shows sessions talking to the gateway | High alert: the sentinel is blind |
 | **S2** | **Platform pod** (gateway, credproxy, control plane…) has a policy-dropped connection, or reaches the outside world when it isn't credproxy, or credproxy reaches a name outside its allowlist | High alert (isolating platform pods needs approval) |
 | **S1** | Gateway evidence incomplete: the datapath (Hubble L7 for the AI gateway, L4 connections for the egress proxy) saw at least 3 more requests than the gateway logged, and at least 25% of them, over a window that ended 20 s ago | High; **quarantine** the session |
 | **S6** | Traffic still forwarded from a session after its containment took effect (e.g. a compromised control plane lifted its own quarantine) | High; **re-quarantine** |
@@ -307,7 +308,7 @@ rather than run on a hidden default.
 - **`mode: monitor`** records the alert and the steps it *would* have run, and does nothing else, so a new rule can be tuned
   before it is enforced.
 - **The floor** is compiled into the image and cannot be configured away:
-  - D1, EV, S6 and POL always stay enabled in enforce mode;
+  - D1, EV, HB, S6 and POL always stay enabled in enforce mode;
   - D1 and S6 must quarantine or freeze;
   - thresholds are bounded (e.g. an S1 deficit of 1–20, a D2 burst of 1–50);
   - only high-severity rules may freeze;
@@ -340,6 +341,10 @@ can lift a sentinel quarantine or freeze.
 **Verification** polls up to 60 s:
 - *verified* only if Hubble shows the pod's traffic **dropped after the quarantine** and **nothing forwarded** after a 3 s grace period;
 - with no traffic at all, the result is recorded as *inconclusive* rather than claimed.
+
+**Restart:** positions, chain heads, known alerts and **containment memory** are rebuilt from its own
+log and evidence copy, and any `sentinel-q-*` policy that exists at boot is adopted, so S6 watches
+quarantined sessions from the first second.
 
 **Record:** its own hash-chained log (`/data/sentinel.jsonl`, on its own volume) of alerts, actions
 and verifications, plus the verified evidence copies.

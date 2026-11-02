@@ -18,7 +18,7 @@ one is rejected instead of silently running on a value nobody can see. A policy 
                 freeze                the sentinel's fleet-wide deny policy (sentinel-freeze)
                 notify-control-plane  best effort: control plane revokes the token, snapshots evidence
               Every alert is always recorded in the sentinel's own hash-chained log.
-  rules       every built-in rule (D1-D3, EV, S1, S2, S6, POL): severity, response, all its params,
+  rules       every built-in rule (D1-D3, EV, HB, S1, S2, S6, POL): severity, response, all its params,
               optional stages, enabled (default true) and mode (default enforce)
               custom match rules: a source, field matchers, an optional count/window threshold
 
@@ -50,7 +50,8 @@ BUILTIN_RULES: dict[str, dict] = {
     "D1": {"params": {}, "stages": ()},
     "D2": {"params": {"default_burst": dict, "deny_reasons": list}, "stages": ("first",)},
     "D3": {"params": {"acting_tools": list, "acting_tool_prefixes": list}, "stages": ()},
-    "EV": {"params": {}, "stages": ()},
+    "EV": {"params": {"cooldown_s": NUMBER}, "stages": ()},
+    "HB": {"params": {"hubble_stale_s": NUMBER, "evidence_stale_s": NUMBER, "interval_s": NUMBER}, "stages": ()},
     "S1": {"params": {"horizon_s": NUMBER, "min_deficit": NUMBER, "min_ratio": NUMBER, "interval_s": NUMBER},
            "stages": ()},
     "S2": {"params": {"world_allowlist": dict}, "stages": ()},
@@ -59,12 +60,14 @@ BUILTIN_RULES: dict[str, dict] = {
 }
 
 # ------------------------------------------------------------------------------------------- floor
-ALWAYS_ON = {"D1", "EV", "S6", "POL"}          # cannot be disabled or set to monitor
+ALWAYS_ON = {"D1", "EV", "HB", "S6", "POL"}    # cannot be disabled or set to monitor
 MUST_CONTAIN = {"D1", "S6"}                    # response must quarantine or freeze
 PARAM_BOUNDS = {                               # rule -> param path -> (min, max)
     "D2": {"default_burst.count": (1, 50), "default_burst.window_s": (5, 600)},
     "S1": {"horizon_s": (5, 120), "min_deficit": (1, 20), "min_ratio": (0.0, 1.0), "interval_s": (2, 60)},
     "S6": {"grace_s": (1, 10)},
+    "EV": {"cooldown_s": (1, 600)},
+    "HB": {"hubble_stale_s": (15, 600), "evidence_stale_s": (15, 600), "interval_s": (2, 60)},
 }
 RULE_KEYS = {"id", "enabled", "mode", "severity", "response", "params", "stages", "description",
              "type", "source", "match", "threshold", "groupBy", "summary"}
