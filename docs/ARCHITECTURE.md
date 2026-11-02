@@ -224,7 +224,7 @@ One Python process (`src/sbx/gateway/`) with two listeners. Each request:
 
 **Egress gateway (`:3128`)**, a hand-written authenticated forward proxy:
 - **Plain HTTP:** the full request is visible. URL, headers and body are canary-scanned, the host is checked against `egress.allow`, and the request is forwarded via credproxy `/egress`. **Write-capable destinations** (marked `accepts_writes` in the baseline catalogue) accept only GET/HEAD unless the spec lists them in `egress.writeAllowed`.
-- **CONNECT:** only host and port are visible, so a tunnel counts as a **write**. It is allowed only to write-allowed hosts and tunnelled via credproxy `:9001`; the payload is opaque (B10v).
+- **CONNECT:** only host and port are visible, so a tunnel counts as a **write**. It is allowed only to write-allowed hosts and tunnelled via credproxy `:9001`; the payload is opaque, so a write grant to a host means TLS writes to it go undetected.
 - **Limits per sandbox IP:** 16 concurrent connections; 16 MB body, size-checked before reading; 30 s body timeout; 32 MB response cap.
 
 ### 5.5 Credentials proxy
@@ -571,7 +571,7 @@ with what each proves and costs, in [AGENTS.md](../AGENTS.md#5-test-it). Harness
 
 | Decision | Alternatives | Why this one |
 |---|---|---|
-| Explicit gateways (agent configured via base URL and proxy env) | Transparent TLS-intercepting chokepoint | Semantic visibility (model requests, tool_use) without a MITM CA in the sandbox. Bypassing the env vars fails closed at the network. The cost is that CONNECT is opaque (B10). |
+| Explicit gateways (agent configured via base URL and proxy env) | Transparent TLS-intercepting chokepoint | Semantic visibility (model requests, tool_use) without a MITM CA in the sandbox. Bypassing the env vars fails closed at the network. The cost is that CONNECT is opaque, which is why hosts are read-only unless a spec grants writes. |
 | gVisor in kind | Kata/Firecracker; plain runc | Large attack-surface reduction with no KVM (the M2 has no nested virtualisation). MicroVMs remain the production design. |
 | Cilium + Hubble | Plain NetworkPolicy; iptables | FQDN egress for credproxy, deny policies for fast quarantine, and **independent flow telemetry** for bypass attempts. |
 | Per-session deny policy for containment | Relabel the pod | ≤ 1 s against ~45 s (a relabel forces a new Cilium identity). |
