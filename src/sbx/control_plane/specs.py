@@ -204,6 +204,9 @@ def compile_policy(spec: dict) -> dict:
         "max_tokens": int(s["model"]["maxTokens"]),
         "grants": [g["ref"] for g in s.get("secrets", [])],
         "agent_tools": list(s.get("agentTools", {}).get("allow", [])),
+        # The platform's instructions first, then the spec's own; applied by the AI gateway.
+        "agent_instructions": "\n\n".join(filter(None, [baseline.BASELINE["agent_instructions"],
+                                                         s.get("agentInstructions", "").strip()])),
         "output": {"type": s["repo"].get("output", {}).get("type", "branch"),
                    "base": s["repo"].get("output", {}).get("base", "main"),
                    "draft": bool(s["repo"].get("output", {}).get("draft", True)),

@@ -452,6 +452,31 @@ def phase_b() -> list[dict]:
                              f"\"source\":{{\"type\":\"url\",\"url\":\"https://x.invalid/?d=1\"}}}}]}}]}}'")
     case("B18", "URL-sourced content (provider would fetch it) rejected", "403", c_url, c_url == "403",
          {"gateway": "reason remote_content_source"})
+    # A request built by hand in the sandbox (not by Claude Code) must still reach the model with the
+    # platform's instructions appended by the gateway, after the agent's own system prompt.
+    curl_code(fresh, f"-X POST http://gateway:8080/v1/messages/count_tokens {hdr} -d '{{\"model\":\"claude-haiku-5-5\","
+                     f"\"system\":\"my own system prompt\",{msg}}}'", timeout=20)
+    sent = [e for e in gateway_events(fresh) if e["action"] == "ai_request" and e.get("decision") == "allow"
+            and e.get("path") == "/v1/messages/count_tokens"]
+    blocks = []
+    if sent:
+        _, raw = sh(["kubectl", "-n", "sbx-system", "exec", "deploy/gateway", "-c", "gateway", "--", "python", "-c",
+                     "import gzip,json,sys; d=json.load(gzip.open(sys.argv[1],'rt')); "
+                     "print(json.dumps(json.loads(d['request'])['system']))",
+                     f"/evidence/bodies/{fresh}/{sent[-1]['seq']:08d}.json.gz"])
+        try:
+            blocks = json.loads(raw.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            blocks = []
+    applied = (len(blocks) == 2 and blocks[0].get("text") == "my own system prompt"
+               and blocks[1].get("text", "").startswith("This is an automated coding task")
+               and bool(sent and sent[-1].get("instructions_sha256")))
+    case("B25", "platform agent instructions applied by the gateway, even to a request built by hand in the sandbox",
+         "the agent's own system block kept, the instructions appended after it, their hash in evidence",
+         f"system blocks seen by the model: {len(blocks)}; instructions hash recorded: "
+         f"{bool(sent and sent[-1].get('instructions_sha256'))}", applied,
+         {"gateway": (blocks[-1].get("text", "")[:80] if blocks else None)})
+
     def internal_call(method, path, key):
         """Status of a control-plane internal API call made with `key`."""
         req = urllib.request.Request(API + path, method=method, data=b"{}" if method == "POST" else None,

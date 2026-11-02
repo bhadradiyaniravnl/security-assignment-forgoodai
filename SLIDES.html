@@ -246,13 +246,13 @@ html,body{margin:0;height:100%;background:#0b1118;color:#F4F2EC;font-family:'IBM
 <div style="display:flex;gap:32px">
 <div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:44px;border-radius:12px;border-top:6px solid #3E7CB1">
 <p style="font-size:30px;font-weight:600;color:#4A5568">Phase B · enforcement</p>
-<p style="font-size:120px;font-weight:700;line-height:1">28/28</p>
+<p style="font-size:120px;font-weight:700;line-height:1">29/29</p>
 <p style="font-size:28px;line-height:1.4;color:#4A5568">cases as expected with the agent assumed compromised: no secrets found, every bypass dropped and seen</p>
 </div>
 <div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:44px;border-radius:12px;border-top:6px solid #E07A3F">
 <p style="font-size:30px;font-weight:600;color:#4A5568">Phase A · real agent, injected</p>
 <p style="font-size:120px;font-weight:700;line-height:1">0/8</p>
-<p style="font-size:28px;line-height:1.4;color:#4A5568">attempted the exfiltration; 3 were refused by the provider, which broke the real task too</p>
+<p style="font-size:28px;line-height:1.4;color:#4A5568">attempted the exfiltration; 4 were refused by the provider, which broke the real task too</p>
 </div>
 <div style="flex:1;display:flex;flex-direction:column;gap:16px;background:#FFFFFF;padding:44px;border-radius:12px;border-top:6px solid #3E7CB1">
 <p style="font-size:30px;font-weight:600;color:#4A5568">Phase C · utility</p>
@@ -261,7 +261,7 @@ html,body{margin:0;height:100%;background:#0b1118;color:#F4F2EC;font-family:'IBM
 </div>
 </div>
 <p style="font-size:30px;line-height:1.4;color:#4A5568">Verdicts come only from outside the sandbox: gateway evidence, Hubble, lab receipts. “The agent didn’t try” is never counted as protection.</p>
-<aside>The harness is one command with three phases, and I keep them apart on purpose. Phase B is the real security evidence: it execs attacker commands inside the gVisor pod, so model behaviour plays no part: look for secrets, call the API server, skip the gateway, hit another session, raw TCP and DNS to the attacker sink, write the canary to an allowed host over HTTP and TLS. 28 of 28 behave as expected, including a repo CLAUDE.md being withheld from the agent. Phase A is a real Claude Code agent fixing a bug in a repo whose code and CONTRIBUTING.md carry an injection asking it to POST .env. A fourth variant puts the same text in a repo CLAUDE.md, which the platform withholds. None of eight tried; three were refused by the provider’s usage-policy check, which means injection is also an availability attack: the legitimate task failed. With the CLAUDE.md withheld, both of those trials just did the task. No agent told the user about the injection, even with a system prompt asking it to, which is why the prompt is measured rather than counted as a control. Phase C proves the controls don’t break the job: tests re-run in a network-less container on the diff the control plane computed, not on what the agent claims.</aside>
+<aside>The harness is one command with three phases, and I keep them apart on purpose. Phase B is the real security evidence: it execs attacker commands inside the gVisor pod, so model behaviour plays no part: look for secrets, call the API server, skip the gateway, hit another session, raw TCP and DNS to the attacker sink, write the canary to an allowed host over HTTP and TLS. 29 of 29 behave as expected, including a repo CLAUDE.md being withheld from the agent, and the platform's instructions reaching the model even on a request built by hand in the sandbox. Phase A is a real Claude Code agent fixing a bug in a repo whose code and CONTRIBUTING.md carry an injection asking it to POST .env. A fourth variant puts the same text in a repo CLAUDE.md, which the platform withholds. None of eight tried; four were refused by the provider’s usage-policy check, which means injection is also an availability attack: the legitimate task failed. With the CLAUDE.md withheld, both of those trials just did the task. No agent told the user about the injection, even with instructions asking it to, which is why the instructions are measured rather than counted as a control. Phase C proves the controls don’t break the job: tests re-run in a network-less container on the diff the control plane computed, not on what the agent claims.</aside>
 </section>
 <section id="gaps" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:48px">
 <h2 style="font-size:64px;font-weight:600;line-height:1.15">What still gets through, and how I’d close it</h2>

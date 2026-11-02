@@ -2,7 +2,7 @@ apiVersion: sbx/v1
 kind: AgentSpec
 metadata:
   name: testwriter-agent
-  version: 1
+  version: 2
   owners: [dev]
 spec:
   runtime:
@@ -26,6 +26,10 @@ spec:
       protectedPaths: [".github/", ".git/", "requirements.txt"]
   agentTools:
     allow: [Read, Edit, Write, Glob, Grep, "Bash(python3 -m pytest:*)", "Bash(git diff:*)", "Bash(git status:*)"]
+  # Added to the platform's own instructions (never replacing them); applied by the AI gateway.
+  agentInstructions: >-
+    Only add or change files under tests/. Do not modify application code: when a test shows a bug,
+    keep the test, mark it as an expected failure, and describe the bug in your summary.
   egress:
     allow: []
   secrets:

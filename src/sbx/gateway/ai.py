@@ -64,6 +64,21 @@ def request_policy(method: str, path: str, body: bytes, model_allow: list[str]) 
     return model, None
 
 
+def with_instructions(body: bytes, instructions: str) -> bytes:
+    """The session's agent instructions (platform default + the spec's own) appended as the last
+    system block. Done here rather than in the sandbox, so they reach every model call the session
+    makes, including one the agent builds by hand, and the agent can't remove them. Appending keeps
+    Claude Code's own cached system prefix intact. Only called on bodies request_policy accepted."""
+    if not instructions:
+        return body
+    req = json.loads(body)
+    system = req.get("system")
+    blocks = [{"type": "text", "text": system}] if isinstance(system, str) else list(system or [])
+    blocks.append({"type": "text", "text": instructions})
+    req["system"] = blocks
+    return json.dumps(req).encode()
+
+
 def _has_remote_source(node) -> bool:
     """True if any content block asks the provider to fetch something (URL) or read stored files."""
     if isinstance(node, dict):
@@ -112,15 +127,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
         await evidence.write("ai_request", **event_fields, decision="deny", reason="budget")
         return web.json_response({"type": "error", "error": {"type": "rate_limit_error",
                                   "message": "sbx: session token budget exhausted"}}, status=429)
+    instructions = policy.get("agent_instructions", "")
+    forwarded = with_instructions(body, instructions)
     # Recorded before forwarding, so the event exists even if the upstream call fails.
-    req_event = await evidence.write("ai_request", **event_fields, decision="allow", reason="spec_policy")
+    req_event = await evidence.write("ai_request", **event_fields, decision="allow", reason="spec_policy",
+                                     instructions_sha256=sha256(instructions.encode()) if instructions else None)
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in DROP_HEADERS}
     headers.update(internal.headers())
     headers["X-Sbx-Session"] = ctx["session_id"]
     http: aiohttp.ClientSession = request.app["http"]
     async with http.request(request.method, f"{internal.CREDPROXY_URL}/anthropic{path}", params=request.query,
-                            headers=headers, data=body) as upstream:
+                            headers=headers, data=forwarded) as upstream:
         resp = web.StreamResponse(status=upstream.status, headers={k: v for k, v in upstream.headers.items()
                                                                    if k.lower() not in DROP_HEADERS})
         await resp.prepare(request)
@@ -140,7 +158,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
             await inspector.feed_json(json_body)
         await resp.write_eof()
         if req_event.get("seq", -1) > 0:     # seq -1: the event was dropped (fault injection), so nothing to link to
-            store_bodies(ctx["session_id"], req_event["seq"], body, bytes(kept_response), canaries, upstream.status)
+            store_bodies(ctx["session_id"], req_event["seq"], forwarded, bytes(kept_response), canaries, upstream.status)
         return resp
 
 
