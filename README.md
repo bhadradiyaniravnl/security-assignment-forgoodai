@@ -27,10 +27,10 @@ flowchart TB
   cfg -.-> sen
 
   subgraph platform [platform node · sbx-system]
-    cp[control plane<br/>spec registry + baseline · sessions<br/>token checks · trusted diff · reaper]
-    gw[gateway<br/>AI :8080 · egress proxy :3128<br/>spec policy on every request]
+    cp[control plane<br/>spec registry + baseline · sessions · token checks<br/>repo scan · withholds CLAUDE.md etc. · trusted diff]
+    gw[gateway<br/>AI :8080 · egress proxy :3128<br/>spec policy + agent instructions on every request]
     cred[credproxy<br/>the only real secrets<br/>Anthropic key · GitHub App]
-    ship[evidence shipper<br/>hash-chained records]
+    ship[evidence shipper<br/>gateway sidecar]
     ev[(evidence<br/>gateway · control plane · alerts)]
     gitlab[(git-lab<br/>lab repos)]
   end
@@ -44,10 +44,11 @@ flowchart TB
   end
 
   k8s{{kube-apiserver<br/>RBAC · admission policy}}
-  hub((Hubble<br/>kernel flow log))
+  hub((Cilium + Hubble<br/>kernel flow log, L7 counts))
 
   cp -->|create pod · quarantine CNP| k8s --> pod
-  cp -->|clone via credproxy, workspace via exec| pod
+  cp -->|workspace via exec| pod
+  cp -->|GitHub clone · draft PR| cred
   cp --> gitlab
   pod -->|model calls| gw
   pod -->|allowed hosts| gw
@@ -64,6 +65,8 @@ flowchart TB
   sen -->|sentinel-q-SID, sentinel-freeze| k8s
   sen -.->|revoke · snapshot · alert| cp
 ```
+
+<sub>Deployed and tested on: kind v0.33.0 · Kubernetes v1.37.0 · containerd 2.3.4 · Cilium + Hubble 1.20.1 · gVisor release-20261019.0 · Claude Code 2.1.1 · Python 3.12.</sub>
 
 ## Results at a glance
 

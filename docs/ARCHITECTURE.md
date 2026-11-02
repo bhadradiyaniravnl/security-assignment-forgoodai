@@ -36,10 +36,10 @@ flowchart LR
     cli[sbxctl CLI]
   end
   subgraph sys [namespace sbx-system]
-    cp[control plane<br/>FastAPI + SQLite]
-    gw[gateway<br/>AI :8080 · egress :3128]
+    cp[control plane<br/>FastAPI + SQLite<br/>scan · withhold agent files · trusted diff]
+    gw[gateway<br/>AI :8080 · egress :3128<br/>+ agent instructions]
     cred[credproxy<br/>:9000 HTTP · :9001 tunnel]
-    ship[evidence shipper]
+    ship[evidence shipper<br/>gateway sidecar]
     git[git-lab]
     ev[(evidence PVC)]
   end
@@ -50,7 +50,7 @@ flowchart LR
     paste[paste-mock<br/>allowlisted]
     sink[attacker-sink<br/>not allowlisted]
   end
-  hub[(Cilium + Hubble)]
+  hub[(Cilium + Envoy L7 + Hubble)]
   anth[(api.anthropic.com)]
   gh[(github.com)]
 
@@ -70,6 +70,7 @@ flowchart LR
   subgraph secns [namespace sbx-security · own node]
     sen[sentinel<br/>detect · respond · verify]
   end
+  dp[(ConfigMap<br/>sentinel-detection)] -->|rules + responses| sen
   ship -->|push, chain-verified| sen
   hub -->|all flows: sessions + platform| sen
   sen -->|own deny policies| pod
@@ -84,12 +85,13 @@ pod with a route out of the cluster.** Everything else is reached through those 
 ```
 macOS (Apple M2 Pro)
 └── Colima VM "sbx" (Linux arm64, 6 CPU, 8 GB)          docker engine
-    └── kind cluster "sbx" (Kubernetes 1.37)
-        ├── node sbx-control-plane   Kubernetes control plane; sbx/pool=security: sentinel (ns sbx-security) only
-        ├── node sbx-worker          sbx/pool=platform: control-plane · gateway (+ evidence shipper) · credproxy ·
-        │                            git-lab · lab-ext (runc), evidence and cp-data volumes
-        ├── node sbx-worker2         sbx/pool=sandbox, tainted: sandbox-<sid> pods only (gVisor installed only here)
-        └── Cilium 1.20 (CNI, kube-proxy replacement, Hubble relay, socketLB.hostNamespaceOnly) on all nodes
+    └── kind v0.33.0 cluster "sbx" (Kubernetes v1.37.0, containerd 2.3.4)
+        ├── node sbx-control-plane   Kubernetes control plane + CoreDNS; sbx/pool=security: sentinel (ns sbx-security) only
+        ├── node sbx-worker          sbx/pool=platform: control-plane · gateway (+ evidence-shipper sidecar) · credproxy ·
+        │                            git-lab · lab-ext (runc) · hubble-relay · cilium-operator; evidence and cp-data volumes
+        ├── node sbx-worker2         sbx/pool=sandbox, tainted: sandbox-<sid> pods only (gVisor release-20261019.0, only here)
+        └── Cilium 1.20.1 on all nodes: CNI, kube-proxy replacement, socketLB.hostNamespaceOnly, Envoy (L7 visibility
+            on the AI gateway port), Hubble with credential headers redacted
 ```
 
 | Workload | Image | Ports | Holds | Can reach |
@@ -97,7 +99,7 @@ macOS (Apple M2 Pro)
 | control-plane | `sbx/services` | 8000 (NodePort 30443 → `127.0.0.1:8443`) | SQLite (sessions, specs, approvals); controller SA; caller keys; `cp-key` | API server, credproxy, git-lab |
 | gateway | `sbx/services` | 8080, 3128 (ClusterIP `10.96.100.10`) | `gateway-key`; evidence (rw) | control plane, credproxy |
 | credproxy | `sbx/services` | 9000, 9001 | **Anthropic key, GitHub App key**; `credproxy-key`; `cp-key` | control plane, lab-ext, `api.anthropic.com`, `github.com`, `api.github.com` |
-| sentinel (ns `sbx-security`, security node) | `sbx/services` | 9100 (ingest), 127.0.0.1:9101 (admin) | `sentinel-key`, `ingest-key`; own volume; SA limited to Cilium policies + pod list in `sbx-sessions` | Hubble relay, API server, control plane |
+| sentinel (ns `sbx-security`, security node) | `sbx/services` | 9100 (ingest), 127.0.0.1:9101 (admin) | `sentinel-key`, `ingest-key`; own volume; SA limited to Cilium policies + pod list in `sbx-sessions`, plus reading its own detection-policy ConfigMap | Hubble relay, API server, control plane |
 | gateway sidecar: evidence-shipper | `sbx/services` | — | `ingest-key`; evidence (ro) | sentinel |
 | git-lab | `sbx/services` | 8080 (`git://`) | demo repos | — (control plane only inbound) |
 | sandbox-&lt;sid&gt; | `sbx/sandbox` or `sbx/sandbox-pyweb` | — | repo copy, canary, placeholder token | gateway only |
@@ -396,7 +398,7 @@ flowchart LR
   a -- present --> r[(registry: name, version, digest)]
   r -->|run: owner + declared params| c[compiled policy, frozen per session]
   c --> pod[pod manifest: image, gVisor, limits, TTL]
-  c --> g[gateway: models, budget, egress.allow]
+  c --> g[gateway: models, budget, egress.allow,<br/>agent instructions]
   c --> cp2[credproxy: grants, repo, output]
   c --> d[sentinel: denied-requests burst threshold]
   c --> cc[Claude Code allowedTools<br/>defence in depth]
@@ -494,6 +496,7 @@ sequenceDiagram
   else git-lab repo
     CP->>CP: git clone git://git-lab
   end
+  CP->>CP: content scan, then withhold CLAUDE.md / AGENTS.md / .claude/ (alert if injected)
   CP->>CP: plant canary (no-follow), exclude .env from git
   CP->>K: create pod (gVisor, limits, TTL, hostAliases, env)
   K-->>CP: Ready, pod IP
@@ -518,6 +521,7 @@ sequenceDiagram
   alt denied
     G-->>P: 403 + evidence (deny reason)
   else allowed
+    G->>G: record evidence, then append the spec agent instructions as the last system block
     G->>CR: /anthropic/v1/messages (gateway key, session id)
     CR->>CR: re-check grant + endpoint, inject real key
     CR->>A: request
@@ -539,9 +543,10 @@ sequenceDiagram
   U->>CP: POST /sessions/{id}/stop
   CP->>CP: CAS running→stopping (gateway rejects from now)
   CP->>P: exec: tar working tree (no .git)
-  CP->>CP: lay files over OUR pristine .git, diff with isolated git config
+  CP->>CP: lay files over OUR pristine .git (+ the withheld agent files), diff with isolated git config
+  CP->>CP: record changed paths (diff_collected evidence)
   CP->>CP: canary scan of diff + agent summary (hit → refuse + canary-exfiltration)
-  CP->>CR: /github/publish (cp-key, diff, inert body)
+  CP->>CR: /github/publish (cp-key, diff, inert body), if the spec's output is a pull request
   CR->>CR: mint contents+PR write token, apply, check STAGED paths/modes
   CR->>GH: push agent/<sid>, open draft PR, revoke token
   CR-->>CP: PR URL
@@ -558,7 +563,7 @@ sequenceDiagram
   participant CP as control plane
   participant K as Cilium
   G->>D: evidence event / DROPPED flow
-  D->>D: rules canary-exfiltration / denied-requests / risky-tool-call
+  D->>D: rules from config/sentinel/detection.yaml (e.g. canary-exfiltration, denied-requests)
   D->>K: create sentinel-q-<sid> deny policy with its OWN identity (≤ 1 s, no control plane needed)
   D->>D: record alert + action in its own hash chain
   D->>CP: best effort: POST /internal/alerts {contain: true} (sentinel key)
