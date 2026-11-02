@@ -14,7 +14,7 @@ html,body{margin:0;height:100%;background:#0b1118;color:#F4F2EC;font-family:'IBM
 .slide th{font-weight:600}
 .slide aside{display:none}
 .xs[kind="arrow-right"]{clip-path:polygon(0 25%,60% 25%,60% 0,100% 50%,60% 100%,60% 75%,0 75%)}
-x-connector{display:none}
+.xc{position:absolute;pointer-events:none}
 #hud{position:fixed;right:16px;bottom:12px;font-size:14px;color:#8EA1B4;user-select:none}
 #notes{position:fixed;left:0;right:0;bottom:0;max-height:34vh;overflow:auto;background:#13202E;color:#D5DEE7;padding:16px 24px;font-size:16px;line-height:1.5;border-top:2px solid #E9945F;display:none}
 #notes.on{display:block}
@@ -50,43 +50,64 @@ x-connector{display:none}
 </section>
 <section id="architecture" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column">
 <h2 style="font-size:64px;font-weight:600;line-height:1.15">Two ports out, and keys never enter the pod</h2>
-<div style="position:absolute;left:128px;top:300px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#FBE9DF;border:2px solid #E07A3F;border-radius:16px;padding:28px">
-<p style="font-size:36px;font-weight:600">Sandbox pod</p>
-<p style="font-size:24px;line-height:1.35;color:#4A5568">gVisor · Claude Code · repo copy + canary · session token only</p>
+
+<div style="position:absolute;left:128px;top:250px;width:420px;height:370px;background:#FBE9DF;border-radius:20px"></div>
+<p style="position:absolute;left:150px;top:264px;width:380px;font-size:24px;font-weight:600;color:#993C1D;letter-spacing:1px">SANDBOX NODE · gVisor · default-deny</p>
+<div style="position:absolute;left:578px;top:250px;width:820px;height:370px;background:#E3EDF6;border-radius:20px"></div>
+<p style="position:absolute;left:600px;top:264px;width:780px;font-size:24px;font-weight:600;color:#185FA5;letter-spacing:1px">PLATFORM NODE · trusted code, the only real secrets</p>
+<p style="position:absolute;left:1428px;top:264px;width:364px;font-size:24px;font-weight:600;color:#5F5E5A;letter-spacing:1px">OUTSIDE THE CLUSTER</p>
+<div style="position:absolute;left:128px;top:660px;width:1664px;height:240px;background:#13202E;border-radius:20px"></div>
+<p style="position:absolute;left:150px;top:674px;width:1600px;font-size:24px;font-weight:600;color:#E9945F;letter-spacing:1px">SECURITY NODE · the sentinel trusts neither of the above</p>
+
+<div style="position:absolute;left:158px;top:320px;width:360px;height:150px;display:flex;flex-direction:column;gap:8px;padding:20px 24px;background:#FFFFFF;border:2px solid #E07A3F;border-radius:14px">
+<p style="font-size:30px;font-weight:600">Sandbox pod</p>
+<p style="font-size:24px;line-height:1.3;color:#4A5568">Claude Code · repo + canary · session token only</p>
 </div>
-<x-shape kind="arrow-right" style="position:absolute;left:484px;top:365px;width:88px;height:40px;background:#8EA1B4" class="xs"></x-shape>
-<div style="position:absolute;left:588px;top:300px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#E3EDF6;border:2px solid #3E7CB1;border-radius:16px;padding:28px">
-<p style="font-size:36px;font-weight:600">Gateway</p>
-<p style="font-size:24px;line-height:1.35;color:#4A5568">:8080 model · :3128 egress · spec policy at every request</p>
+<div style="position:absolute;left:158px;top:510px;width:360px;height:90px;display:flex;flex-direction:column;gap:4px;padding:14px 24px;background:#FFFFFF;border:2px dashed #E07A3F;border-radius:14px">
+<p style="font-size:28px;font-weight:600">Anything else</p>
+<p style="font-size:24px;line-height:1.3;color:#4A5568">dropped by Cilium, seen by Hubble</p>
 </div>
-<x-shape kind="arrow-right" style="position:absolute;left:944px;top:365px;width:88px;height:40px;background:#8EA1B4" class="xs"></x-shape>
-<div style="position:absolute;left:1048px;top:300px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#E3EDF6;border:2px solid #3E7CB1;border-radius:16px;padding:28px">
-<p style="font-size:36px;font-weight:600">credproxy</p>
-<p style="font-size:24px;line-height:1.35;color:#4A5568">the only real secrets · re-checks the grant</p>
+
+<div style="position:absolute;left:608px;top:320px;width:350px;height:150px;display:flex;flex-direction:column;gap:8px;padding:20px 24px;background:#FFFFFF;border:2px solid #3E7CB1;border-radius:14px">
+<p style="font-size:30px;font-weight:600">Gateway</p>
+<p style="font-size:24px;line-height:1.3;color:#4A5568">:8080 model · :3128 egress · spec policy on every request</p>
 </div>
-<x-shape kind="arrow-right" style="position:absolute;left:1404px;top:365px;width:88px;height:40px;background:#8EA1B4" class="xs"></x-shape>
-<div style="position:absolute;left:1508px;top:300px;width:284px;height:170px;display:flex;flex-direction:column;gap:12px;background:#FFFFFF;border:2px solid #B9C6D3;border-radius:16px;padding:28px">
-<p style="font-size:36px;font-weight:600">Outside</p>
-<p style="font-size:24px;line-height:1.35;color:#4A5568">Anthropic · GitHub · allowlisted hosts</p>
+<div style="position:absolute;left:998px;top:320px;width:370px;height:150px;display:flex;flex-direction:column;gap:8px;padding:20px 24px;background:#FFFFFF;border:2px solid #3E7CB1;border-radius:14px">
+<p style="font-size:30px;font-weight:600">credproxy</p>
+<p style="font-size:24px;line-height:1.3;color:#4A5568">holds the Anthropic key and GitHub App · re-checks every grant</p>
 </div>
-<div style="position:absolute;left:128px;top:560px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#FFFFFF;border:2px dashed #E07A3F;border-radius:16px;padding:28px">
-<p style="font-size:36px;font-weight:600">Anything else</p>
-<p style="font-size:24px;line-height:1.35;color:#4A5568">dropped by Cilium, recorded by Hubble</p>
+<div style="position:absolute;left:608px;top:510px;width:760px;height:100px;display:flex;flex-direction:column;gap:4px;padding:14px 24px;background:#FFFFFF;border:2px solid #3E7CB1;border-radius:14px">
+<p style="font-size:28px;font-weight:600">Control plane</p>
+<p style="font-size:24px;line-height:1.3;color:#4A5568">spec registry · sessions · token checks · trusted diff and draft PRs · reaper</p>
 </div>
-<div style="position:absolute;left:588px;top:560px;width:340px;height:170px;display:flex;flex-direction:column;gap:12px;background:#E3EDF6;border:2px solid #3E7CB1;border-radius:16px;padding:28px">
-<p style="font-size:36px;font-weight:600">Control plane</p>
-<p style="font-size:24px;line-height:1.35;color:#4A5568">specs · sessions · token checks · trusted diff</p>
+
+<div style="position:absolute;left:1428px;top:320px;width:364px;height:150px;display:flex;flex-direction:column;gap:8px;padding:20px 24px;background:#FFFFFF;border:2px solid #B9C6D3;border-radius:14px">
+<p style="font-size:30px;font-weight:600">Outside</p>
+<p style="font-size:24px;line-height:1.3;color:#4A5568">api.anthropic.com · GitHub · allowlisted hosts only</p>
 </div>
-<div style="position:absolute;left:1048px;top:560px;width:744px;height:170px;display:flex;flex-direction:column;gap:12px;background:#13202E;border-radius:16px;padding:28px">
-<p style="font-size:36px;font-weight:600;color:#F4F2EC">Sentinel, on its own node</p>
-<p style="font-size:24px;line-height:1.35;color:#B9C6D3">verified gateway evidence + Hubble flows → its own deny policy on the session, about 1 s</p>
+
+<div style="position:absolute;left:158px;top:720px;width:480px;height:130px;display:flex;flex-direction:column;gap:8px;padding:18px 24px;background:#1E2F42;border:2px solid #3E7CB1;border-radius:14px">
+<p style="font-size:30px;font-weight:600;color:#F4F2EC">Hubble</p>
+<p style="font-size:24px;line-height:1.3;color:#D5DEE7">kernel flow log from every node; no pod can fake it</p>
 </div>
-<x-connector x1="298" y1="470" x2="298" y2="558" head="end" style="color:#E07A3F;border-width:3px;border-style:dashed"></x-connector>
-<x-connector x1="758" y1="470" x2="758" y2="558" head="both" style="color:#3E7CB1;border-width:3px"></x-connector>
-<x-connector x1="900" y1="470" x2="1100" y2="558" route="vh" head="end" style="color:#13202E;border-width:3px"></x-connector>
-<x-connector x1="298" y1="730" x2="1420" y2="730" route="elbow" head="end" style="color:#13202E;border-width:3px;border-style:dotted"></x-connector>
-<p style="position:absolute;left:128px;top:808px;width:1664px;font-size:30px;line-height:1.4;color:#4A5568">Three trust zones on three nodes: sandboxes on a tainted gVisor node, platform with the secrets on another, the sentinel alone on a third.</p>
-<aside>Walk the request path left to right. The sandbox can open exactly two connections, both to the gateway: port 8080 for model calls, 3128 as an explicit forward proxy for everything else. Every request carries the session token, which the gateway checks with the control plane, bound to the pod IP and the session’s compiled spec. The gateway then hands the call to credproxy, the only component holding the Anthropic key and the GitHub App key, which re-checks the grant before using them. Anything the sandbox tries outside those two ports never gets out: Cilium drops it at the kernel and Hubble records it, which is the bypass signal. The gateway ships its hash-chained evidence to the sentinel, and the sentinel also reads Hubble directly; if something is wrong it writes its own deny policy on the session. Physically: sandboxes on a tainted node that is the only one with gVisor; the secrets on the platform node; the sentinel alone on the third node.</aside>
+<div style="position:absolute;left:678px;top:720px;width:560px;height:130px;display:flex;flex-direction:column;gap:8px;padding:18px 24px;background:#1E2F42;border:2px solid #E9945F;border-radius:14px">
+<p style="font-size:30px;font-weight:600;color:#F4F2EC">Sentinel</p>
+<p style="font-size:24px;line-height:1.3;color:#D5DEE7">cross-checks evidence against flows · writes its own deny policy on the pod in about 1 s</p>
+</div>
+<div style="position:absolute;left:1278px;top:720px;width:484px;height:130px;display:flex;flex-direction:column;gap:8px;padding:18px 24px;background:#1E2F42;border:2px solid #3E7CB1;border-radius:14px">
+<p style="font-size:30px;font-weight:600;color:#F4F2EC">Shipped evidence</p>
+<p style="font-size:24px;line-height:1.3;color:#D5DEE7">from gateway and control plane; hash chain checked on arrival</p>
+</div>
+
+<div class="xc" style="left:518.0px;top:393.5px;width:90.0px;height:0;border-top:3px solid #13202E;transform-origin:0 0;transform:rotate(0.0deg)"></div><div class="xc" style="left:599.0px;top:386.0px;width:18px;height:18px;transform:rotate(0.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#13202E"></div>
+<div class="xc" style="left:958.0px;top:393.5px;width:40.0px;height:0;border-top:3px solid #13202E;transform-origin:0 0;transform:rotate(0.0deg)"></div><div class="xc" style="left:989.0px;top:386.0px;width:18px;height:18px;transform:rotate(0.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#13202E"></div>
+<div class="xc" style="left:1368.0px;top:393.5px;width:60.0px;height:0;border-top:3px solid #13202E;transform-origin:0 0;transform:rotate(0.0deg)"></div><div class="xc" style="left:1419.0px;top:386.0px;width:18px;height:18px;transform:rotate(0.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#13202E"></div>
+<div class="xc" style="left:783.0px;top:468.5px;width:40.0px;height:0;border-top:3px solid #3E7CB1;transform-origin:0 0;transform:rotate(90.0deg)"></div><div class="xc" style="left:774.0px;top:501.0px;width:18px;height:18px;transform:rotate(90.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#3E7CB1"></div><div class="xc" style="left:774.0px;top:461.0px;width:18px;height:18px;transform:rotate(270.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#3E7CB1"></div>
+<div class="xc" style="left:338.0px;top:598.5px;width:120.0px;height:0;border-top:3px dashed #E07A3F;transform-origin:0 0;transform:rotate(90.0deg)"></div><div class="xc" style="left:329.0px;top:711.0px;width:18px;height:18px;transform:rotate(90.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#E07A3F"></div>
+<div class="xc" style="left:1300.0px;top:608.5px;width:110.0px;height:0;border-top:3px solid #3E7CB1;transform-origin:0 0;transform:rotate(90.0deg)"></div><div class="xc" style="left:1291.0px;top:711.0px;width:18px;height:18px;transform:rotate(90.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#3E7CB1"></div>
+<div class="xc" style="left:638.0px;top:783.5px;width:40.0px;height:0;border-top:3px solid #E9945F;transform-origin:0 0;transform:rotate(0.0deg)"></div><div class="xc" style="left:669.0px;top:776.0px;width:18px;height:18px;transform:rotate(0.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#E9945F"></div>
+<div class="xc" style="left:1278.0px;top:783.5px;width:40.0px;height:0;border-top:3px solid #E9945F;transform-origin:0 0;transform:rotate(180.0deg)"></div><div class="xc" style="left:1229.0px;top:776.0px;width:18px;height:18px;transform:rotate(180.0deg);clip-path:polygon(0 0,100% 50%,0 100%);background:#E9945F"></div>
+<aside>Read it left to right along the top, then down. The sandbox can open exactly two connections, both to the gateway: port 8080 for model calls and 3128 as an explicit forward proxy for everything else. Every request carries the session token; the gateway checks it with the control plane, bound to the pod IP and the session’s compiled spec, and applies the spec’s policy. The gateway hands the call to credproxy, the only component holding the Anthropic key and the GitHub App key, which re-checks the grant before using them and is the only thing that talks to the outside. Anything the sandbox tries beyond those two ports never leaves: Cilium drops it at the kernel and Hubble records the drop, which is the bypass signal. The bottom band is the security node. The sentinel gets the platform’s evidence, verified on arrival, and the kernel’s flow log, which no pod can fake, and reconciles the two; when something is wrong it writes its own deny policy on the pod, about a second from detection, and that works with the control plane down. Three nodes, three trust zones: nothing worth stealing in the first, the secrets in the second, and a third that trusts neither.</aside>
 </section>
 <section id="lifecycle" class="slide" data-transition="fade" style="background:#F4F2EC;color:#13202E;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:48px">
 <h2 style="font-size:64px;font-weight:600;line-height:1.15">A session, from <span style="font-family:'JetBrains Mono', monospace">run</span> to pull request</h2>
